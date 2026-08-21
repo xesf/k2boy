@@ -213,6 +213,22 @@ bool init(gl_proc_loader load) {
 
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LEQUAL);
+
+    // Depth ordering silently degrades to submission order if the default
+    // framebuffer has no depth attachment, so report what we actually got
+    // rather than what the pixel format asked for.
+    {
+        GLint bits = -1;
+        glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_DEPTH,
+                                              GL_FRAMEBUFFER_ATTACHMENT_DEPTH_SIZE,
+                                              &bits);
+        const GLenum e = glGetError();          // clear any error from the query
+        std::printf("gl: %s | %s | depth bits %d%s\n",
+                    (const char*)glGetString(GL_RENDERER),
+                    (const char*)glGetString(GL_VERSION),
+                    bits, e != GL_NO_ERROR ? " (query unsupported)" : "");
+        std::fflush(stdout);
+    }
     return true;
 }
 

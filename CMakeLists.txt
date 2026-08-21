@@ -30,6 +30,9 @@ set(K2_SOURCES
     src/engine/module.cpp
     src/engine/nirtti.cpp
     src/engine/actor.cpp
+    src/engine/node.cpp
+    src/engine/config.cpp
+    src/engine/module_table.cpp
 )
 
 if(APPLE)

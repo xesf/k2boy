@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>k2boy — web</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<canvas id="view"></canvas>
+
+<!-- Boot / loading. Replaced by the HUD once the level is up. -->
+<div id="boot">
+  <h1>k2boy <span>web</span></h1>
+  <p class="sub">Prince of Persia 3D — WebGPU experiment</p>
+  <div id="boot-status">starting…</div>
+  <div id="boot-bar"><i></i></div>
+  <div id="boot-error" hidden></div>
+</div>
+
+<!-- Debug HUD. Toggled with F1. -->
+<div id="hud" hidden>
+  <div id="hud-perf"></div>
+  <div id="hud-state"></div>
+</div>
+
+<div id="help" hidden>
+  <h2>controls</h2>
+  <table>
+    <tr><td>WASD</td><td>move (camera relative)</td></tr>
+    <tr><td>Space</td><td>jump — hold for height, tap at a ledge to grab</td></tr>
+    <tr><td>Shift</td><td>walk (precision near edges)</td></tr>
+    <tr><td>Mouse / drag</td><td>camera — click canvas to capture</td></tr>
+    <tr><td>Wheel</td><td>camera distance</td></tr>
+    <tr><td>R (hold)</td><td>rewind time</td></tr>
+    <tr><td>F1</td><td>HUD</td></tr>
+    <tr><td>F2</td><td>free camera / play</td></tr>
+    <tr><td>F3</td><td>collision wireframe</td></tr>
+    <tr><td>F4</td><td>ledge graph</td></tr>
+    <tr><td>F5</td><td>respawn</td></tr>
+    <tr><td>H</td><td>this panel</td></tr>
+  </table>
+</div>
+
+<script type="module" src="js/main.js"></script>
+</body>
+</html>

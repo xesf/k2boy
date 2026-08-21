@@ -265,3 +265,37 @@ sections is the way to *validate* this parser without a CD image, and is the obv
 | `0x447CB8` | `LevelGroup__GetRoomCount` |
 | `0x448C89` | `LevelGroup__CommitNeighbors` |
 | `0x44438D` | `FileParser__ReadTokenInto` |
+
+## `[Fog]` distances are fractions of the far clip plane
+
+Each `[Fog]` row is `factor, r, g, b, flag`. **The first column is not a
+distance** — it is a multiplier on `[ClipPlanes]`' far value. Every shipped level
+writes `1.5` in the second row, i.e. fog saturates half again beyond the far
+plane:
+
+| level | far clip | factors | actual fog range |
+|---|---:|---|---|
+| `prisonfix` | 50 | 0.5 / 1.5 | 25 .. 75 |
+| `cistern` | 85 | 0.80 / 1.5 | 68 .. 128 |
+| `ruins` | 100 | 0.8 / 1.5 | 80 .. 150 |
+
+```c
+fog_start = fog[0].distance * clip_far;
+fog_end   = fog[1].distance * clip_far;   // fog[1].distance is always 1.5
+```
+
+Some levels comment out `[ClipPlanes]` (`palace2` writes `;0.5,150`), so a
+fallback is needed; this project uses 100.
+
+**This was a real bug with visible consequences.** Feeding the raw values as
+metres put fog end at **1.5 units**, so everything beyond arm's reach was
+flooded with the fog colour. Two symptoms that had been filed separately were
+both this:
+
+* Cistern "renders almost nothing" — its fog colour is `(43, 147, 95)`, so the
+  level appeared as a featureless **green** field. It was not an untextured mesh,
+  which is what the geometry-based investigation had concluded.
+* Booting `prisonfix` showed a dark navy void — fog colour `(30, 45, 80)`.
+
+Fixed, and both scenes now render correctly. A reminder that "the geometry is
+wrong" and "the shading is wrong" look identical from inside a fog bank.

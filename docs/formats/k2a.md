@@ -166,3 +166,98 @@ address scene objects by these exact names (e.g. `gear_SideLow`, `Pivot`, `S_bur
   rather than lightmaps.
 - No skinning tokens appear in the actor `.K2A` files; character deformation is driven by the
   joint hierarchy from `.act` + `.skl`, not by per-vertex weights in the mesh file.
+
+## `*ALPHA_SOURCE` does not mean "transparent"
+
+**This was a real bug and it broke draw order in every room but the first.**
+
+A material body contains nested `*MAP_<CHANNEL>` blocks, each with its own
+`*BITMAP` and `*ALPHA_SOURCE`. The parser originally scanned the whole material
+to brace depth 0, which got both fields wrong:
+
+* **transparency** was set from any `*ALPHA_SOURCE Opacity`. That token only says
+  where a *map's* alpha comes from; a plain wall's diffuse map routinely says
+  `Opacity` while the material is fully opaque. Every shipped `prisonfix`
+  material has `*MATERIAL_TRANSPARENCY 0.0000`.
+* **`bitmap`** took the *last* `*BITMAP` seen, so a material with an opacity or
+  specular map got that map's image as its diffuse texture.
+
+Measured on the prisonfix rooms:
+
+| room | materials | `*MAP_OPACITY` | `*ALPHA_SOURCE Opacity` |
+|---|---:|---:|---:|
+| prison1 | 132 | 1 | 3 |
+| prison2 | 61 | 2 | 39 |
+| prison3 | 131 | **0** | **105** |
+
+prison3 has *no* transparent materials at all, yet 105 of its 131 were being
+flagged. Transparent draws with depth-write **off**, so most of the room lost
+depth ordering and far polygons painted over near ones. prison1 happened to be
+mostly opaque, which is exactly why "the first room is fine, the others are not".
+
+### The correct rule
+
+A material is alpha-blended when it has a **`*MAP_OPACITY` block**, or
+`*MATERIAL_TRANSPARENCY > 0`. `bitmap` comes from `*MAP_DIFFUSE`, falling back to
+the first bitmap when there is no explicit diffuse channel.
+
+Item counts before and after, per room:
+
+```
+prison1            opaque 180 -> 192   transparent 15 -> 3
+prison2            opaque  25 ->  64   transparent 42 -> 3
+prison3            opaque  64 -> 156   transparent 92 -> 0
+prison3_hall       opaque  19 ->  31   transparent 12 -> 0
+prison3_junction   opaque  11 ->  26   transparent 15 -> 0
+```
+
+which matches the `*MAP_OPACITY` counts exactly.
+
+### Validated install-wide
+
+`k2boy --materials` (or `make materials`) sweeps every `.K2A`:
+
+```
+materials: 501 files, 28119 materials
+  name a bitmap   27062
+  bitmap resolves 27061
+  unresolved      1
+  blended (MAP_OPACITY or TRANSPARENCY>0) 624 (2.2%)
+    missing: D:\3DSMAX2.5\Scenes\ripple.ifl
+```
+
+**27061 of 27062 texture references resolve.** The single miss is an authoring
+path that was never shipped, so the per-channel change did not cost a texture
+anywhere. 2.2% blended is a plausible figure for flames, water and grates —
+compare the old rule, which flagged 105 of prison3's 131 materials alone.
+
+## Triangle winding is CCW, so backface culling is safe
+
+`k2boy --winding` (or `make winding`) measures it rather than guessing. For a
+closed mesh the divergence theorem gives a signed volume from the triangles
+alone; with counter-clockwise outward winding — OpenGL's default front face —
+that volume is positive. Actor body parts are watertight, so they are what gets
+measured:
+
+```
+winding over 1201 actor meshes
+  positive volume (CCW outward) 1028   total 12.245
+  negative volume (CW outward)  157   total -0.167
+  degenerate / open             16
+  verdict: CCW front faces (86.8% agree)
+```
+
+By count it is 87%, but **by volume it is decisive**: the negative meshes total
+-0.167 against +12.245, i.e. they are near-degenerate slivers rather than
+genuinely inverted geometry.
+
+`CULL_BACK` is now the default (`--cull none|back|front` overrides). Verified:
+
+| view | none vs back |
+|---|---|
+| inside a room | identical (mean 22.28, 38.4% near-black, both) |
+| level default | 0.001% of pixels differ |
+| from *outside* a room | 7.5% differ — culling correctly reveals the interior instead of the outer wall's back face |
+
+The third row is the point: the difference is not an artefact, it is culling
+doing its job for a camera the original would never have placed there.

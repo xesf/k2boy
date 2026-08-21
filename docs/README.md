@@ -26,6 +26,7 @@ binary can be attributed to a named C++ class without guessing.
 ```
 docs/          these notes — the tracked content
 src/           engine source (platform + gfx interfaces scaffolded)
+web/           a second runtime: vanilla JS + WebGPU, playable (see plan/06)
 data/          the retail install (git-ignored; not redistributable)
 ```
 
@@ -55,6 +56,8 @@ form (`geometry\rooms\prisonfix\prison3.k2a`) because that is what the binary co
   - [`02-ida-mcp-playbook.md`](plan/02-ida-mcp-playbook.md) — concrete MCP tool recipes
   - [`03-reimplementation.md`](plan/03-reimplementation.md) — porting strategy and recommended tech stack
   - [`04-platform-layer.md`](plan/04-platform-layer.md) — macOS + OpenGL backend, swappable platform/gfx split
+  - [`05-boot-to-gameplay.md`](plan/05-boot-to-gameplay.md) — what happens between launch and player control
+  - [`06-web-experiment.md`](plan/06-web-experiment.md) — the `web/` runtime: WebGPU, derived ledges, playable
 - [`reference/`](reference/)
   - [`coverage.md`](reference/coverage.md) — what is reversed, by format and subsystem
   - [`class-hierarchy.md`](reference/class-hierarchy.md) — 909 vtables with recovered inheritance

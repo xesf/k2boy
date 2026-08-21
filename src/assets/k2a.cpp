@@ -93,19 +93,65 @@ void read3(tokenizer& t, float* v) {
 
 // ---------------------------------------------------------------- sections
 
+// A material body contains nested *MAP_<CHANNEL> blocks, each with its own
+// *BITMAP and *ALPHA_SOURCE. Both fields therefore have to be read *per channel*
+// rather than by scanning the whole material:
+//
+//   * `bitmap` must come from *MAP_DIFFUSE. Taking the last *BITMAP seen picked
+//     up the opacity or specular map instead whenever a material had one.
+//   * transparency is signalled by the presence of a *MAP_OPACITY block (or a
+//     non-zero *MATERIAL_TRANSPARENCY), *not* by *ALPHA_SOURCE. ALPHA_SOURCE
+//     only says where a map's alpha comes from; a plain wall's diffuse map
+//     routinely says "Opacity" while the material is fully opaque.
+//
+// Measured on the prisonfix rooms: prison3 has 105 *ALPHA_SOURCE Opacity lines
+// and **zero** *MAP_OPACITY blocks. Keying on ALPHA_SOURCE flagged 105 of its
+// 131 materials transparent, which pushed most of the room into the
+// depth-write-off pass and destroyed its draw order.
 void parse_material(tokenizer& t, k2a_material& m) {
     int depth = 1;                       // '{' already consumed
+    std::string pending;                 // last *MAP_* token seen
+    std::string channel;                 // channel whose block we are inside
+    int channel_depth = -1;
+    bool have_diffuse_bitmap = false;
+
     while (depth > 0 && t.next()) {
-        if (!t.quoted && is_open(t.tok))  { ++depth; continue; }
-        if (!t.quoted && is_close(t.tok)) { --depth; continue; }
-        if (t.quoted) continue;
+        if (!t.quoted && is_open(t.tok)) {
+            ++depth;
+            if (pending.size() > 5 && pending.compare(0, 5, "*MAP_") == 0) {
+                channel = pending;
+                channel_depth = depth;
+                // An opacity channel is the actual signal for alpha blending.
+                if (channel == "*MAP_OPACITY") m.alpha = K2A_ALPHA_OPACITY;
+            }
+            pending.clear();
+            continue;
+        }
+        if (!t.quoted && is_close(t.tok)) {
+            if (depth == channel_depth) { channel.clear(); channel_depth = -1; }
+            --depth;
+            pending.clear();
+            continue;
+        }
+        if (t.quoted) { pending.clear(); continue; }
 
         if (t.tok == "*MATERIAL_NAME") { t.next(); m.name = t.tok; }
-        else if (t.tok == "*BITMAP")   { t.next(); m.bitmap = t.tok; }
-        else if (t.tok == "*ALPHA_SOURCE") {
+        else if (t.tok == "*MATERIAL_TRANSPARENCY") {
             t.next();
-            if (t.tok == "Opacity") m.alpha = K2A_ALPHA_OPACITY;
+            if (to_float(t.tok) > 0.0f) m.alpha = K2A_ALPHA_OPACITY;
         }
+        else if (t.tok == "*BITMAP") {
+            t.next();
+            // Prefer the diffuse map; fall back to the first bitmap seen so a
+            // material with no explicit *MAP_DIFFUSE still gets a texture.
+            if (channel == "*MAP_DIFFUSE") { m.bitmap = t.tok; have_diffuse_bitmap = true; }
+            else if (!have_diffuse_bitmap && m.bitmap.empty()) m.bitmap = t.tok;
+        }
+        else {
+            pending = t.tok;
+            continue;
+        }
+        pending.clear();
     }
 }
 

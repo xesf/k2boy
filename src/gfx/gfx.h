@@ -60,6 +60,17 @@ struct render_state {
     bool       vertex_color;    // NiVertexColorProperty — baked lighting
     bool       fog;             // NiFogProperty
     bool       wireframe;       // NiWireframeProperty (debug)
+
+    // Defaults matter: this used to be left uninitialised at the top of each
+    // frame, and callers set only the fields they cared about. The debug
+    // trigger pass sets wireframe = true, the next frame's state landed on the
+    // same stack slot with wireframe still true, and the *opaque* pass drew in
+    // wireframe - room textures vanished whenever trigger volumes were on.
+    // A forgotten field must not be able to inherit last frame's value.
+    render_state()
+        : blend(BLEND_NONE), cull(CULL_NONE), depth(DEPTH_TEST_WRITE),
+          alpha_test(false), alpha_ref(0.5f), vertex_color(true),
+          fog(false), wireframe(false) {}
 };
 
 // ---------------------------------------------------------------- vertices

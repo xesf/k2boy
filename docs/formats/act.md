@@ -273,3 +273,332 @@ Joint limits *are* tagged and therefore locatable: `Prince.act` carries **11 `JL
 4. **Done** — the `MF_*` keys are registered by `MfProtoActor`'s ctor at `0x5FDD1C`
    (references at `0x5FDE99`–`0x5FE626`). It `operator new`s a 12-byte `Prop` and a 16-byte value
    object per property, matching `porP`(12) and `rtSV`/`olFV`(16) in the chunk registry.
+
+---
+
+# Skeleton hierarchy: what the data says, and what is still missing
+
+Run `k2boy --bind <master.dat>` to reproduce everything below.
+
+## `.act` transforms are local-to-parent, not bind poses
+
+The first guess — that `.act` node transforms are world-space bind poses, so a
+part's local geometry could be had by inverting them — is **wrong**. Measured on
+the Prince: applying the inverse transform collapses only 5 of 26 parts toward
+the origin, worst radius 1.80.
+
+The positions say why:
+
+```
+Pelvis   act (0.000, 1.034, 0.000)     <- ~1m up: plausible as world
+Mid      act (0.002, 0.185, 0.018)     <- 18cm: an offset, not a position
+LHand    act (-0.013, -0.285, 0.017)   <- 29cm down the forearm
+```
+
+These are **local-to-parent offsets**. `.act` is a real skeleton, and using it
+needs the parent links — which are not in the parsed data.
+
+## The two files use different coordinate systems
+
+| file | field | space |
+|---|---|---|
+| `.K2A` | `*NODE_TM` position | **world bind pose, Max Z-up** |
+| `.act` | node transform | **local-to-parent, engine Y-up** |
+
+The mapping is `engine = (x, z, -y)`, pinned by the Pelvis: `.K2A`
+`(-0.002, 0.000, 1.033)` against `.act` `(0.000, 1.034, 0.000)`.
+
+This also means the `.K2A` node transform, which the mesh builder ignores because
+vertices are baked, *does* carry usable information: it is each part's world bind
+position.
+
+## Bind rotations are identity
+
+Every `.act` bind quaternion on the Prince is exactly `[1, 0, 0, 0]`. Forward
+kinematics over the bind pose is therefore pure offset addition, which is worth
+knowing before writing any quaternion code.
+
+## Deriving the hierarchy from geometry — works, but not reliably
+
+Since `.K2A` gives world positions and `.act` gives local offsets, a parent can
+be predicted: `parent_world ~= child_world - child_local`, then matched to the
+nearest joint. On the Prince this produces an anatomically correct skeleton:
+
+```
+Pelvis (root) -> Mid -> ... -> LArm1 -> LArm2 -> LHand -> LFingers1 -> LFingers2
+joints 26, roots 1, cycles 0, residual mean 0.0051
+```
+
+But it does **not** generalise:
+
+| actor | joints | cycles | residual mean | FK worst |
+|---|---:|---:|---:|---:|
+| Prince | 26 | 0 | 0.0051 | 0.1111 |
+| PG3Archer | 25 | 0 | 0.0176 | 0.1144 |
+| A1 | 26 | **2** | 0.0136 | **1.5479** |
+
+A1 comes out with cycles and 1.5 units of drift. **The hierarchy is not
+recovered.** Nearest-neighbour parent matching is a heuristic, and it fails.
+
+## Why forward kinematics drifts even when the tree is right
+
+Some `.act` joints carry no geometry, so a geometry-derived tree cannot see
+them, and their offsets get skipped or absorbed into the wrong link. Every actor
+has the same handful:
+
+| node | Prince | A1 | PG3Archer |
+|---|---|---|---|
+| actor root | `Prince` | `a1` | `Pg3` |
+| `Prime` | yes | yes | yes |
+| `DumChest` | `(0, 0.107, -0.018)` | `(0, 0.198, -0.005)` | `(0, 0.111, -0.014)` |
+| grips | `LGrip`, `RGrip` | `SwordAttach` | `LGrip`, `RGrip` |
+
+`DumChest` is the giveaway: it carries a real offset, and `LArm1`'s local
+`y = 0.107` on the Prince is exactly `DumChest`'s. So the arms hang off
+`DumChest`, not `Chest` — the derivation collapsed a joint it could not see, and
+that is where the residual comes from.
+
+`LGrip` / `RGrip` / `SwordAttach` are the weapon attachment points, which
+cross-checks against `master.dat`'s hand list.
+
+## Conclusion
+
+Attaching body parts to joints and posing them needs the real parent links. The
+remaining unknown is the **`.act` 20-byte child records**, still unrecovered (an
+earlier child-count hypothesis failed on 0/115 files). That is the blocker for
+animation, and guessing at it from geometry has now been tried and measured
+rather than assumed.
+
+## `MfProtoNode` in memory — where the children actually live
+
+From `MfProtoNode__copy_ctor` (`0x602F12`), which touches every field:
+
+```c
+struct MfProtoNode {          // sizeof not yet pinned
+/* +0x00 */ void*  vtbl_MfProtoNode_2;   // secondary base (MI)
+/* +0x14 */ void*  vtbl_MfProtoNode;     // the MfStreamObject interface
+/* +0x18 */ ...                          // copied by sub_616E49
+/* +0x1C */ int32_t
+/* +0x20 */ std::string                  // node name
+/* +0x3C */ void*                        // deep-copied, new(0x58) + sub_60EEF7
+/* +0x40 */ MfDblList                    // <-- doubly-linked list, 4 dwords
+/* +0x50 */ void*                        // cloned through its own vtable slot 5
+/* +0x54 */ ...                          // copied by sub_60AC3C
+/* +0x6C */ int32_t kind;                // 1..6, selects the payload below
+/* +0x70 */ int32_t
+/* +0x74 */ int32_t
+/* +0x78 */ void*   payload;             // sized by `kind`
+/* +0x7C */ int32_t
+};
+```
+
+**The list at `+0x40` holds 20-byte elements.** The copy constructor walks it
+with the list's own virtuals (`+0x24` first, `+0x28` next, `+0x14` add) and for
+each element does `operator new(0x14)` then copies **five dwords**. That is the
+20-byte child record the earlier notes flagged as unrecovered — it is a linked
+list on the node, not an array in the file.
+
+`kind` at `+0x6C` selects a variant payload allocated at `+0x78`:
+
+| kind | payload size | copy helper |
+|---:|---:|---|
+| 6 | `0x1C` (28) | `sub_60E0CD` |
+| 5 | `0x8C` (140) | `sub_60DDDC` |
+| 4 | `0x34` (52) | `sub_60DABC` |
+| 3, 2, 1 | (not read) | |
+| other | none, `payload = 0` | |
+
+28 bytes for kind 6 matches the shared `pos[3] + quat[4]` transform already
+documented.
+
+## The type tags are runtime-only
+
+`MfProtoNode__IsKindOfTag` (`0x602ED7`) answers to two 4CCs:
+
+```
+0x5072744E  'NtrP'   <- ProtoNode
+0x54726565  'eerT'   <- Tree
+```
+
+`"Tree"` looked like the hierarchy chunk. **It is not on disk**: neither `eerT`,
+`Tree`, `NtrP` nor `PrtN` appears anywhere in `Prince.act`. These are runtime
+type-identity tags used by the streaming layer, not file markers. Recorded so
+the next attempt does not re-follow it.
+
+(`JLHn`, which occurs 11 times in `Prince.act`, is also a dead end — it falls in
+the middle of a float run after a texture name, not on a record boundary.)
+
+## Where this leaves animation
+
+Known: the node layout, that children are a linked list of 20-byte records, the
+variant payload table, the coordinate mapping, and that bind rotations are
+identity. Unknown: **how that list is encoded in the file**. Until the on-disk
+form of the `+0x40` list is found, the parent links cannot be read, and posing
+body parts stays blocked.
+
+## On-disk search for the parent links — where it is *not*
+
+`k2boy --actnodes <file>` dumps each node record with its surroundings. On
+`Prince.act` (31 nodes, 36306 bytes) the layout is:
+
+```
+u32 len, name, 28-byte transform, then either
+    03 00 00 00  00 00 00 00  0b 00 00 00  NN 00 00 00   + a large payload   (25 nodes)
+    all zeros                                            + a 140-byte payload ( 6 nodes)
+```
+
+The all-zero form belongs to exactly the nodes with **no geometry** —
+`Prince`, `Prime`, `DumChest`, `LGrip`, `RGrip` — the same set identified from
+the bind-pose work.
+
+Three candidate locations for the tree were checked and **all are ruled out**:
+
+| location | what it actually is |
+|---|---|
+| the trailing `[3, 0, 11, N]` block | `N` varies per node (8..56) but does not scale with the payload size; not a child count |
+| the 140-byte payload of a meshless node | a **material block** — 1.0 and 0.5 floats, `20 00 00 00 20 00 00 00` (32x32) |
+| the end of file | the `MF_` property table (`rtSV`, `3eVV`, ... `MF_locoSkill "WalkForwards"`) |
+
+## The node order is a depth-first walk
+
+```
+Prince, Prime, Pelvis,
+  LLeg1, LLeg2, LHeel, LToes,
+  RLeg1, RLeg2, RHeel, RToes,
+  Mid, DumChest,
+    LArm1, LArm2, LHand, LThumb1, LFingers1, LFingers2, LGrip,
+    RArm1, RArm2, RHand, RThumb1, RFingers1, RFingers2, RGrip,
+    Neck, Head,
+  Chest, Scabbard
+```
+
+`Mid -> DumChest -> LArm1` appears in exactly that order, which independently
+corroborates the bind-pose finding that the arms hang off `DumChest` and not
+`Chest`. So the file almost certainly encodes the tree as **traversal order plus
+a per-node child or sibling count** — but the count has not been located, and
+none of the fields above behaves like one.
+
+**Status: still unrecovered.** What has changed is that the search space is much
+smaller, and three plausible-looking candidates are now eliminated rather than
+untested.
+
+## The loader, traced
+
+`sub_600A5B` is the `.act` node load:
+
+```
+600ab0  push 80h / operator new      -> sizeof(MfProtoNode) = 0x80 = 128
+600ac7  call MfProtoNode__ctor
+600ae0  call sub_6052BF              -> read the node from the stream
+600ae8  call sub_5FEDAE              -> hand it to the actor
+```
+
+**`MfProtoActor` stores a single root node**, not a flat list: `sub_5FEDAE`
+writes it to `actor+0x14`, releasing any previous one, and the node *array* at
+`actor+0x18` is derived by traversing from that root. So the tree is encoded
+**recursively inside the node record**, which is consistent with the depth-first
+node order seen in the file.
+
+`MfProtoNode__vf1` (`0x603E30`) is the node reader, and its order matches the
+on-disk dump exactly:
+
+```
+sub_605251(stream, +0x04)          name
+stream->vf0(0x1C, +0x0C)           28-byte transform   (pos[3] + quat[4])
+sub_605205(stream, +0x5C)          kind                (3 for geometry nodes)
+switch (kind) { ... }              kind-specific payload
+sub_6052BF(stream, +0x40)          <-- the children list
+```
+
+`+0x40` is the `MfDblList` the copy constructor initialises. `MfDblList` is a
+plain doubly-linked list: 12-byte links `{ void* value; next; prev }` with the
+count at `list+0x0C`; vtable slot 1 is push-back, slot 3 is insert.
+
+## Still not recovered, and why
+
+`sub_6052BF(stream, obj)` calls `obj->vtable[1](stream)` and stores the result at
+`stream+0x14`. Read literally against `vtbl_MfDblList`, slot 1 is *push-back*,
+which would push the stream pointer into the list — that cannot be right, so the
+`this` being passed is not the primary base.
+
+`MfProtoNode` has two vtables (`+0x00` and `+0x14`, the documented MI pair) and
+the field offsets quoted by `MfProtoNode__copy_ctor` and by
+`MfProtoNode__vf1` **do not line up**, which means one of the two is working
+through the adjusted `this`. Until that adjustment is pinned down, the offsets
+above are provisional and the list's on-disk encoding stays unknown.
+
+**Three attempts at this hierarchy have now failed**, each in a different way and
+each recorded rather than quietly dropped:
+
+1. a child-count hypothesis — 0/115 files;
+2. geometry-derived parents — anatomically correct on the Prince, but cycles and
+   1.5 units of drift on A1;
+3. this pass — the recursive encoding is confirmed and the reader is located, but
+   the `this`-adjustment ambiguity blocks the field mapping.
+
+The next attempt should start by resolving which vtable `MfProtoNode__vf1`
+belongs to, not by guessing at the record layout again.
+
+## The `this`-adjust is resolved
+
+The blocker named in the previous pass is settled. Every field quoted by
+`MfProtoNode__vf1` sits exactly **0x14 below** the corresponding field in
+`MfProtoNode__copy_ctor`:
+
+| copy_ctor (primary) | vf1 | member |
+|---|---|---|
+| `+0x18` | `+0x04` | string |
+| `+0x20` | `+0x0C` | 28-byte transform |
+| `+0x40` | `+0x2C` | `MfDblList` |
+| `+0x54` | `+0x40` | `MfPropertyTable` |
+| `+0x6C` | `+0x58` | `kind` |
+| `+0x78` | `+0x64` | kind payload |
+
+So **`vf1` is a method on the `+0x14` subobject** (the `MfStreamObject` base),
+while the constructors work from the primary base. The offsets were never
+inconsistent; they were being read against two different `this` pointers.
+
+## The reader, fully mapped
+
+```
+MfStream__ReadString(+0x18)            name
+stream->vf0(0x1C, +0x20)               28-byte transform (pos[3] + quat[4])
+MfStream__ReadDword(+0x6C)             kind
+switch (kind) { ... }                  kind payload at +0x78
+MfStream__ReadDword(&N)                <-- count
+repeat N times:
+    operator new(0x14)                 20-byte record
+    zero [0],[4],[8] as floats, [0x10]
+    stream->vf0(0x14, rec)             read 20 bytes
+    MfDblList(+0x40)->push_back(rec)
+MfStream__ReadObject(+0x54)            MfPropertyTable (the MF_ properties)
+```
+
+**The 20-byte records are count-prefixed and read straight from the stream.**
+That is the structure the earlier notes called "the 20-byte child records", now
+located in both the code and the load order.
+
+## What the 20-byte record is not
+
+It is **not** obviously a parent link. The reader pre-zeroes `[0]`, `[4]`, `[8]`
+as *floats* and `[0x10]` as a dword, leaving `[0x0C]` untouched — so the shape is
+
+```c
+struct rec20 { float v[3]; uint32_t unknown_0C; uint32_t flags_10; };
+```
+
+A vec3 plus two dwords reads as attachment or anchor data rather than a child
+reference. `[0x0C]` being the one field not pre-zeroed makes it the candidate
+for a link id resolved in a later pass, in the style of `NiObject::LinkObject` —
+but that is a hypothesis, not a finding.
+
+`+0x54` was briefly a candidate for the child container; `sub_60AC3C` shows it
+installs `vtbl_MfPropertyTable`, so it is the `MF_` property table this project
+already parses. Ruled out.
+
+## Where the child *nodes* are read is still unknown
+
+`Act__LoadNode` builds one node and calls `MfProtoActor__SetRootNode`, yet
+`Prince.act` has 31 nodes, and no node-creating loop appears in the node reader.
+Something outside `vf1` walks the file. That is the next question, and it is now
+a narrow one.

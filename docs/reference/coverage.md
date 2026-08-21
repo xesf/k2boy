@@ -7,9 +7,9 @@ Regenerate with `python3 tools/coverage.py`. Subsystem percentages are judgement
 | Bucket | Count | Share |
 |---|---:|---:|
 | Total | 39,695 | 100.0% |
-| Named by this project | 777 | 2.0% |
-| Named by IDA / FLIRT (library code) | 1,376 | 3.5% |
-| Still `sub_*` | 37,542 | 94.6% |
+| Named by this project | 793 | 2.0% |
+| Named by IDA / FLIRT (library code) | 1,379 | 3.5% |
+| Still `sub_*` | 37,523 | 94.5% |
 
 The headline number is deliberately unflattering. Most of the binary is NetImmerse and Motivate middleware that does not need naming to be reimplemented - see `docs/plan/03-reimplementation.md`. Progress is better read per subsystem below.
 
@@ -47,9 +47,10 @@ Trap factory                 [####################] 100%  all 33 registry keys +
 Chunk registry               [####################] 100%  78 types with creator and sizeof
 Piccolo script API           [####################] 100%  29 classes, 250 methods (dormant subsystem)
 K2A keyword grammar          [####################] 100%  77 keywords incl. K2_TRAP_* and TRI_* variant
-K2A loader (engine code)     [####################] 100%  parser + mesh build; 501/501 geometry files parse
-LVL + NBR loaders            [####################] 100%  all 21 levels parse; 18 resolve every path
+K2A loader (engine code)     [####################] 100%  parser + mesh build; 501/501 parse; per-channel material reading (MAP_DIFFUSE bitmap, MAP_OPACITY = blended)
+LVL + NBR loaders            [####################] 100%  all 21 levels parse; 18 resolve every path; fog factors are far-clip fractions
 master.dat loader            [####################] 100%  42/42 parse, 0 unresolved geometry or actor
+ACT skeleton hierarchy       [#############.......]  65%  transforms are local-to-parent, bind rotations identity, this-adjust resolved (0x14); full reader field order mapped; count-prefixed 20-byte records located; node-walk still unknown
 ACT loader                   [###############.....]  75%  properties 145/145; node layout + write order recovered
 Mf serialization iface       [##################..]  90%  interface, tags, write order, and the +0x14 MI this-adjust
 Image loaders                [####################] 100%  BMP + TGA, 1035/1035 decode
@@ -61,13 +62,15 @@ Command-line dispatcher      [#######.............]  35%  tree mapped, ~6 of 18 
 Savegame                     [#########...........]  45%  framing + 5 sections
 Animation (.skl)             [###################.]  95%  loader done: 2363 files, 0 failures, 99.89% quats valid
 CharacterStateTable          [####................]  20%  placed in the hierarchy; base of Prince, camera and Trap. Only 7 of its 51 slots are overridden - 51 slots are the inherited NiNode interface, not states
-Module state machine         [#######.............]  35%  6-virtual interface, 5 subclasses, slot 3 = event handler
+Boot sequence / WinMain      [##################..]  90%  entry -> WinMain -> event loop traced; distribution.dat + Tsunami.ttf; distribution.dat parsed; module table decoded - ids are alphabetical, 0x0C = prison = prisonfix.lvl
+Module state machine         [###############.....]  75%  6-virtual interface, 5 subclasses, slot 3 = event handler; 20 modules with names + levels, table + startup id implemented and verified
+Scene graph (NiNode)         [############........]  60%  transform layout measured from NiAVObject__LoadBinary; 8/8 self-test
 Actor spawn / New Game       [##############......]  70%  chain traced; ported and validated: 134/142 spawn points resolve
 K2*Activity family           [#...................]   5%  identified and named only
 Motivate planner             [....................]   0%  MfLocoPlanner / MfManipActivity - not started
 ```
 
-Unweighted mean across subsystems: **72%**.
+Unweighted mean across subsystems: **73%**.
 
 ## What the numbers say about ordering
 

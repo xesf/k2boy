@@ -10,6 +10,9 @@
 #include "assets/skl.h"
 #include "engine/nirtti.h"
 #include "engine/actor.h"
+#include "engine/node.h"
+#include "engine/config.h"
+#include "engine/module_table.h"
 
 #include <cstdio>
 #include <cstring>
@@ -41,15 +44,6 @@ void mat4_look_at(float* m, const float* eye, const float* at, const float* up) 
     m[1]=u[0]; m[5]=u[1]; m[9]=u[2];  m[13]=-(u[0]*eye[0]+u[1]*eye[1]+u[2]*eye[2]);
     m[2]=-f[0];m[6]=-f[1];m[10]=-f[2];m[14]=  f[0]*eye[0]+f[1]*eye[1]+f[2]*eye[2];
     m[3]=0; m[7]=0; m[11]=0; m[15]=1;
-}
-
-// Y-axis rotation plus translation: the placement a spawn point specifies.
-void mat4_translate_yaw(float* m, const float* pos, float yaw) {
-    const float c = std::cos(yaw), sn = std::sin(yaw);
-    mat4_identity(m);
-    m[0]  =  c;  m[2]  = -sn;
-    m[8]  =  sn; m[10] =  c;
-    m[12] = pos[0]; m[13] = pos[1]; m[14] = pos[2];
 }
 
 void mat4_perspective(float* m, float fov_y_rad, float aspect, float znear, float zfar) {
@@ -120,6 +114,71 @@ void verify_rtti() {
     // A negative control: these must not be related, or is_kind_of is degenerate.
     std::printf("  NiCamera is not a Trap     %s\n",
                 k2::engine::rtti_is_kind_of("NiCamera", "Trap") ? "WRONG" : "ok");
+}
+
+// Self-test for the scene graph. Transform composition cannot be eyeballed, and
+// a wrong basis would silently misplace every actor, so check it against
+// hand-computed answers. See docs/reference/scene-graph.md.
+void verify_nodes() {
+    using namespace k2::engine;
+    int pass = 0, fail = 0;
+    #define CHECK(what, cond) do { if (cond) ++pass; else { ++fail; \
+        std::printf("  node self-test FAILED: %s\n", what); } } while (0)
+
+    // A 90-degree yaw sends +X to -Z. set_yaw uses the same convention as the
+    // camera basis, so this pins the sign down rather than assuming it.
+    transform r;
+    r.set_yaw(1.5707963f);
+    float m[16];
+    r.to_matrix(m);
+    CHECK("yaw90 maps +X to -Z", std::fabs(m[0]) < 1e-4f && std::fabs(m[2] + 1.0f) < 1e-4f);
+
+    // Composition: parent translated, child offset along +X, parent yawed 90.
+    // The child should end up offset along -Z from the parent.
+    transform parent, childl, out;
+    parent.set_yaw(1.5707963f);
+    parent.translate[0] = 10.0f; parent.translate[1] = 0.0f; parent.translate[2] = 5.0f;
+    childl.translate[0] = 2.0f;
+    transform_compose(parent, childl, out);
+    CHECK("compose rotates child offset",
+          std::fabs(out.translate[0] - 10.0f) < 1e-3f &&
+          std::fabs(out.translate[2] - 3.0f)  < 1e-3f);
+
+    // Identity parent must leave the child untouched.
+    transform id, c2, out2;
+    c2.translate[0] = 1.0f; c2.translate[1] = 2.0f; c2.translate[2] = 3.0f;
+    transform_compose(id, c2, out2);
+    CHECK("identity parent is a no-op",
+          std::fabs(out2.translate[0]-1.0f) < 1e-6f &&
+          std::fabs(out2.translate[1]-2.0f) < 1e-6f &&
+          std::fabs(out2.translate[2]-3.0f) < 1e-6f);
+
+    // Scale multiplies down the chain and scales the child's offset.
+    transform sp, sc2, so;
+    sp.scale = 2.0f; sc2.scale = 3.0f; sc2.translate[0] = 1.0f;
+    transform_compose(sp, sc2, so);
+    CHECK("scale composes", std::fabs(so.scale - 6.0f) < 1e-6f &&
+                            std::fabs(so.translate[0] - 2.0f) < 1e-6f);
+
+    // Graph: parent -> child, world of child must equal the composition.
+    level_group* root = new level_group();
+    root->name = "root";
+    root->local.translate[1] = 100.0f;
+    ni_node* kid = new ni_node();
+    kid->name = "kid";
+    kid->local.translate[1] = 5.0f;
+    root->add_child(kid);
+    root->update_world();
+    CHECK("child world inherits parent", std::fabs(kid->world().translate[1] - 105.0f) < 1e-4f);
+    CHECK("find by name", root->find("kid") == kid);
+    CHECK("subtree size", root->subtree_size() == 2);
+    CHECK("rtti", kid->is_kind_of(ni_node::rtti()) &&
+                  root->is_kind_of(ni_node::rtti()) &&
+                  !kid->is_kind_of(level_group::rtti()));
+    delete root;   // must also delete the child
+
+    #undef CHECK
+    std::printf("scene graph self-test: %d passed, %d failed\n", pass, fail);
 }
 
 // Headless .K2A dump: parses a file and reports what came out. The real check
@@ -324,6 +383,318 @@ bool write_bmp(const char* path, int w, int h, const uint8_t* rgba) {
     return true;
 }
 
+
+// Dumps the bytes surrounding each .act node record, to look for the parent
+// link. Nodes are `u32 len, name, 28-byte transform`; whatever encodes the tree
+// has to live near them. See docs/formats/act.md.
+int dump_act_nodes(const char* path) {
+    size_t size = 0;
+    uint8_t* d = plat::fs_read_basename(path, size);
+    if (!d) d = plat::fs_read(path, size);
+    if (!d) { std::fprintf(stderr, "k2boy: cannot read %s\n", path); return 1; }
+
+    assets::act_file a;
+    std::string err;
+    if (!assets::act_parse(d, size, a, &err)) { plat::fs_free(d); return 1; }
+
+    std::printf("%s: %zu nodes, file %zu bytes\n", path, a.nodes.size(), size);
+    for (size_t i = 0; i < a.nodes.size(); ++i) {
+        const assets::act_node& n = a.nodes[i];
+        const size_t rec_end = n.offset + 4 + n.name.size() + 28;
+        const size_t gap = (i + 1 < a.nodes.size())
+                         ? a.nodes[i + 1].offset - rec_end : 0;
+        std::printf("  [%2zu] %-14s off %6zu  rec_end %6zu  gap_to_next %4zu  ",
+                    i, n.name.c_str(), n.offset, rec_end, gap);
+        // First 16 bytes after the transform, as both hex and u32.
+        const size_t show = (rec_end + 16 <= size) ? 16 : 0;
+        for (size_t k = 0; k < show; ++k) std::printf("%02x ", d[rec_end + k]);
+        if (show >= 8) {
+            uint32_t a0, a1;
+            std::memcpy(&a0, d + rec_end, 4);
+            std::memcpy(&a1, d + rec_end + 4, 4);
+            std::printf(" u32[%u, %u]", a0, a1);
+        }
+        std::printf("\n");
+    }
+    plat::fs_free(d);
+    return 0;
+}
+
+// Probe: do the .act node transforms line up with the .K2A body geometry?
+//
+// The parts in a body .K2A are baked in bind pose (a standing figure, ~2 units
+// tall). Animation needs each part in its own local space, so the bind
+// transform has to be removed: local = R^T * (v - t). If the .act transforms
+// really are world-space bind poses, every part's vertices should collapse to a
+// small blob around the origin once that is applied. If they are local-to-parent
+// (the .act hierarchy is not recovered - see docs/formats/act.md), it will not
+// collapse, and this says so instead of guessing.
+int check_bind_pose(const char* master_path) {
+    assets::master_file m;
+    {
+        size_t size = 0;
+        uint8_t* d = plat::fs_read(master_path, size);
+        if (!d) d = plat::fs_read_basename(master_path, size);
+        if (!d) { std::fprintf(stderr, "k2boy: cannot read %s\n", master_path); return 1; }
+        std::string err;
+        const bool ok = assets::master_parse(d, size, m, &err);
+        plat::fs_free(d);
+        if (!ok) { std::fprintf(stderr, "k2boy: master parse failed: %s\n", err.c_str()); return 1; }
+    }
+
+    assets::k2a_file g;
+    {
+        size_t size = 0;
+        uint8_t* d = plat::fs_read_basename(m.geometry.c_str(), size);
+        if (!d) { std::fprintf(stderr, "k2boy: cannot read %s\n", m.geometry.c_str()); return 1; }
+        std::string err;
+        const bool ok = assets::k2a_parse(d, size, g, &err);
+        plat::fs_free(d);
+        if (!ok) return 1;
+    }
+
+    assets::act_file a;
+    {
+        std::string act_path = m.proto ? m.actor : (m.actor + ".act");
+        size_t size = 0;
+        uint8_t* d = plat::fs_read_basename(act_path.c_str(), size);
+        if (!d) { std::fprintf(stderr, "k2boy: cannot read %s\n", act_path.c_str()); return 1; }
+        std::string err;
+        const bool ok = assets::act_parse(d, size, a, &err);
+        plat::fs_free(d);
+        if (!ok) return 1;
+    }
+
+    std::printf("%s: %zu geometry nodes, %zu act nodes\n",
+                m.name.c_str(), g.nodes.size(), a.nodes.size());
+
+    // .K2A node positions are world bind poses in Max's Z-up space; .act
+    // offsets are local-to-parent in the engine's Y-up space. The mapping is
+    // engine = (x, z, -y), confirmed on Pelvis: k2a (0, 0, 1.033) vs act
+    // (0, 1.034, 0).
+    struct joint {
+        std::string name;
+        float       world[3];    // engine space, from the .K2A node transform
+        float       local[3];    // engine space, from the .act node
+        int         parent;
+        float       residual;
+    };
+    std::vector<joint> js;
+
+    size_t orphan = 0;
+    for (size_t i = 0; i < g.nodes.size(); ++i) {
+        const assets::k2a_node& n = g.nodes[i];
+        if (!n.has_mesh || n.has_trap) continue;
+        const assets::act_node* bind = 0;
+        for (size_t k = 0; k < a.nodes.size(); ++k)
+            if (a.nodes[k].name == n.name) { bind = &a.nodes[k]; break; }
+        if (!bind) { ++orphan; continue; }
+
+        joint j;
+        j.name     = n.name;
+        j.world[0] =  n.pos[0];
+        j.world[1] =  n.pos[2];
+        j.world[2] = -n.pos[1];
+        for (int k = 0; k < 3; ++k) j.local[k] = bind->pos[k];
+        j.parent   = -1;
+        j.residual = 0.0f;
+        js.push_back(j);
+    }
+
+    // parent_world ~= child_world - child_local. Pick the joint sitting closest
+    // to that predicted point. Rotation is ignored on purpose: if the bind pose
+    // is mostly axis-aligned this is enough to recover the tree, and the
+    // residual below says whether that held.
+    float worst_res = 0.0f;
+    double sum_res = 0.0;
+    size_t rooted = 0;
+    for (size_t i = 0; i < js.size(); ++i) {
+        const float want[3] = { js[i].world[0] - js[i].local[0],
+                                js[i].world[1] - js[i].local[1],
+                                js[i].world[2] - js[i].local[2] };
+        int best = -1;
+        float bestd = 1e30f;
+        for (size_t k = 0; k < js.size(); ++k) {
+            if (k == i) continue;
+            const float dx = js[k].world[0] - want[0];
+            const float dy = js[k].world[1] - want[1];
+            const float dz = js[k].world[2] - want[2];
+            const float d  = std::sqrt(dx*dx + dy*dy + dz*dz);
+            if (d < bestd) { bestd = d; best = int(k); }
+        }
+        // A joint whose predicted parent is the origin is the root.
+        const float rootd = std::sqrt(want[0]*want[0] + want[1]*want[1] + want[2]*want[2]);
+        if (rootd < bestd) { js[i].parent = -1; js[i].residual = rootd; ++rooted; }
+        else               { js[i].parent = best; js[i].residual = bestd; }
+        sum_res += js[i].residual;
+        if (js[i].residual > worst_res) worst_res = js[i].residual;
+    }
+
+    for (size_t i = 0; i < js.size() && i < 14; ++i)
+        std::printf("  %-16s parent %-16s residual %.4f\n",
+                    js[i].name.c_str(),
+                    js[i].parent < 0 ? "(root)" : js[size_t(js[i].parent)].name.c_str(),
+                    js[i].residual);
+
+    // A tree needs exactly one root and no cycles.
+    size_t cyclic = 0;
+    for (size_t i = 0; i < js.size(); ++i) {
+        int p = js[i].parent;
+        for (size_t hops = 0; p >= 0 && hops <= js.size(); ++hops) {
+            if (size_t(p) == i) { ++cyclic; break; }
+            p = js[size_t(p)].parent;
+        }
+    }
+
+    std::printf("  joints %zu, orphan %zu, roots %zu, cycles %zu\n",
+                js.size(), orphan, rooted, cyclic);
+    std::printf("  residual: mean %.4f, worst %.4f\n",
+                js.empty() ? 0.0 : sum_res / double(js.size()), worst_res);
+    // Now the real test. With the tree known, run forward kinematics from the
+    // .act locals *including rotation* and compare the resulting world
+    // positions against the .K2A bind poses. The parent search above ignored
+    // rotation, so this is an independent check, not a restatement.
+    std::vector<float> wq(js.size() * 4), wt(js.size() * 3);
+    std::vector<bool>  done(js.size(), false);
+
+    // act quaternions are w-first; find each joint's own local rotation.
+    std::vector<float> lq(js.size() * 4);
+    for (size_t i = 0; i < js.size(); ++i) {
+        const assets::act_node* bn = 0;
+        for (size_t k = 0; k < a.nodes.size(); ++k)
+            if (a.nodes[k].name == js[i].name) { bn = &a.nodes[k]; break; }
+        for (int k = 0; k < 4; ++k) lq[i*4+k] = bn ? bn->quat[k] : (k == 0 ? 1.0f : 0.0f);
+    }
+
+    bool progress = true;
+    while (progress) {
+        progress = false;
+        for (size_t i = 0; i < js.size(); ++i) {
+            if (done[i]) continue;
+            const int p = js[i].parent;
+            if (p >= 0 && !done[size_t(p)]) continue;
+
+            float pq[4] = {1,0,0,0}, pt[3] = {0,0,0};
+            if (p >= 0) {
+                for (int k = 0; k < 4; ++k) pq[k] = wq[size_t(p)*4+k];
+                for (int k = 0; k < 3; ++k) pt[k] = wt[size_t(p)*3+k];
+            }
+            // world_q = parent_q * local_q  (Hamilton, w first)
+            const float* q = &lq[i*4];
+            wq[i*4+0] = pq[0]*q[0] - pq[1]*q[1] - pq[2]*q[2] - pq[3]*q[3];
+            wq[i*4+1] = pq[0]*q[1] + pq[1]*q[0] + pq[2]*q[3] - pq[3]*q[2];
+            wq[i*4+2] = pq[0]*q[2] - pq[1]*q[3] + pq[2]*q[0] + pq[3]*q[1];
+            wq[i*4+3] = pq[0]*q[3] + pq[1]*q[2] - pq[2]*q[1] + pq[3]*q[0];
+            // world_t = parent_t + parent_R * local_t
+            const float w0=pq[0], x0=pq[1], y0=pq[2], z0=pq[3];
+            const float R[9] = {
+                1-2*(y0*y0+z0*z0),   2*(x0*y0-w0*z0),   2*(x0*z0+w0*y0),
+                  2*(x0*y0+w0*z0), 1-2*(x0*x0+z0*z0),   2*(y0*z0-w0*x0),
+                  2*(x0*z0-w0*y0),   2*(y0*z0+w0*x0), 1-2*(x0*x0+y0*y0)
+            };
+            const float* t = js[i].local;
+            for (int r = 0; r < 3; ++r)
+                wt[i*3+r] = pt[r] + R[r*3+0]*t[0] + R[r*3+1]*t[1] + R[r*3+2]*t[2];
+            done[i] = true;
+            progress = true;
+        }
+    }
+
+    for (size_t i = 0; i < a.nodes.size(); ++i) {
+        bool has_geom = false;
+        for (size_t k = 0; k < js.size(); ++k)
+            if (js[k].name == a.nodes[i].name) { has_geom = true; break; }
+        if (!has_geom)
+            std::printf("  act node with NO geometry: %-16s local (%6.3f %6.3f %6.3f)\n",
+                        a.nodes[i].name.c_str(), a.nodes[i].pos[0],
+                        a.nodes[i].pos[1], a.nodes[i].pos[2]);
+    }
+    for (size_t i = 0; i < js.size() && i < 0; ++i)
+        std::printf("  quat %-14s [%6.3f %6.3f %6.3f %6.3f] |q|=%.4f\n",
+                    js[i].name.c_str(), lq[i*4+0], lq[i*4+1], lq[i*4+2], lq[i*4+3],
+                    std::sqrt(lq[i*4+0]*lq[i*4+0]+lq[i*4+1]*lq[i*4+1]+
+                              lq[i*4+2]*lq[i*4+2]+lq[i*4+3]*lq[i*4+3]));
+
+    float fk_worst = 0.0f; double fk_sum = 0.0; std::string fk_worst_name;
+    for (size_t i = 0; i < js.size(); ++i) {
+        const float dx = wt[i*3+0] - js[i].world[0];
+        const float dy = wt[i*3+1] - js[i].world[1];
+        const float dz = wt[i*3+2] - js[i].world[2];
+        const float d  = std::sqrt(dx*dx + dy*dy + dz*dz);
+        fk_sum += d;
+        if (d > fk_worst) { fk_worst = d; fk_worst_name = js[i].name; }
+    }
+    std::printf("  forward kinematics vs .K2A bind: mean %.4f, worst %.4f (%s)\n",
+                js.empty() ? 0.0 : fk_sum / double(js.size()), fk_worst,
+                fk_worst_name.c_str());
+    std::printf("  verdict: %s\n",
+                (rooted == 1 && cyclic == 0 && fk_worst < 0.02f)
+                    ? "hierarchy recovered and confirmed by forward kinematics"
+                    : "hierarchy NOT confirmed");
+    return 0;
+}
+
+// Reads the startup flag file the way WinMain does, and reports what it found.
+// See docs/reference/boot-sequence.md.
+int dump_config(const char* path) {
+    size_t size = 0;
+    uint8_t* d = plat::fs_read(path, size);
+    if (!d) d = plat::fs_read_basename(path, size);
+    if (!d) { std::fprintf(stderr, "k2boy: cannot read '%s'\n", path); return 1; }
+
+    k2::engine::config cfg;
+    k2::engine::config_parse(reinterpret_cast<const char*>(d), size, cfg);
+    plat::fs_free(d);
+
+    std::printf("%s: %zu active flags\n", path, cfg.flags.size());
+    for (size_t i = 0; i < cfg.flags.size(); ++i)
+        std::printf("  -%c  %s\n", cfg.flags[i].key,
+                    cfg.flags[i].tail.empty() ? "(no tail)" : cfg.flags[i].tail.c_str());
+
+    const std::string startup = cfg.startup_file();
+    const std::string console = cfg.console_file();
+    std::printf("  startup file (-i): %s\n", startup.empty() ? "(none)" : startup.c_str());
+    std::printf("  console file (-c): %s\n", console.empty() ? "(none)" : console.c_str());
+
+    // Follow the -i file, which is what the original would load next.
+    if (!startup.empty()) {
+        size_t s2 = 0;
+        uint8_t* d2 = plat::fs_read_basename(startup.c_str(), s2);
+        if (d2) {
+            std::string body(reinterpret_cast<const char*>(d2), s2);
+            while (!body.empty() && (body[body.size()-1] == '\n' || body[body.size()-1] == '\r'))
+                body.erase(body.size()-1);
+            std::printf("  %s contents: '%s'\n", startup.c_str(), body.c_str());
+            plat::fs_free(d2);
+        } else {
+            std::printf("  %s: NOT FOUND\n", startup.c_str());
+        }
+    }
+    return 0;
+}
+
+// Prints the recovered module registry and checks the ordering that defines
+// the ids. See docs/plan/05-boot-to-gameplay.md.
+int dump_modules() {
+    const char* why = 0;
+    const bool ok = k2::engine::module_table_verify(&why);
+
+    size_t n = 0;
+    const k2::engine::module_entry* t = k2::engine::module_table(n);
+    std::printf("%zu modules; id = position in the strcmpi-sorted name list\n", n);
+    for (size_t i = 0; i < n; ++i) {
+        const char* kind = t[i].kind == k2::engine::MODULE_KIND_GAME  ? "game"
+                         : t[i].kind == k2::engine::MODULE_KIND_MENU  ? "menu"
+                         : t[i].kind == k2::engine::MODULE_KIND_NIS   ? "NIS"
+                                                                      : "title";
+        std::printf("  %2zu (0x%02zX) %-5s %-12s %s%s\n", i, i, kind, t[i].name,
+                    t[i].level,
+                    int32_t(i) == k2::engine::MODULE_ID_STARTUP ? "   <== WinMain posts 0x0C" : "");
+    }
+    std::printf("table ordering: %s\n", ok ? "ok" : why);
+    return ok ? 0 : 1;
+}
+
 } // namespace
 
 // Free-fly camera. Yaw/pitch in radians; pitch clamped just short of vertical
@@ -351,6 +722,7 @@ struct draw_item {
     bool            is_trap;        // a trigger volume, drawn as coloured wireframe
     int             trap_type;      // index into scene::trap_types; -1 when not a volume
     int             owner;          // index into scene::actors; -1 for static room geometry
+    float           center[3];      // world centroid, for back-to-front sorting
     float           tint[3];        // filled by assign_trap_colors once the scene is loaded
 };
 
@@ -358,12 +730,11 @@ struct draw_item {
 // The original attaches an AnimationNode to the LevelGroup; this is the same
 // relationship expressed as a draw range plus a transform.
 struct actor_inst {
-    std::string name;
-    float       pos[3];
-    float       yaw;
-    bool        is_enemy;
-    size_t      first_item;
-    size_t      item_count;
+    std::string             name;
+    k2::engine::animation_node* node;   // owned by scene::root
+    bool                    is_enemy;
+    size_t                  first_item;
+    size_t                  item_count;
 };
 
 struct scene {
@@ -371,12 +742,18 @@ struct scene {
     std::vector<gfx::texture_id> textures;   // owned, one per material
     std::vector<std::string> trap_types;     // distinct types present, for the legend
     std::vector<actor_inst>  actors;
+    // The scene graph. Rooms and actors are children of the level root; room
+    // geometry is authored in world space so rooms sit at identity, while
+    // actors carry the transform their spawn point specifies.
+    k2::engine::level_group* root;
     // PrinceStart / EnemyStart trap blocks found in the rooms. argv[0] is the
     // body name (Traps.txt); centre and pivot angle give the placement.
     std::vector<assets::k2a_trap> spawn_points;
     float mn[3];
     float mx[3];
     bool  empty;
+
+    scene() : root(0), empty(true) { mn[0]=mn[1]=mn[2]=0; mx[0]=mx[1]=mx[2]=0; }
 };
 
 // Trigger volumes carry no material, so they used to render as solid black
@@ -459,11 +836,137 @@ gfx::texture_id load_texture(const std::string& bitmap_path, int& decoded, int& 
     return gfx::create_texture(img.width, img.height, &img.rgba[0]);
 }
 
+// Sweeps every .K2A in the install and reports how many materials resolve a
+// texture, how many are flagged blended, and how many name a bitmap that cannot
+// be found. Added after the per-channel material fix, which changed *which*
+// bitmap each material uses - a change worth checking install-wide rather than
+// on one room. See docs/formats/k2a.md.
+int check_materials() {
+    std::vector<std::string> paths;
+    plat::fs_list_paths_by_extension(".k2a", paths);
+    std::sort(paths.begin(), paths.end());
+
+    size_t files = 0, mats = 0, with_bitmap = 0, resolved = 0, blended = 0, missing = 0;
+    std::vector<std::string> misses;
+
+    for (size_t i = 0; i < paths.size(); ++i) {
+        size_t size = 0;
+        uint8_t* d = plat::fs_read(paths[i].c_str(), size);
+        if (!d) continue;
+        assets::k2a_file f;
+        std::string err;
+        const bool ok = assets::k2a_parse(d, size, f, &err);
+        plat::fs_free(d);
+        if (!ok) continue;
+        ++files;
+
+        for (size_t m = 0; m < f.materials.size(); ++m) {
+            ++mats;
+            if (f.materials[m].alpha == assets::K2A_ALPHA_OPACITY) ++blended;
+            const std::string& b = f.materials[m].bitmap;
+            if (b.empty()) continue;
+            ++with_bitmap;
+            const std::string img = resolve_ifl(b);
+            char real[4096];
+            if (plat::fs_resolve_basename(img.c_str(), real, sizeof(real))) ++resolved;
+            else {
+                ++missing;
+                if (misses.size() < 10) misses.push_back(img);
+            }
+        }
+    }
+
+    std::printf("materials: %zu files, %zu materials\n", files, mats);
+    std::printf("  name a bitmap   %zu\n", with_bitmap);
+    std::printf("  bitmap resolves %zu\n", resolved);
+    std::printf("  unresolved      %zu\n", missing);
+    std::printf("  blended (MAP_OPACITY or TRANSPARENCY>0) %zu (%.1f%%)\n",
+                blended, mats ? 100.0 * double(blended) / double(mats) : 0.0);
+    for (size_t i = 0; i < misses.size(); ++i)
+        std::printf("    missing: %s\n", misses[i].c_str());
+    return missing == 0 ? 0 : 1;
+}
+
+// Determines .K2A triangle winding, which gates backface culling.
+//
+// For a closed mesh the divergence theorem gives a signed volume from the
+// triangles alone: V = sum dot(v0, cross(v1-v0, v2-v0)) / 6. With outward-facing
+// counter-clockwise winding (OpenGL's default front face) V is positive. Actor
+// body parts are watertight, so they are the meshes to measure; room walls are
+// often single-sided sheets and are reported separately.
+int check_winding() {
+    std::vector<std::string> paths;
+    plat::fs_list_paths_by_extension(".k2a", paths);
+    std::sort(paths.begin(), paths.end());
+
+    size_t pos = 0, neg = 0, flat = 0, meshes = 0;
+    double pos_vol = 0.0, neg_vol = 0.0;
+
+    for (size_t i = 0; i < paths.size(); ++i) {
+        // Actor geometry lives under Geometry\Enemies or \prince; rooms do not.
+        std::string lower = paths[i];
+        for (size_t k = 0; k < lower.size(); ++k)
+            lower[k] = char(std::tolower((unsigned char)lower[k]));
+        const bool is_actor = lower.find("enemies") != std::string::npos ||
+                              lower.find("prince")  != std::string::npos;
+        if (!is_actor) continue;
+
+        size_t size = 0;
+        uint8_t* d = plat::fs_read(paths[i].c_str(), size);
+        if (!d) continue;
+        assets::k2a_file f;
+        std::string err;
+        const bool ok = assets::k2a_parse(d, size, f, &err);
+        plat::fs_free(d);
+        if (!ok) continue;
+
+        for (size_t n = 0; n < f.nodes.size(); ++n) {
+            const assets::k2a_node& nd = f.nodes[n];
+            if (!nd.has_mesh || nd.has_trap) continue;
+            std::vector<assets::k2a_vertex> vb;
+            std::vector<uint16_t> ib;
+            assets::k2a_build_mesh(nd, vb, ib);
+            if (ib.size() < 3) continue;
+            ++meshes;
+
+            double vol = 0.0;
+            for (size_t t = 0; t + 2 < ib.size(); t += 3) {
+                const assets::k2a_vertex& a = vb[ib[t]];
+                const assets::k2a_vertex& b = vb[ib[t+1]];
+                const assets::k2a_vertex& c = vb[ib[t+2]];
+                const double e0[3] = {b.x-a.x, b.y-a.y, b.z-a.z};
+                const double e1[3] = {c.x-a.x, c.y-a.y, c.z-a.z};
+                const double cr[3] = {e0[1]*e1[2]-e0[2]*e1[1],
+                                      e0[2]*e1[0]-e0[0]*e1[2],
+                                      e0[0]*e1[1]-e0[1]*e1[0]};
+                vol += a.x*cr[0] + a.y*cr[1] + a.z*cr[2];
+            }
+            vol /= 6.0;
+            if      (vol >  1e-6) { ++pos; pos_vol += vol; }
+            else if (vol < -1e-6) { ++neg; neg_vol += vol; }
+            else                    ++flat;
+        }
+    }
+
+    std::printf("winding over %zu actor meshes\n", meshes);
+    std::printf("  positive volume (CCW outward) %zu   total %.3f\n", pos, pos_vol);
+    std::printf("  negative volume (CW outward)  %zu   total %.3f\n", neg, neg_vol);
+    std::printf("  degenerate / open             %zu\n", flat);
+    const size_t dom = pos > neg ? pos : neg;
+    std::printf("  verdict: %s (%.1f%% agree)\n",
+                pos == neg ? "inconclusive" : (pos > neg ? "CCW front faces" : "CW front faces"),
+                (pos + neg) ? 100.0 * double(dom) / double(pos + neg) : 0.0);
+    return 0;
+}
+
 void scene_reset(scene& sc) {
     sc.items.clear();
     sc.textures.clear();
     sc.trap_types.clear();
     sc.actors.clear();
+    delete sc.root;
+    sc.root = new k2::engine::level_group();
+    sc.root->name = "LevelRoot";
     sc.spawn_points.clear();
     sc.empty = true;
     sc.mn[0] = sc.mn[1] = sc.mn[2] =  1e30f;
@@ -485,6 +988,7 @@ bool append_scene(const char* path, scene& sc) {
 
     // Texture ids are per-file, so remember where this file's block starts.
     const size_t tex_base = sc.textures.size();
+    const size_t first_item_of_file = sc.items.size();
     int decoded = 0, failed = 0;
     std::vector<bool> mat_transparent(f.materials.size(), false);
     for (size_t i = 0; i < f.materials.size(); ++i) {
@@ -525,8 +1029,19 @@ bool append_scene(const char* path, scene& sc) {
         }
         total_v += vb.size();
 
+        // Centroid of the built mesh, used to sort the transparent pass.
+        float cmn[3] = {1e30f,1e30f,1e30f}, cmx[3] = {-1e30f,-1e30f,-1e30f};
+        for (size_t v = 0; v < vb.size(); ++v) {
+            const float pv[3] = {vb[v].x, vb[v].y, vb[v].z};
+            for (int a = 0; a < 3; ++a) {
+                if (pv[a] < cmn[a]) cmn[a] = pv[a];
+                if (pv[a] > cmx[a]) cmx[a] = pv[a];
+            }
+        }
+
         // k2a_vertex and gfx::vertex have identical layout by construction.
         draw_item it;
+        for (int a = 0; a < 3; ++a) it.center[a] = (cmn[a] + cmx[a]) * 0.5f;
         it.mesh = gfx::create_mesh(
             reinterpret_cast<const gfx::vertex*>(&vb[0]), int32_t(vb.size()),
             &ib[0], int32_t(ib.size()));
@@ -557,8 +1072,17 @@ bool append_scene(const char* path, scene& sc) {
         sc.items.push_back(it);
     }
 
-    std::printf("  %-28s %3zu meshes %6zu verts  tex %3d ok %2d fail  traps %d\n",
-                path, f.nodes.size(), total_v, decoded, failed, f.trap_count());
+    {
+        size_t op = 0, tr = 0, tv = 0;
+        for (size_t i = first_item_of_file; i < sc.items.size(); ++i) {
+            if (sc.items[i].is_trap) { ++tv; continue; }
+            if (sc.items[i].transparent) ++tr; else ++op;
+        }
+        std::printf("  %-28s %3zu meshes %6zu verts  tex %3d ok %2d fail  traps %d"
+                    "  [opaque %zu transparent %zu vol %zu, mats %zu]\n",
+                    path, f.nodes.size(), total_v, decoded, failed, f.trap_count(),
+                    op, tr, tv, f.materials.size());
+    }
     return true;
 }
 
@@ -681,6 +1205,24 @@ bool append_actor_geometry(const std::string& geometry, scene& sc,
 // PrinceStart and EnemyStart both take the body *name* in argv[0] (Traps.txt),
 // and the original resolves it by walking the body table comparing names. The
 // placement comes from the trap's centre and pivot angle.
+// The Prince has two possible spawn sources and levels use different ones:
+//
+//   * `.lvl` [Prince] inside a [Region]: "<body> x,y,z,heading". Active in
+//     prisonfix, the game's opening level, where it is commented `;cell`.
+//   * a PrinceStart trap in room geometry, resolved by body name. Used by
+//     Cistern, whose [Prince] line is commented out.
+//
+// An earlier reading of this project concluded [Prince] was a dead authoring
+// leftover, on the strength of Cistern alone. That was wrong: it is live in the
+// first level. Try it first, fall back to the traps.
+//
+// `heading` is in **degrees** here - prisonfix writes 83.25, which is nonsense
+// as radians. The trap route's pivot_angle is radians.
+size_t spawn_prince_from_level(const assets::lvl_file& lv, scene& sc,
+                               k2::engine::body_table& bodies,
+                               std::vector<k2::engine::actor_spawn>& spawns,
+                               int region);
+
 void spawn_level_actors(scene& sc, k2::engine::body_table& bodies,
                         std::vector<k2::engine::actor_spawn>& spawns) {
     for (size_t i = 0; i < sc.spawn_points.size(); ++i) {
@@ -706,12 +1248,19 @@ void spawn_level_actors(scene& sc, k2::engine::body_table& bodies,
         // which builds an AnimationNode and hangs the body parts off it; here
         // the whole body is one .K2A, which is what the shipped data provides.
         const k2::engine::avatar_body* b = bodies.at(body);
+        k2::engine::animation_node* an = new k2::engine::animation_node();
+        an->name = spawns[size_t(id)].name;
+        an->body = body;
+        an->is_enemy = is_enemy;
+        an->local.set_yaw(t.pivot_angle);
+        an->local.translate[0] = t.center[0];
+        an->local.translate[1] = t.center[1];
+        an->local.translate[2] = t.center[2];
+        sc.root->add_child(an);
+
         actor_inst inst;
         inst.name       = spawns[size_t(id)].name;
-        inst.pos[0]     = t.center[0];
-        inst.pos[1]     = t.center[1];
-        inst.pos[2]     = t.center[2];
-        inst.yaw        = t.pivot_angle;
+        inst.node       = an;
         inst.is_enemy   = is_enemy;
         inst.first_item = 0;
         inst.item_count = 0;
@@ -726,12 +1275,69 @@ void spawn_level_actors(scene& sc, k2::engine::body_table& bodies,
             sc.items[inst.first_item + k].owner = owner;
         sc.actors.push_back(inst);
 
+        sc.root->update_world();
         std::printf("  spawned %-14s body %d (%s) at (%.1f, %.1f, %.1f) yaw %.2f  %zu meshes"
                     "  local x[%.2f,%.2f] y[%.2f,%.2f] z[%.2f,%.2f]\n",
                     inst.name.c_str(), body, b->name.c_str(),
-                    inst.pos[0], inst.pos[1], inst.pos[2], inst.yaw, inst.item_count,
+                    an->local.translate[0], an->local.translate[1],
+                    an->local.translate[2], t.pivot_angle, inst.item_count,
                     lmn[0], lmx[0], lmn[1], lmx[1], lmn[2], lmx[2]);
     }
+}
+
+size_t spawn_prince_from_level(const assets::lvl_file& lv, scene& sc,
+                               k2::engine::body_table& bodies,
+                               std::vector<k2::engine::actor_spawn>& spawns,
+                               int region) {
+    size_t made = 0;
+    for (size_t r = 0; r < lv.regions.size() && !made; ++r) {
+        if (region >= 0 && int(r) != region) continue;
+        const assets::lvl_region& reg = lv.regions[r];
+        for (size_t i = 0; i < reg.prince_starts.size(); ++i) {
+            const assets::lvl_prince_start& ps = reg.prince_starts[i];
+            const k2::engine::avatar_body* b = bodies.at(ps.index);
+            if (!b || !b->loaded) {
+                std::printf("  [Prince] body %d not loaded\n", ps.index);
+                continue;
+            }
+            const float yaw = ps.heading * 3.14159265f / 180.0f;
+            std::string err;
+            const int32_t id = k2::engine::spawn_actor(bodies, spawns, false, ps.index,
+                                                       ps.x, ps.y, ps.z, yaw, "Prince", &err);
+            if (id < 0) { std::printf("  [Prince] refused: %s\n", err.c_str()); continue; }
+
+            k2::engine::animation_node* an = new k2::engine::animation_node();
+            an->name = "Prince";
+            an->body = ps.index;
+            an->is_enemy = false;
+            an->local.set_yaw(yaw);
+            an->local.translate[0] = ps.x;
+            an->local.translate[1] = ps.y;
+            an->local.translate[2] = ps.z;
+            sc.root->add_child(an);
+
+            actor_inst inst;
+            inst.name = "Prince";
+            inst.node = an;
+            inst.is_enemy = false;
+            inst.first_item = 0;
+            inst.item_count = 0;
+            float lmn[3] = {0,0,0}, lmx[3] = {0,0,0};
+            append_actor_geometry(b->master.geometry, sc,
+                                  inst.first_item, inst.item_count, lmn, lmx);
+            const int owner = int(sc.actors.size());
+            for (size_t k = 0; k < inst.item_count; ++k)
+                sc.items[inst.first_item + k].owner = owner;
+            sc.actors.push_back(inst);
+            sc.root->update_world();
+
+            std::printf("  [Prince] body %d (%s) at (%.1f, %.1f, %.1f) heading %.1f deg  %zu meshes\n",
+                        ps.index, b->name.c_str(), ps.x, ps.y, ps.z, ps.heading, inst.item_count);
+            ++made;
+            break;   // one Prince
+        }
+    }
+    return made;
 }
 
 bool load_scene(const char* path, scene& sc) {
@@ -783,7 +1389,11 @@ int dump_images() {
 
 // Loads every room of a .lvl into one scene. Room names carry no extension and
 // live beside the .lvl, so try "<name>.k2a" by basename.
-bool load_level(const char* path, scene& sc, assets::lvl_file& lv) {
+// `region` selects one [Region] to load, or -1 for all of them. The original
+// streams a region at a time: prisonfix has two, with separate room lists *and*
+// separate [Prince] entries, so loading both at once puts two starts and two
+// sets of rooms in one scene.
+bool load_level(const char* path, scene& sc, assets::lvl_file& lv, int region) {
     size_t size = 0;
     uint8_t* data = plat::fs_read(path, size);
     if (!data) { std::fprintf(stderr, "k2boy: cannot read '%s'\n", path); return false; }
@@ -799,6 +1409,7 @@ bool load_level(const char* path, scene& sc, assets::lvl_file& lv) {
 
     int loaded = 0, missing = 0;
     for (size_t r = 0; r < lv.regions.size(); ++r) {
+        if (region >= 0 && int(r) != region) continue;
         const assets::lvl_region& reg = lv.regions[r];
         for (size_t i = 0; i < reg.rooms.size(); ++i) {
             const std::string file = assets::lvl_room_filename(reg.rooms[i]);
@@ -806,7 +1417,8 @@ bool load_level(const char* path, scene& sc, assets::lvl_file& lv) {
             else { ++missing; std::printf("  missing room %s\n", file.c_str()); }
         }
     }
-    std::printf("  rooms loaded %d, missing %d\n", loaded, missing);
+    std::printf("  region %s: rooms loaded %d, missing %d\n",
+                region < 0 ? "all" : "selected", loaded, missing);
     return loaded > 0;
 }
 
@@ -999,7 +1611,12 @@ void frame_scene(camera& c, const scene& sc) {
     if (start < 0 && !sc.actors.empty()) start = 0;
 
     if (start >= 0) {
-        const actor_inst& a = sc.actors[size_t(start)];
+        const actor_inst& ai = sc.actors[size_t(start)];
+        const k2::engine::transform& aw = ai.node->world();
+        struct { float pos[3]; float yaw; } a;
+        a.pos[0] = aw.translate[0]; a.pos[1] = aw.translate[1]; a.pos[2] = aw.translate[2];
+        // Recover yaw from the world basis: rotate[2] = sin, rotate[8] = cos.
+        a.yaw = std::atan2(aw.rotate[2], aw.rotate[8]);
         // Stand *at* the spawn, at eye height, looking the way the actor faces.
         //
         // An earlier version stood 6 units back along the facing. That is
@@ -1163,6 +1780,20 @@ int main(int argc, char** argv) {
     const char* shot_path = 0;
     const char* cam_arg = 0;      // "x,y,z,yaw,pitch" — diagnostic override
     bool trig_off = false;
+    bool rev_draw = false;
+    bool materials_only = false;
+    bool winding_only = false;
+    // .K2A winding measured as CCW-outward over 1201 actor meshes (--winding),
+    // so GL's default front face is correct and back faces can be dropped.
+    // Verified identical to CULL_NONE from inside a room; from outside it
+    // correctly reveals the interior instead of the wall's back face.
+    gfx::cull_mode cull_mode_arg = gfx::CULL_BACK;
+    const char* bind_path = 0;
+    bool config_only = false;
+    int  region_arg = 0;      // the original streams one region; -1 loads all
+    bool boot = false;
+    bool modules_only = false;
+    const char* actnodes_path = 0;
     const char* dumpskl_path = 0;
     const char* actor_path = 0;
     const char* dumpactor_path = 0;
@@ -1179,6 +1810,21 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--shot") == 0 && i + 1 < argc) shot_path = argv[++i];
         else if (std::strcmp(argv[i], "--cam") == 0 && i + 1 < argc) cam_arg = argv[++i];
         else if (std::strcmp(argv[i], "--notrig") == 0) trig_off = true;
+        else if (std::strcmp(argv[i], "--revdraw") == 0) rev_draw = true;
+        else if (std::strcmp(argv[i], "--materials") == 0) materials_only = true;
+        else if (std::strcmp(argv[i], "--winding") == 0) winding_only = true;
+        else if (std::strcmp(argv[i], "--cull") == 0 && i + 1 < argc) {
+            const char* m = argv[++i];
+            cull_mode_arg = !std::strcmp(m, "back")  ? gfx::CULL_BACK
+                          : !std::strcmp(m, "front") ? gfx::CULL_FRONT
+                                                     : gfx::CULL_NONE;
+        }
+        else if (std::strcmp(argv[i], "--bind") == 0 && i + 1 < argc) bind_path = argv[++i];
+        else if (std::strcmp(argv[i], "--config") == 0) config_only = true;
+        else if (std::strcmp(argv[i], "--region") == 0 && i + 1 < argc) region_arg = std::atoi(argv[++i]);
+        else if (std::strcmp(argv[i], "--boot") == 0) boot = true;
+        else if (std::strcmp(argv[i], "--modules") == 0) modules_only = true;
+        else if (std::strcmp(argv[i], "--actnodes") == 0 && i + 1 < argc) actnodes_path = argv[++i];
         else if (std::strcmp(argv[i], "--skl") == 0 && i + 1 < argc) dumpskl_path = argv[++i];
         else if (std::strcmp(argv[i], "--actor") == 0 && i + 1 < argc) actor_path = argv[++i];
         else if (std::strcmp(argv[i], "--dumpactor") == 0 && i + 1 < argc) dumpactor_path = argv[++i];
@@ -1196,6 +1842,7 @@ int main(int argc, char** argv) {
     }
     verify_data();
     verify_rtti();
+    verify_nodes();
     std::fflush(stdout);
 
     if (dumpactor_path) {
@@ -1204,6 +1851,12 @@ int main(int argc, char** argv) {
     }
     if (skills_only)    return dump_skills();
     if (spawns_only)    return check_spawns();
+    if (bind_path)      return check_bind_pose(bind_path);
+    if (config_only)    return dump_config("distribution.dat");
+    if (modules_only)   return dump_modules();
+    if (materials_only) return check_materials();
+    if (winding_only)   return check_winding();
+    if (actnodes_path)  return dump_act_nodes(actnodes_path);
     if (dumpskl_path) {
         size_t sz = 0;
         uint8_t* dd = plat::fs_read(dumpskl_path, sz);
@@ -1264,6 +1917,33 @@ int main(int argc, char** argv) {
     plat::drawable_size(w, h);
     gfx::resize(w, h);
 
+    // --boot: do what WinMain does. Read distribution.dat, then resolve the
+    // startup module id to its level. No hardcoded path.
+    std::string boot_level;
+    if (boot) {
+        const char* why = 0;
+        if (!k2::engine::module_table_verify(&why))
+            std::fprintf(stderr, "k2boy: module table invalid: %s\n", why);
+
+        size_t csize = 0;
+        uint8_t* cd = plat::fs_read("distribution.dat", csize);
+        k2::engine::config cfg;
+        if (cd) {
+            k2::engine::config_parse(reinterpret_cast<const char*>(cd), csize, cfg);
+            plat::fs_free(cd);
+        }
+        const k2::engine::module_entry* m =
+            k2::engine::module_at(k2::engine::MODULE_ID_STARTUP);
+        std::printf("boot: %zu config flags, startup module 0x%02X = '%s'\n",
+                    cfg.flags.size(), k2::engine::MODULE_ID_STARTUP,
+                    m ? m->name : "?");
+        if (m && m->level[0]) {
+            boot_level = m->level;
+            level_path = boot_level.c_str();
+            std::printf("boot: level %s (region %d)\n", level_path, region_arg);
+        }
+    }
+
     scene sc;
     assets::lvl_file lv;
     bool have_level = false;
@@ -1278,9 +1958,10 @@ int main(int argc, char** argv) {
         }
     } else if (level_path) {
         scene_reset(sc);
-        have_level = load_level(level_path, sc, lv);
+        have_level = load_level(level_path, sc, lv, region_arg);
         if (have_level) {
             build_body_table(lv, bodies);
+            spawn_prince_from_level(lv, sc, bodies, spawns, region_arg);
             spawn_level_actors(sc, bodies, spawns);
             std::printf("  actors: %zu spawned (prince index %d)\n",
                         spawns.size(), k2::engine::find_prince(spawns));
@@ -1340,7 +2021,39 @@ int main(int argc, char** argv) {
 
     float view[16], proj[16];
     mat4_identity(view);
-    mat4_perspective(proj, 1.0472f /* 60 deg */, float(w) / float(h ? h : 1), 0.1f, 1000.0f);
+    // Depth precision is governed by the near/far *ratio*, and the near plane
+    // dominates it. Hardcoding 0.1 .. 1000 gave a ratio of 10000, which left so
+    // little precision at distance that far polygons won z-fighting against
+    // near ones - rooms drew through each other.
+    //
+    // Levels ship their own [ClipPlanes] and the original uses them: prisonfix
+    // is .1, 50 (ratio 500), cistern .5, 85 (ratio 170). Honour them. The far
+    // plane is deliberately not widened to fit the scene: the original relies on
+    // region streaming plus fog, and fog saturates at 1.5x far anyway, so
+    // anything beyond it is solid fog colour regardless.
+    float znear = 0.1f, zfar = 1000.0f;
+    if (have_level && lv.has_clip_planes && lv.clip_far > lv.clip_near && lv.clip_near > 0.0f) {
+        znear = lv.clip_near;
+        zfar  = lv.clip_far;
+
+        // Deviation from the original, on purpose. Its far plane is tuned for
+        // portal-culled region streaming; this loads a whole region at once, so
+        // taking prisonfix's far of 50 literally sliced rooms off mid-wall.
+        // Extend far to cover the loaded bounds. Precision is governed by the
+        // near/far ratio and dominated by *near*, so keeping the level's near
+        // retains most of the gain: prisonfix goes 10000 -> ~2000 rather than
+        // -> 500, still several times better than the old hardcoded pair.
+        if (!sc.empty) {
+            const float dx = sc.mx[0] - sc.mn[0];
+            const float dy = sc.mx[1] - sc.mn[1];
+            const float dz = sc.mx[2] - sc.mn[2];
+            const float diag = std::sqrt(dx*dx + dy*dy + dz*dz);
+            if (diag * 1.1f > zfar) zfar = diag * 1.1f;
+        }
+        std::printf("clip planes: near %.2f far %.2f (level far %.2f, ratio %.0f)\n",
+                    znear, zfar, lv.clip_far, zfar / znear);
+    }
+    mat4_perspective(proj, 1.0472f /* 60 deg */, float(w) / float(h ? h : 1), znear, zfar);
 
     gfx::set_clear_color(0.05f, 0.06f, 0.09f);
 
@@ -1393,7 +2106,7 @@ int main(int argc, char** argv) {
                     gfx::resize(e.width, e.height);
                     mat4_perspective(proj, 1.0472f,
                                      float(e.width) / float(e.height ? e.height : 1),
-                                     0.1f, 1000.0f);
+                                     znear, zfar);
                     break;
                 default:
                     break;
@@ -1433,19 +2146,26 @@ int main(int argc, char** argv) {
         gfx::clear(true, true);
         gfx::set_view_projection(view, proj);
 
-        gfx::render_state rs;
-        rs.blend = gfx::BLEND_NONE;
-        rs.cull  = gfx::CULL_NONE;      // .K2A winding not yet verified
-        rs.depth = gfx::DEPTH_TEST_WRITE;
-        rs.alpha_test = false;
-        rs.alpha_ref  = 0.5f;
-        rs.vertex_color = true;
-        rs.fog = have_level && lv.fog.size() >= 2;
-        rs.wireframe = false;
+        gfx::render_state rs;           // constructor gives every field a value
+        rs.cull  = cull_mode_arg;       // --cull; see check_winding()
+        rs.fog   = have_level && lv.fog.size() >= 2;
         if (rs.fog) {
+            // The first column of a [Fog] row is a **fraction of the far clip
+            // plane**, not a distance. Every shipped level writes 1.5 in the
+            // second row, i.e. fog saturates half again beyond the far plane:
+            //
+            //   prisonfix  far 50   0.5 / 1.5  ->  25 .. 75
+            //   cistern    far 85   0.8 / 1.5  ->  68 .. 128
+            //   ruins      far 100  0.8 / 1.5  ->  80 .. 150
+            //
+            // Treating them as metres put fog end at 1.5 units and drowned the
+            // whole scene in the fog colour, which is what "the level renders
+            // almost nothing" turned out to be.
+            const float far_clip = lv.has_clip_planes && lv.clip_far > 1.0f
+                                 ? lv.clip_far : 100.0f;
             const assets::lvl_fog& f0 = lv.fog[0];
             const assets::lvl_fog& f1 = lv.fog[1];
-            gfx::set_fog(f0.distance, f1.distance,
+            gfx::set_fog(f0.distance * far_clip, f1.distance * far_clip,
                          f1.r / 255.0f, f1.g / 255.0f, f1.b / 255.0f);
         }
         gfx::set_render_state(rs);
@@ -1457,20 +2177,12 @@ int main(int argc, char** argv) {
         // depth writes off, so alpha-mapped geometry (torch flames, water) does
         // not occlude what is behind it. Materials are flagged from
         // *ALPHA_SOURCE Opacity in the .K2A.
-        for (size_t i = 0; i < sc.items.size(); ++i) {
+        for (size_t n = 0; n < sc.items.size(); ++n) {
+            // --revdraw reverses submission order. With a working depth buffer
+            // the frame must come out near-identical; if it does not, depth is
+            // not deciding visibility and something else is.
+            const size_t i = rev_draw ? sc.items.size() - 1 - n : n;
             if (sc.items[i].transparent || sc.items[i].is_trap) continue;
-            if (sc.items[i].owner >= 0) continue;
-            gfx::set_texture(sc.items[i].tex);
-            gfx::draw(sc.items[i].mesh);
-        }
-
-        rs.blend      = gfx::BLEND_ALPHA;
-        rs.depth      = gfx::DEPTH_TEST;      // test, but do not write
-        rs.alpha_test = true;                 // drop fully transparent texels
-        rs.alpha_ref  = 0.02f;
-        gfx::set_render_state(rs);
-        for (size_t i = 0; i < sc.items.size(); ++i) {
-            if (!sc.items[i].transparent || sc.items[i].is_trap) continue;
             if (sc.items[i].owner >= 0) continue;
             gfx::set_texture(sc.items[i].tex);
             gfx::draw(sc.items[i].mesh);
@@ -1490,7 +2202,7 @@ int main(int argc, char** argv) {
             for (size_t a = 0; a < sc.actors.size(); ++a) {
                 const actor_inst& ai = sc.actors[a];
                 float am[16];
-                mat4_translate_yaw(am, ai.pos, ai.yaw);
+                ai.node->world().to_matrix(am);
                 gfx::set_model(am);
                 for (size_t k = 0; k < ai.item_count; ++k) {
                     const draw_item& di = sc.items[ai.first_item + k];
@@ -1499,7 +2211,37 @@ int main(int argc, char** argv) {
                     gfx::draw(di.mesh);
                 }
             }
-            gfx::set_model(model);   // restore identity for the passes below
+            gfx::set_model(model);   // room geometry is world-space; restore identity
+        }
+
+        // Transparent last of the lit passes: actors are opaque and must be in
+        // the depth buffer before alpha surfaces are blended over them.
+        rs.blend      = gfx::BLEND_ALPHA;
+        rs.depth      = gfx::DEPTH_TEST;      // test, but do not write
+        rs.alpha_test = true;                 // drop fully transparent texels
+        rs.alpha_ref  = 0.02f;
+        gfx::set_render_state(rs);
+        // Back to front. These draws do not write depth, so without sorting a
+        // distant alpha surface submitted later paints straight over nearer
+        // geometry - "far polygons on top of near ones". Order is by distance
+        // from the camera, farthest first.
+        {
+            static std::vector<std::pair<float, size_t> > order;
+            order.clear();
+            for (size_t i = 0; i < sc.items.size(); ++i) {
+                const draw_item& di = sc.items[i];
+                if (!di.transparent || di.is_trap || di.owner >= 0) continue;
+                const float dx = di.center[0] - cam.pos[0];
+                const float dy = di.center[1] - cam.pos[1];
+                const float dz = di.center[2] - cam.pos[2];
+                order.push_back(std::make_pair(dx*dx + dy*dy + dz*dz, i));
+            }
+            std::sort(order.begin(), order.end());
+            for (size_t k = order.size(); k-- > 0; ) {
+                const draw_item& di = sc.items[order[k].second];
+                gfx::set_texture(di.tex);
+                gfx::draw(di.mesh);
+            }
         }
 
         // Trigger volumes last: coloured wireframe, one colour per trap type.

@@ -16,12 +16,24 @@
 #   make actors     headless: parse every .act, report skeletons
 #   make skills     headless: parse every .skl, validate quaternions
 #   make spawns     headless: resolve every PrinceStart/EnemyStart to a body
+#   make bind A=... headless: compare .act skeleton against .K2A bind pose
+#   make actnodes A=... headless: dump .act node records and their surroundings
+#   make materials  headless: resolve every material's texture across all .K2A
+#   make winding    headless: measure .K2A triangle winding (gates backface cull)
+#   make config     headless: parse distribution.dat the way WinMain does
+#   make modules    headless: print the module table and check its ordering
+#   make boot       launch the way WinMain does: startup module -> level
 #   make shot S=... render one frame to a .bmp and exit (add --cam/--notrig)
+#                   --revdraw reverses opaque order; frame must not change
 #   make levels     headless: parse every .lvl and check all paths resolve
 #   make check      verify + images + parse every .K2A  (no window needed)
 #   make release    optimised build
 #   make coverage   regenerate docs/reference/coverage.md
 #   make clean      remove the build directory
+#
+#   web/ — the WebGPU experiment (docs/plan/06-web-experiment.md)
+#   make web        generate the manifest and serve the repo at :8080
+#   make webindex   regenerate web/data-index.txt from the install
 
 BUILD     ?= build
 TYPE      ?= Debug
@@ -31,7 +43,7 @@ JOBS      ?= $(shell sysctl -n hw.ncpu 2>/dev/null || echo 4)
 
 DEFAULT_ROOM ?= geometry\\rooms\\prisonfix\\prison1.k2a
 
-.PHONY: all build run verify images dump room level levels actor prince actors skills spawns shot skl check release coverage clean rebuild help
+.PHONY: all build run verify images dump room level levels actor prince actors skills spawns shot bind actnodes materials winding config modules boot skl check release coverage web webindex clean rebuild help
 
 all: build
 
@@ -79,6 +91,27 @@ actors: build
 shot: $(BIN)
 	@$(BIN) --room "$(DEFAULT_ROOM)" --shot "$(S)" $(DATA)
 
+boot: $(BIN)
+	@$(BIN) --boot $(DATA)
+
+modules: $(BIN)
+	@$(BIN) --modules $(DATA)
+
+winding: $(BIN)
+	@$(BIN) --winding $(DATA)
+
+materials: $(BIN)
+	@$(BIN) --materials $(DATA)
+
+config: $(BIN)
+	@$(BIN) --config $(DATA)
+
+actnodes: $(BIN)
+	@$(BIN) --actnodes "$(A)" $(DATA)
+
+bind: $(BIN)
+	@$(BIN) --bind "$(A)" $(DATA)
+
 spawns: $(BIN)
 	@$(BIN) --spawns
 
@@ -125,6 +158,21 @@ check: build
 
 coverage:
 	@python3 tools/coverage.py
+
+# --- web ---------------------------------------------------------------------
+#
+# The browser cannot list a directory, so the VFS index that vfs.cpp builds with
+# opendir has to be generated ahead of time. Everything else is static: no
+# bundler, no transpiler, no node_modules.
+
+WEB_PORT ?= 8080
+
+webindex:
+	@python3 tools/webindex.py $(DATA) web/data-index.txt
+
+web: webindex
+	@echo "serving http://localhost:$(WEB_PORT)/web/  (needs a WebGPU browser)"
+	@python3 -m http.server $(WEB_PORT) --bind 127.0.0.1
 
 clean:
 	@rm -rf $(BUILD) $(BUILD)-release
