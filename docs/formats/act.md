@@ -727,3 +727,32 @@ so its records have a different payload layout and the shape-based node scanner
 in `act_parse` most likely misses one. The failure is in finding the nodes, not
 in the count arithmetic — but that has not been confirmed, and one file is not
 worth a special case until the kind-2 payload is decoded.
+
+## The bind pose validates the whole chain
+
+`k2boy --bind <master.dat>` now runs forward kinematics over the recovered tree
+and compares each joint's world bind pose against the matching `.K2A` node's own
+transform:
+
+```
+Prince: 29 geometry nodes, 31 act nodes, tree ok
+  Pelvis   FK ( 0.000  1.034  0.000)   K2A (-0.002  1.033 -0.000)  err 0.0025
+  LArm1    FK ( 0.169  1.432 -0.041)   K2A ( 0.166  1.432 -0.041)  err 0.0025
+  LHand    FK ( 0.211  0.902 -0.029)   K2A ( 0.209  0.901 -0.029)  err 0.0025
+  matched 26, orphan 0
+  FK vs .K2A bind pose: mean 0.0027, worst 0.0062 (RThumb1)
+  verdict: hierarchy reproduces the bind pose
+```
+
+Millimetres on a two-metre figure. The earlier attempt, with parents guessed
+from geometry, managed mean 0.0668 and worst 0.1111 — this is 25x closer.
+
+One check confirms four separate things at once, which is why it is worth having:
+
+* the **hierarchy** — a wrong parent anywhere would blow up the chain below it;
+* the **coordinate mapping** `engine = (x, z, -y)` between Max and engine space;
+* the **quaternion convention**, w first, matching `.skl`;
+* the **composition order** in `transform_compose`.
+
+The residual ~2.5mm is uniform across joints, which points at the precision of
+the `.K2A` text (four decimals) rather than an error in the maths.

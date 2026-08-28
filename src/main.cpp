@@ -420,16 +420,14 @@ int dump_act_nodes(const char* path) {
     plat::fs_free(d);
     return 0;
 }
-
-// Probe: do the .act node transforms line up with the .K2A body geometry?
+// Validates the recovered skeleton against the geometry: runs forward
+// kinematics over the .act tree and compares each joint's world bind pose with
+// the matching .K2A node's own transform.
 //
-// The parts in a body .K2A are baked in bind pose (a standing figure, ~2 units
-// tall). Animation needs each part in its own local space, so the bind
-// transform has to be removed: local = R^T * (v - t). If the .act transforms
-// really are world-space bind poses, every part's vertices should collapse to a
-// small blob around the origin once that is applied. If they are local-to-parent
-// (the .act hierarchy is not recovered - see docs/formats/act.md), it will not
-// collapse, and this says so instead of guessing.
+// The two files use different spaces. .act transforms are local-to-parent in
+// engine space (Y-up); a .K2A node transform is the world bind pose in Max
+// space (Z-up), mapping engine = (x, z, -y). Nodes are depth-first, so a parent
+// is always resolved before its children.
 int check_bind_pose(const char* master_path) {
     assets::master_file m;
     {
@@ -440,9 +438,8 @@ int check_bind_pose(const char* master_path) {
         std::string err;
         const bool ok = assets::master_parse(d, size, m, &err);
         plat::fs_free(d);
-        if (!ok) { std::fprintf(stderr, "k2boy: master parse failed: %s\n", err.c_str()); return 1; }
+        if (!ok) return 1;
     }
-
     assets::k2a_file g;
     {
         size_t size = 0;
@@ -453,7 +450,6 @@ int check_bind_pose(const char* master_path) {
         plat::fs_free(d);
         if (!ok) return 1;
     }
-
     assets::act_file a;
     {
         std::string act_path = m.proto ? m.actor : (m.actor + ".act");
@@ -466,172 +462,54 @@ int check_bind_pose(const char* master_path) {
         if (!ok) return 1;
     }
 
-    std::printf("%s: %zu geometry nodes, %zu act nodes\n",
-                m.name.c_str(), g.nodes.size(), a.nodes.size());
+    std::printf("%s: %zu geometry nodes, %zu act nodes, tree %s\n",
+                m.name.c_str(), g.nodes.size(), a.nodes.size(),
+                a.tree_ok ? "ok" : "NOT RECOVERED");
+    if (!a.tree_ok) return 1;
 
-    // .K2A node positions are world bind poses in Max's Z-up space; .act
-    // offsets are local-to-parent in the engine's Y-up space. The mapping is
-    // engine = (x, z, -y), confirmed on Pelvis: k2a (0, 0, 1.033) vs act
-    // (0, 1.034, 0).
-    struct joint {
-        std::string name;
-        float       world[3];    // engine space, from the .K2A node transform
-        float       local[3];    // engine space, from the .act node
-        int         parent;
-        float       residual;
-    };
-    std::vector<joint> js;
+    const size_t n = a.nodes.size();
+    std::vector<k2::engine::transform> world(n);
+    for (size_t i = 0; i < n; ++i) {
+        const assets::act_node& nd = a.nodes[i];
+        k2::engine::transform local;
+        const float w = nd.quat[0], x = nd.quat[1], y = nd.quat[2], z = nd.quat[3];
+        local.rotate[0]=1-2*(y*y+z*z); local.rotate[1]=  2*(x*y-w*z); local.rotate[2]=  2*(x*z+w*y);
+        local.rotate[3]=  2*(x*y+w*z); local.rotate[4]=1-2*(x*x+z*z); local.rotate[5]=  2*(y*z-w*x);
+        local.rotate[6]=  2*(x*z-w*y); local.rotate[7]=  2*(y*z+w*x); local.rotate[8]=1-2*(x*x+y*y);
+        for (int k = 0; k < 3; ++k) local.translate[k] = nd.pos[k];
+        local.scale = 1.0f;
+        if (nd.parent >= 0) k2::engine::transform_compose(world[size_t(nd.parent)], local, world[i]);
+        else                world[i] = local;
+    }
 
-    size_t orphan = 0;
+    size_t matched = 0, orphan = 0;
+    double sum = 0.0; float worst = 0.0f; std::string worst_name;
     for (size_t i = 0; i < g.nodes.size(); ++i) {
-        const assets::k2a_node& n = g.nodes[i];
-        if (!n.has_mesh || n.has_trap) continue;
-        const assets::act_node* bind = 0;
-        for (size_t k = 0; k < a.nodes.size(); ++k)
-            if (a.nodes[k].name == n.name) { bind = &a.nodes[k]; break; }
-        if (!bind) { ++orphan; continue; }
-
-        joint j;
-        j.name     = n.name;
-        j.world[0] =  n.pos[0];
-        j.world[1] =  n.pos[2];
-        j.world[2] = -n.pos[1];
-        for (int k = 0; k < 3; ++k) j.local[k] = bind->pos[k];
-        j.parent   = -1;
-        j.residual = 0.0f;
-        js.push_back(j);
-    }
-
-    // parent_world ~= child_world - child_local. Pick the joint sitting closest
-    // to that predicted point. Rotation is ignored on purpose: if the bind pose
-    // is mostly axis-aligned this is enough to recover the tree, and the
-    // residual below says whether that held.
-    float worst_res = 0.0f;
-    double sum_res = 0.0;
-    size_t rooted = 0;
-    for (size_t i = 0; i < js.size(); ++i) {
-        const float want[3] = { js[i].world[0] - js[i].local[0],
-                                js[i].world[1] - js[i].local[1],
-                                js[i].world[2] - js[i].local[2] };
-        int best = -1;
-        float bestd = 1e30f;
-        for (size_t k = 0; k < js.size(); ++k) {
-            if (k == i) continue;
-            const float dx = js[k].world[0] - want[0];
-            const float dy = js[k].world[1] - want[1];
-            const float dz = js[k].world[2] - want[2];
-            const float d  = std::sqrt(dx*dx + dy*dy + dz*dz);
-            if (d < bestd) { bestd = d; best = int(k); }
-        }
-        // A joint whose predicted parent is the origin is the root.
-        const float rootd = std::sqrt(want[0]*want[0] + want[1]*want[1] + want[2]*want[2]);
-        if (rootd < bestd) { js[i].parent = -1; js[i].residual = rootd; ++rooted; }
-        else               { js[i].parent = best; js[i].residual = bestd; }
-        sum_res += js[i].residual;
-        if (js[i].residual > worst_res) worst_res = js[i].residual;
-    }
-
-    for (size_t i = 0; i < js.size() && i < 14; ++i)
-        std::printf("  %-16s parent %-16s residual %.4f\n",
-                    js[i].name.c_str(),
-                    js[i].parent < 0 ? "(root)" : js[size_t(js[i].parent)].name.c_str(),
-                    js[i].residual);
-
-    // A tree needs exactly one root and no cycles.
-    size_t cyclic = 0;
-    for (size_t i = 0; i < js.size(); ++i) {
-        int p = js[i].parent;
-        for (size_t hops = 0; p >= 0 && hops <= js.size(); ++hops) {
-            if (size_t(p) == i) { ++cyclic; break; }
-            p = js[size_t(p)].parent;
-        }
-    }
-
-    std::printf("  joints %zu, orphan %zu, roots %zu, cycles %zu\n",
-                js.size(), orphan, rooted, cyclic);
-    std::printf("  residual: mean %.4f, worst %.4f\n",
-                js.empty() ? 0.0 : sum_res / double(js.size()), worst_res);
-    // Now the real test. With the tree known, run forward kinematics from the
-    // .act locals *including rotation* and compare the resulting world
-    // positions against the .K2A bind poses. The parent search above ignored
-    // rotation, so this is an independent check, not a restatement.
-    std::vector<float> wq(js.size() * 4), wt(js.size() * 3);
-    std::vector<bool>  done(js.size(), false);
-
-    // act quaternions are w-first; find each joint's own local rotation.
-    std::vector<float> lq(js.size() * 4);
-    for (size_t i = 0; i < js.size(); ++i) {
-        const assets::act_node* bn = 0;
-        for (size_t k = 0; k < a.nodes.size(); ++k)
-            if (a.nodes[k].name == js[i].name) { bn = &a.nodes[k]; break; }
-        for (int k = 0; k < 4; ++k) lq[i*4+k] = bn ? bn->quat[k] : (k == 0 ? 1.0f : 0.0f);
-    }
-
-    bool progress = true;
-    while (progress) {
-        progress = false;
-        for (size_t i = 0; i < js.size(); ++i) {
-            if (done[i]) continue;
-            const int p = js[i].parent;
-            if (p >= 0 && !done[size_t(p)]) continue;
-
-            float pq[4] = {1,0,0,0}, pt[3] = {0,0,0};
-            if (p >= 0) {
-                for (int k = 0; k < 4; ++k) pq[k] = wq[size_t(p)*4+k];
-                for (int k = 0; k < 3; ++k) pt[k] = wt[size_t(p)*3+k];
-            }
-            // world_q = parent_q * local_q  (Hamilton, w first)
-            const float* q = &lq[i*4];
-            wq[i*4+0] = pq[0]*q[0] - pq[1]*q[1] - pq[2]*q[2] - pq[3]*q[3];
-            wq[i*4+1] = pq[0]*q[1] + pq[1]*q[0] + pq[2]*q[3] - pq[3]*q[2];
-            wq[i*4+2] = pq[0]*q[2] - pq[1]*q[3] + pq[2]*q[0] + pq[3]*q[1];
-            wq[i*4+3] = pq[0]*q[3] + pq[1]*q[2] - pq[2]*q[1] + pq[3]*q[0];
-            // world_t = parent_t + parent_R * local_t
-            const float w0=pq[0], x0=pq[1], y0=pq[2], z0=pq[3];
-            const float R[9] = {
-                1-2*(y0*y0+z0*z0),   2*(x0*y0-w0*z0),   2*(x0*z0+w0*y0),
-                  2*(x0*y0+w0*z0), 1-2*(x0*x0+z0*z0),   2*(y0*z0-w0*x0),
-                  2*(x0*z0-w0*y0),   2*(y0*z0+w0*x0), 1-2*(x0*x0+y0*y0)
-            };
-            const float* t = js[i].local;
-            for (int r = 0; r < 3; ++r)
-                wt[i*3+r] = pt[r] + R[r*3+0]*t[0] + R[r*3+1]*t[1] + R[r*3+2]*t[2];
-            done[i] = true;
-            progress = true;
-        }
-    }
-
-    for (size_t i = 0; i < a.nodes.size(); ++i) {
-        bool has_geom = false;
-        for (size_t k = 0; k < js.size(); ++k)
-            if (js[k].name == a.nodes[i].name) { has_geom = true; break; }
-        if (!has_geom)
-            std::printf("  act node with NO geometry: %-16s local (%6.3f %6.3f %6.3f)\n",
-                        a.nodes[i].name.c_str(), a.nodes[i].pos[0],
-                        a.nodes[i].pos[1], a.nodes[i].pos[2]);
-    }
-    for (size_t i = 0; i < js.size() && i < 0; ++i)
-        std::printf("  quat %-14s [%6.3f %6.3f %6.3f %6.3f] |q|=%.4f\n",
-                    js[i].name.c_str(), lq[i*4+0], lq[i*4+1], lq[i*4+2], lq[i*4+3],
-                    std::sqrt(lq[i*4+0]*lq[i*4+0]+lq[i*4+1]*lq[i*4+1]+
-                              lq[i*4+2]*lq[i*4+2]+lq[i*4+3]*lq[i*4+3]));
-
-    float fk_worst = 0.0f; double fk_sum = 0.0; std::string fk_worst_name;
-    for (size_t i = 0; i < js.size(); ++i) {
-        const float dx = wt[i*3+0] - js[i].world[0];
-        const float dy = wt[i*3+1] - js[i].world[1];
-        const float dz = wt[i*3+2] - js[i].world[2];
+        const assets::k2a_node& nd = g.nodes[i];
+        if (!nd.has_mesh || nd.has_trap) continue;
+        size_t j = 0;
+        for (; j < n; ++j) if (a.nodes[j].name == nd.name) break;
+        if (j == n) { ++orphan; continue; }
+        ++matched;
+        const float wp[3] = { nd.pos[0], nd.pos[2], -nd.pos[1] };
+        const float dx = world[j].translate[0] - wp[0];
+        const float dy = world[j].translate[1] - wp[1];
+        const float dz = world[j].translate[2] - wp[2];
         const float d  = std::sqrt(dx*dx + dy*dy + dz*dz);
-        fk_sum += d;
-        if (d > fk_worst) { fk_worst = d; fk_worst_name = js[i].name; }
+        sum += d;
+        if (d > worst) { worst = d; worst_name = nd.name; }
+        if (matched <= 6)
+            std::printf("  %-14s FK (%7.3f %7.3f %7.3f)  K2A (%7.3f %7.3f %7.3f)  err %.4f\n",
+                        nd.name.c_str(), world[j].translate[0], world[j].translate[1],
+                        world[j].translate[2], wp[0], wp[1], wp[2], d);
     }
-    std::printf("  forward kinematics vs .K2A bind: mean %.4f, worst %.4f (%s)\n",
-                js.empty() ? 0.0 : fk_sum / double(js.size()), fk_worst,
-                fk_worst_name.c_str());
+
+    std::printf("  matched %zu, orphan %zu\n", matched, orphan);
+    std::printf("  FK vs .K2A bind pose: mean %.4f, worst %.4f (%s)\n",
+                matched ? sum / double(matched) : 0.0, worst, worst_name.c_str());
     std::printf("  verdict: %s\n",
-                (rooted == 1 && cyclic == 0 && fk_worst < 0.02f)
-                    ? "hierarchy recovered and confirmed by forward kinematics"
-                    : "hierarchy NOT confirmed");
+                worst < 0.02f ? "hierarchy reproduces the bind pose"
+                              : "MISMATCH - hierarchy or convention still wrong");
     return 0;
 }
 
