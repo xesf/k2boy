@@ -756,3 +756,40 @@ One check confirms four separate things at once, which is why it is worth having
 
 The residual ~2.5mm is uniform across joints, which points at the precision of
 the `.K2A` text (four decimals) rather than an error in the maths.
+
+## Body parts are bound to joints
+
+Each `.K2A` mesh node is matched to its `.act` joint **by name** — every shipped
+actor has zero orphans, so nothing else is needed. A part is then drawn at
+
+```
+actor_world * cur[j] * bind_inv[j]
+```
+
+where `bind_inv[j]` is the inverse of joint j's world bind pose and `cur[j]` is
+where the joint is now. Vertices are never touched: the `.K2A` geometry stays
+baked in bind pose, and the transform undoes the bind before applying the
+current pose.
+
+The useful property is that this is **exactly the identity at bind pose**, which
+makes it verifiable rather than merely plausible:
+
+```
+skinning off vs on, at bind pose: 0/409920 differing (0.000%)
+```
+
+`--noskin` draws every part at the actor transform instead, for that comparison.
+
+`--pose Joint:degrees` rotates a single joint and re-poses the actor.
+`--pose LArm1:70` moves the Prince's left upper arm and carries the forearm and
+hand with it, leaving the rest of the body untouched — the chain propagates.
+
+`pose_actor()` recomputes every joint's world transform from its local pose in
+one forward pass, which is valid because joints are stored depth-first.
+
+### What remains for animation
+
+The rig is complete: skeleton, bind poses, part binding and posing all work and
+are checked. What is missing is driving `joint_local_cur` from `.skl` — those
+files already parse (2363 files, 99.89% of quaternions unit-norm), so the open
+question is which `JKey` channel maps to which joint, not the container format.

@@ -58,6 +58,12 @@ struct transform {
     void to_matrix(float* m16) const;
 };
 
+// Inverse of a rigid transform with uniform scale:
+//   R' = R^T,  s' = 1/s,  t' = -(R^T * t) / s
+// Used to take geometry that is baked in bind pose back into joint-local space,
+// so a joint can be re-posed without touching the vertices.
+void transform_inverse(const transform& in, transform& out);
+
 // out = a * b, i.e. apply b in a's space. Mirrors how the original composes a
 // child's local transform with its parent's world transform.
 void transform_compose(const transform& a, const transform& b, transform& out);

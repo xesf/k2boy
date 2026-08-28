@@ -29,6 +29,24 @@ void transform::to_matrix(float* m) const {
     m[12] = translate[0];      m[13] = translate[1];      m[14] = translate[2];      m[15] = 1.0f;
 }
 
+void transform_inverse(const transform& in, transform& out) {
+    const float s = (in.scale > 1e-8f || in.scale < -1e-8f) ? 1.0f / in.scale : 1.0f;
+    float r[9];
+    for (int row = 0; row < 3; ++row)
+        for (int col = 0; col < 3; ++col)
+            r[row * 3 + col] = in.rotate[col * 3 + row];     // transpose
+
+    float t[3];
+    for (int row = 0; row < 3; ++row) {
+        float v = 0.0f;
+        for (int k = 0; k < 3; ++k) v += r[row * 3 + k] * in.translate[k];
+        t[row] = -v * s;
+    }
+    std::memcpy(out.rotate, r, sizeof(r));
+    std::memcpy(out.translate, t, sizeof(t));
+    out.scale = s;
+}
+
 void transform_compose(const transform& a, const transform& b, transform& out) {
     // Rotation: R = Ra * Rb, both row-major.
     float r[9];

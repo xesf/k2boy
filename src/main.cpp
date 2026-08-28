@@ -161,6 +161,18 @@ void verify_nodes() {
     CHECK("scale composes", std::fabs(so.scale - 6.0f) < 1e-6f &&
                             std::fabs(so.translate[0] - 2.0f) < 1e-6f);
 
+    // Inverse must undo compose: T * inv(T) == identity.
+    transform ti, tinv, tid;
+    ti.set_yaw(0.7f);
+    ti.translate[0] = 3.0f; ti.translate[1] = -1.0f; ti.translate[2] = 2.0f;
+    ti.scale = 2.0f;
+    transform_inverse(ti, tinv);
+    transform_compose(ti, tinv, tid);
+    CHECK("inverse undoes compose",
+          std::fabs(tid.translate[0]) < 1e-4f && std::fabs(tid.translate[1]) < 1e-4f &&
+          std::fabs(tid.translate[2]) < 1e-4f && std::fabs(tid.scale - 1.0f) < 1e-4f &&
+          std::fabs(tid.rotate[0] - 1.0f) < 1e-4f && std::fabs(tid.rotate[4] - 1.0f) < 1e-4f);
+
     // Graph: parent -> child, world of child must equal the composition.
     level_group* root = new level_group();
     root->name = "root";
@@ -601,6 +613,7 @@ struct draw_item {
     bool            is_trap;        // a trigger volume, drawn as coloured wireframe
     int             trap_type;      // index into scene::trap_types; -1 when not a volume
     int             owner;          // index into scene::actors; -1 for static room geometry
+    int             joint;          // index into actor_inst::joint_*; -1 if unbound
     float           center[3];      // world centroid, for back-to-front sorting
     float           tint[3];        // filled by assign_trap_colors once the scene is loaded
 };
@@ -614,13 +627,31 @@ struct actor_inst {
     bool                    is_enemy;
     size_t                  first_item;
     size_t                  item_count;
+
+    // The skeleton, from the .act. `bind_inv[j]` takes geometry that is baked
+    // in bind pose back into joint j's local space; `cur[j]` is where that joint
+    // is now. A part is drawn at  actor_world * cur[j] * bind_inv[j], which is
+    // the identity at bind pose - so binding must not change the image until
+    // something actually poses a joint.
+    std::vector<std::string>          joint_names;
+    std::vector<int32_t>              joint_parent;
+    std::vector<k2::engine::transform> joint_local_bind;
+    std::vector<k2::engine::transform> joint_local_cur;   // pose; starts at bind
+    std::vector<k2::engine::transform> bind_inv;
+    std::vector<k2::engine::transform> cur;
+    bool                              skinned;
+
+    actor_inst() : node(0), is_enemy(false), first_item(0), item_count(0),
+                   skinned(false) {}
 };
+
 
 struct scene {
     std::vector<draw_item>  items;
     std::vector<gfx::texture_id> textures;   // owned, one per material
     std::vector<std::string> trap_types;     // distinct types present, for the legend
     std::vector<actor_inst>  actors;
+    std::vector<std::string> item_names;    // parallel to items; the .K2A node name
     // The scene graph. Rooms and actors are children of the level root; room
     // geometry is authored in world space so rooms sit at identity, while
     // actors carry the transform their spawn point specifies.
@@ -888,8 +919,76 @@ int check_winding() {
     return 0;
 }
 
+// Recomputes every joint's world transform from its current local pose. Joints
+// are depth-first, so one forward pass suffices.
+void pose_actor(actor_inst& a) {
+    for (size_t i = 0; i < a.joint_local_cur.size(); ++i) {
+        const int32_t p = a.joint_parent[i];
+        if (p >= 0) k2::engine::transform_compose(a.cur[size_t(p)], a.joint_local_cur[i], a.cur[i]);
+        else        a.cur[i] = a.joint_local_cur[i];
+    }
+}
+
+// Fills an actor's skeleton from its .act and binds each body part to a joint by
+// name. Every .K2A geometry node has a matching .act node (zero orphans across
+// the shipped actors), so the match is by name and nothing else.
+bool bind_actor_skeleton(const assets::master_file& m, actor_inst& inst, scene& sc) {
+    const std::string act_path = m.proto ? m.actor : (m.actor + ".act");
+    size_t size = 0;
+    uint8_t* d = plat::fs_read_basename(act_path.c_str(), size);
+    if (!d) return false;
+    assets::act_file a;
+    std::string err;
+    const bool ok = assets::act_parse(d, size, a, &err);
+    plat::fs_free(d);
+    if (!ok || !a.tree_ok || a.nodes.empty()) return false;
+
+    const size_t n = a.nodes.size();
+    inst.joint_names.resize(n);
+    inst.joint_parent.resize(n);
+    inst.joint_local_bind.resize(n);
+    inst.joint_local_cur.resize(n);
+    inst.bind_inv.resize(n);
+    inst.cur.resize(n);
+
+    std::vector<k2::engine::transform> world(n);
+    for (size_t i = 0; i < n; ++i) {
+        const assets::act_node& nd = a.nodes[i];
+        k2::engine::transform local;
+        const float w = nd.quat[0], x = nd.quat[1], y = nd.quat[2], z = nd.quat[3];
+        local.rotate[0]=1-2*(y*y+z*z); local.rotate[1]=  2*(x*y-w*z); local.rotate[2]=  2*(x*z+w*y);
+        local.rotate[3]=  2*(x*y+w*z); local.rotate[4]=1-2*(x*x+z*z); local.rotate[5]=  2*(y*z-w*x);
+        local.rotate[6]=  2*(x*z-w*y); local.rotate[7]=  2*(y*z+w*x); local.rotate[8]=1-2*(x*x+y*y);
+        for (int k = 0; k < 3; ++k) local.translate[k] = nd.pos[k];
+        local.scale = 1.0f;
+
+        inst.joint_names[i]      = nd.name;
+        inst.joint_parent[i]     = nd.parent;
+        inst.joint_local_bind[i] = local;
+        inst.joint_local_cur[i]  = local;
+
+        if (nd.parent >= 0) k2::engine::transform_compose(world[size_t(nd.parent)], local, world[i]);
+        else                world[i] = local;
+
+        k2::engine::transform_inverse(world[i], inst.bind_inv[i]);
+        inst.cur[i] = world[i];          // start at the bind pose
+    }
+
+    // Bind each of this actor's draw items to its joint, by node name.
+    size_t bound = 0;
+    for (size_t k = 0; k < inst.item_count; ++k) {
+        draw_item& di = sc.items[inst.first_item + k];
+        const std::string& mesh_name = sc.item_names[inst.first_item + k];
+        for (size_t j = 0; j < n; ++j)
+            if (inst.joint_names[j] == mesh_name) { di.joint = int(j); ++bound; break; }
+    }
+    inst.skinned = bound > 0;
+    return inst.skinned;
+}
+
 void scene_reset(scene& sc) {
     sc.items.clear();
+    sc.item_names.clear();
     sc.textures.clear();
     sc.trap_types.clear();
     sc.actors.clear();
@@ -989,6 +1088,7 @@ bool append_scene(const char* path, scene& sc) {
         it.is_trap   = is_volume;
         it.trap_type = -1;
         it.owner     = -1;
+        it.joint     = -1;
         it.tint[0] = it.tint[1] = it.tint[2] = 1.0f;
         if (it.is_trap) {
             it.tex = gfx::INVALID_TEXTURE;
@@ -999,6 +1099,7 @@ bool append_scene(const char* path, scene& sc) {
             it.trap_type = int(k);
         }
         sc.items.push_back(it);
+        sc.item_names.push_back(n.name);
     }
 
     {
@@ -1257,6 +1358,7 @@ size_t spawn_prince_from_level(const assets::lvl_file& lv, scene& sc,
             const int owner = int(sc.actors.size());
             for (size_t k = 0; k < inst.item_count; ++k)
                 sc.items[inst.first_item + k].owner = owner;
+            bind_actor_skeleton(b->master, inst, sc);
             sc.actors.push_back(inst);
             sc.root->update_world();
 
@@ -1761,6 +1863,8 @@ int main(int argc, char** argv) {
     bool materials_only = false;
     bool winding_only = false;
     bool autowalk = false;
+    bool noskin = false;
+    const char* pose_arg = 0;   // "Joint:degrees" - proves a joint drives its part        // draw parts at the actor transform, unbound
     bool skeletons_only = false;      // headless: hold forward, to test movement
     int  shot_frame = 3;
     // .K2A winding measured as CCW-outward over 1201 actor meshes (--winding),
@@ -1794,6 +1898,8 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--materials") == 0) materials_only = true;
         else if (std::strcmp(argv[i], "--winding") == 0) winding_only = true;
         else if (std::strcmp(argv[i], "--autowalk") == 0) autowalk = true;
+        else if (std::strcmp(argv[i], "--noskin") == 0) noskin = true;
+        else if (std::strcmp(argv[i], "--pose") == 0 && i + 1 < argc) pose_arg = argv[++i];
         else if (std::strcmp(argv[i], "--skeletons") == 0) skeletons_only = true;
         else if (std::strcmp(argv[i], "--frames") == 0 && i + 1 < argc) shot_frame = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--cull") == 0 && i + 1 < argc) {
@@ -1990,6 +2096,35 @@ int main(int argc, char** argv) {
     // Covers every load path (room, level, actor); load_level appends many rooms
     // before the full type set is known, so colours are assigned once, here.
     assign_trap_colors(sc);
+    // --pose Joint:degrees rotates one joint about X and re-poses the actor, to
+    // show that a joint actually drives the geometry bound to it.
+    if (pose_arg) {
+        std::string spec(pose_arg);
+        const size_t colon = spec.find(':');
+        const std::string jname = spec.substr(0, colon);
+        const float deg = colon == std::string::npos ? 30.0f
+                        : float(std::atof(spec.c_str() + colon + 1));
+        const float r = deg * 3.14159265f / 180.0f;
+        for (size_t ai = 0; ai < sc.actors.size(); ++ai) {
+            actor_inst& A = sc.actors[ai];
+            if (!A.skinned) continue;
+            for (size_t j = 0; j < A.joint_names.size(); ++j) {
+                if (A.joint_names[j] != jname) continue;
+                k2::engine::transform rot;
+                const float c = std::cos(r), sn = std::sin(r);
+                rot.rotate[0]=1; rot.rotate[1]=0;  rot.rotate[2]=0;
+                rot.rotate[3]=0; rot.rotate[4]=c;  rot.rotate[5]=-sn;
+                rot.rotate[6]=0; rot.rotate[7]=sn; rot.rotate[8]=c;
+                k2::engine::transform out;
+                k2::engine::transform_compose(A.joint_local_bind[j], rot, out);
+                A.joint_local_cur[j] = out;
+                std::printf("pose: %s '%s' by %.1f deg\n", A.name.c_str(), jname.c_str(), deg);
+                break;
+            }
+            pose_actor(A);
+        }
+    }
+
     print_trap_legend(sc);
 
     camera cam;
@@ -2255,12 +2390,26 @@ int main(int argc, char** argv) {
             gfx::set_render_state(rs);
             for (size_t a = 0; a < sc.actors.size(); ++a) {
                 const actor_inst& ai = sc.actors[a];
+                const k2::engine::transform& aw = ai.node->world();
                 float am[16];
-                ai.node->world().to_matrix(am);
-                gfx::set_model(am);
+                aw.to_matrix(am);
                 for (size_t k = 0; k < ai.item_count; ++k) {
                     const draw_item& di = sc.items[ai.first_item + k];
                     if (di.is_trap) continue;
+                    if (ai.skinned && di.joint >= 0 && !noskin) {
+                        // actor_world * cur[j] * bind_inv[j]. Identity at the
+                        // bind pose, so this cannot change the image until a
+                        // joint is actually moved.
+                        k2::engine::transform t0, t1;
+                        k2::engine::transform_compose(ai.cur[size_t(di.joint)],
+                                                      ai.bind_inv[size_t(di.joint)], t0);
+                        k2::engine::transform_compose(aw, t0, t1);
+                        float jm[16];
+                        t1.to_matrix(jm);
+                        gfx::set_model(jm);
+                    } else {
+                        gfx::set_model(am);
+                    }
                     gfx::set_texture(di.tex);
                     gfx::draw(di.mesh);
                 }
