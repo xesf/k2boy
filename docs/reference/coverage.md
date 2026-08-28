@@ -63,7 +63,7 @@ Savegame                     [#########...........]  45%  framing + 5 sections
 Animation (.skl)             [###################.]  95%  loader done: 2363 files, 0 failures, 99.89% quats valid
 CharacterStateTable          [####................]  20%  placed in the hierarchy; base of Prince, camera and Trap. Only 7 of its 51 slots are overridden - 51 slots are the inherited NiNode interface, not states
 Boot sequence / WinMain      [##################..]  90%  entry -> WinMain -> event loop traced; distribution.dat + Tsunami.ttf; distribution.dat parsed; module table decoded - ids are alphabetical, 0x0C = prison = prisonfix.lvl
-Module state machine         [###############.....]  75%  6-virtual interface, 5 subclasses, slot 3 = event handler; 20 modules with names + levels, table + startup id implemented and verified
+Module state machine         [#################...]  85%  6-virtual interface, 5 subclasses, slot 3 = event handler; table + startup id implemented; module_manager tracks current/previous and drives the boot load, GOTO log matches the original
 Scene graph (NiNode)         [############........]  60%  transform layout measured from NiAVObject__LoadBinary; 8/8 self-test
 Actor spawn / New Game       [##############......]  70%  chain traced; ported and validated: 134/142 spawn points resolve
 K2*Activity family           [#...................]   5%  identified and named only

@@ -13,6 +13,7 @@
 #include "engine/node.h"
 #include "engine/config.h"
 #include "engine/module_table.h"
+#include "engine/module.h"
 
 #include <cstdio>
 #include <cstring>
@@ -1765,6 +1766,54 @@ int dump_skills() {
     return bad == 0 ? 0 : 1;
 }
 
+// The game module, as the original structures it: `gameModule` owns a level and
+// is entered through the module manager rather than being loaded inline.
+//
+// Slot 0 is the entry point (pure virtual in the original, overridden by every
+// subclass), so the level load happens there. The remaining slots stay stubs
+// until their roles are established - naming them enter/update/render would be
+// guessing, and that has already gone wrong once in this project.
+class game_module : public k2::engine::module {
+public:
+    game_module(int32_t module_id, int region,
+                scene* sc, assets::lvl_file* lv,
+                k2::engine::body_table* bodies,
+                std::vector<k2::engine::actor_spawn>* spawns)
+        : m_id(module_id), m_region(region), m_sc(sc), m_lv(lv),
+          m_bodies(bodies), m_spawns(spawns), m_loaded(false) {}
+
+    bool vf0() {
+        const k2::engine::module_entry* e = k2::engine::module_at(m_id);
+        if (!e || !e->level[0]) {
+            std::fprintf(stderr, "game_module: id %d has no level\n", m_id);
+            return false;
+        }
+        scene_reset(*m_sc);
+        m_loaded = load_level(e->level, *m_sc, *m_lv, m_region);
+        if (!m_loaded) return false;
+
+        build_body_table(*m_lv, *m_bodies);
+        spawn_prince_from_level(*m_lv, *m_sc, *m_bodies, *m_spawns, m_region);
+        spawn_level_actors(*m_sc, *m_bodies, *m_spawns);
+        std::printf("  actors: %zu spawned (prince index %d)\n",
+                    m_spawns->size(), k2::engine::find_prince(*m_spawns));
+        return true;
+    }
+
+    bool loaded() const { return m_loaded; }
+
+    k2::engine::module_id id() const { return k2::engine::MODULE_GAME; }
+
+private:
+    int32_t m_id;
+    int     m_region;
+    scene*  m_sc;
+    assets::lvl_file* m_lv;
+    k2::engine::body_table* m_bodies;
+    std::vector<k2::engine::actor_spawn>* m_spawns;
+    bool    m_loaded;
+};
+
 int main(int argc, char** argv) {
     const char* data_root = DEFAULT_DATA_ROOT;
     const char* dump_path = 0;
@@ -1939,8 +1988,7 @@ int main(int argc, char** argv) {
                     m ? m->name : "?");
         if (m && m->level[0]) {
             boot_level = m->level;
-            level_path = boot_level.c_str();
-            std::printf("boot: level %s (region %d)\n", level_path, region_arg);
+            std::printf("boot: level %s (region %d)\n", boot_level.c_str(), region_arg);
         }
     }
 
@@ -1950,7 +1998,19 @@ int main(int argc, char** argv) {
     k2::engine::body_table bodies;
     std::vector<k2::engine::actor_spawn> spawns;
 
-    if (actor_path) {
+    k2::engine::module_manager mgr;
+
+    if (boot) {
+        // The original's path: post a module id, the manager transitions, and
+        // the module loads its own level. No hardcoded level here.
+        game_module* gm = new game_module(k2::engine::MODULE_ID_STARTUP, region_arg,
+                                          &sc, &lv, &bodies, &spawns);
+        mgr.goto_module(k2::engine::MODULE_ID_STARTUP, gm);
+        have_level = gm->loaded();
+        std::printf("module: current '%s' previous '%s'\n",
+                    k2::engine::module_manager::id_name(mgr.current_id()),
+                    k2::engine::module_manager::id_name(mgr.previous_id()));
+    } else if (actor_path) {
         load_actor(actor_path, sc);
         if (!sc.empty) {
             std::printf("  bounds x[%.1f, %.1f] y[%.1f, %.1f] z[%.1f, %.1f]\n",

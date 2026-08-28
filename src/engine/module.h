@@ -17,6 +17,7 @@
 #include <stdint.h>
 
 #include "platform/platform.h"
+#include "engine/module_table.h"
 
 namespace k2 {
 namespace engine {
@@ -63,7 +64,13 @@ public:
 };
 
 // Owns the active module and the transition between them, standing in for
-// `moduleManager`. Kept minimal until the original's transition logic is read.
+// `moduleManager`.
+//
+// The original tracks the transition as two ids: `dword_7BE590` is the target
+// and `dword_7BE588` the previous, and `Game__FirstFrameInit` logs
+// "GOTO:%s FROM %s" while switching. Ids are positions in the alphabetically
+// sorted module table (see module_table.h), which is why they look arbitrary.
+// 0xFFFF means "none" and prints as <none>.
 class module_manager {
 public:
     module_manager();
@@ -71,6 +78,17 @@ public:
 
     void   set(module* m);      // takes ownership; destroys the previous one
     module* current() const { return m_current; }
+
+    // Requests a transition to a module id. Records the previous id and logs
+    // the same GOTO line the original does. The caller supplies the module
+    // instance because constructing one needs the layers above this.
+    void   goto_module(int32_t id, module* m);
+
+    int32_t current_id()  const { return m_current_id; }
+    int32_t previous_id() const { return m_previous_id; }
+
+    // "<none>" when the id is not in the table, matching the original's log.
+    static const char* id_name(int32_t id);
 
     // Drives the active module for one frame. The mapping from these calls onto
     // slots 1/2/4 is not yet established, so this deliberately does the minimum:
@@ -83,6 +101,8 @@ private:
     module_manager& operator=(const module_manager&);
 
     module* m_current;
+    int32_t m_current_id;
+    int32_t m_previous_id;
 };
 
 } // namespace engine

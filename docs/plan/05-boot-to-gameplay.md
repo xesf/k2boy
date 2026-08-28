@@ -76,11 +76,35 @@ first with the trap route as fallback.
 | title / intro | not started; needs the video decoder |
 | player control, animation | blocked on the `.act` hierarchy (`docs/formats/act.md`) |
 
+## Done: the module manager drives the boot
+
+`module_manager` now tracks the transition the way the original does — a current
+and a previous id, mirroring `dword_7BE590` / `dword_7BE588` — and logs the same
+line `Game__FirstFrameInit` prints:
+
+```
+boot: 7 config flags, startup module 0x0C = 'prison'
+GOTO:prison FROM <none>
+  region selected: rooms loaded 5, missing 0
+  [Prince] body 0 (Prince) at (22.0, 0.0, 1.9) heading 83.2 deg  26 meshes
+  actors: 4 spawned (prince index 0)
+module: current 'prison' previous '<none>'
+```
+
+`game_module` (in `main.cpp`, so the engine layer stays free of gfx) owns its
+level: slot 0 resolves its own entry from the module table and loads it. The
+level path is no longer written down anywhere — it comes from the table, which
+came from the binary.
+
+Slots 1, 2, 4 and 5 remain stubs. Naming them enter/update/render would be
+guessing, and `gameModule`'s slot 2 is a nullsub while `sMenuModuleClass`'s is
+248 bytes, so the split is not uniform. See `engine-structure.md`.
+
 ## Next, in order
 
-1. **Wire the module table into `module_manager`.** The ids and levels are known;
-   build the table, honour a startup id of `0x0C`, and let `gameModule` own the
-   scene. This replaces the viewer's ad-hoc load path with the original's.
+1. **Region transitions.** Region 0 loads; nothing yet moves between regions, and
+   the trailing ints on the `gameModule` constructor (`"finale", lvl, 4, 0, 0,
+   -1`) are still undecoded — one of them plausibly selects the start region.
 2. **Region streaming.** `prisonfix` has two `[Region]`s with separate room lists
    and separate `[Prince]` entries. The loader currently flattens every region
    into one scene. The original clearly loads a region at a time.

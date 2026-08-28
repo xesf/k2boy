@@ -2,10 +2,25 @@
 
 #include "engine/module.h"
 
+#include <cstdio>
+
 namespace k2 {
 namespace engine {
 
-module_manager::module_manager() : m_current(0) {}
+module_manager::module_manager()
+    : m_current(0), m_current_id(-1), m_previous_id(-1) {}
+
+const char* module_manager::id_name(int32_t id) {
+    const module_entry* e = module_at(id);
+    return e ? e->name : "<none>";
+}
+
+void module_manager::goto_module(int32_t id, module* m) {
+    m_previous_id = m_current_id;
+    m_current_id  = id;
+    std::printf("GOTO:%s FROM %s\n", id_name(m_current_id), id_name(m_previous_id));
+    set(m);
+}
 
 module_manager::~module_manager() {
     delete m_current;

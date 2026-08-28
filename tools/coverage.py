@@ -96,8 +96,9 @@ SUBSYSTEMS = [
     ('Boot sequence / WinMain',   90, 'entry -> WinMain -> event loop traced; distribution.dat + '
                                       'Tsunami.ttf; distribution.dat parsed; module table decoded - '
                                       'ids are alphabetical, 0x0C = prison = prisonfix.lvl'),
-    ('Module state machine',      75, '6-virtual interface, 5 subclasses, slot 3 = event handler; '
-                                      '20 modules with names + levels, table + startup id implemented and verified'),
+    ('Module state machine',      85, '6-virtual interface, 5 subclasses, slot 3 = event handler; '
+                                      'table + startup id implemented; module_manager tracks current/previous '
+                                      'and drives the boot load, GOTO log matches the original'),
     ('Scene graph (NiNode)',      60, 'transform layout measured from NiAVObject__LoadBinary; 8/8 self-test'),
     ('Actor spawn / New Game',    70, 'chain traced; ported and validated: 134/142 spawn points resolve'),
     ('K2*Activity family',         5, 'identified and named only'),
