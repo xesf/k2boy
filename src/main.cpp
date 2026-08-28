@@ -1832,6 +1832,8 @@ int main(int argc, char** argv) {
     bool rev_draw = false;
     bool materials_only = false;
     bool winding_only = false;
+    bool autowalk = false;      // headless: hold forward, to test movement
+    int  shot_frame = 3;
     // .K2A winding measured as CCW-outward over 1201 actor meshes (--winding),
     // so GL's default front face is correct and back faces can be dropped.
     // Verified identical to CULL_NONE from inside a room; from outside it
@@ -1862,6 +1864,8 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--revdraw") == 0) rev_draw = true;
         else if (std::strcmp(argv[i], "--materials") == 0) materials_only = true;
         else if (std::strcmp(argv[i], "--winding") == 0) winding_only = true;
+        else if (std::strcmp(argv[i], "--autowalk") == 0) autowalk = true;
+        else if (std::strcmp(argv[i], "--frames") == 0 && i + 1 < argc) shot_frame = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--cull") == 0 && i + 1 < argc) {
             const char* m = argv[++i];
             cull_mode_arg = !std::strcmp(m, "back")  ? gfx::CULL_BACK
@@ -2073,6 +2077,24 @@ int main(int argc, char** argv) {
     bool  down[plat::KEY_COUNT];
     std::memset(down, 0, sizeof(down));
     bool  show_traps = !trig_off;
+    // Follow the Prince when there is one; the viewer's free-fly is the
+    // fallback and stays available on F.
+    bool  follow_mode  = (k2::engine::find_prince(spawns) >= 0);
+    float player_yaw   = 0.0f;
+    const float walk_speed   = 3.2f;    // metres/second, eyeballed
+    const float follow_dist  = 4.5f;
+    const float follow_height = 2.2f;
+    if (follow_mode) {
+        const int32_t pi = k2::engine::find_prince(spawns);
+        for (size_t i = 0; i < sc.actors.size(); ++i)
+            if (!sc.actors[i].is_enemy) {
+                player_yaw = std::atan2(sc.actors[i].node->local.rotate[2],
+                                        sc.actors[i].node->local.rotate[8]);
+                break;
+            }
+        (void)pi;
+        cam.pitch = -0.22f;
+    }
     bool   looking   = false;
     double last_time = plat::time_seconds();
 
@@ -2128,6 +2150,11 @@ int main(int argc, char** argv) {
                 case plat::EVENT_KEY_DOWN:
                     if (e.k == plat::KEY_ESCAPE) running = false;
                     if (e.k == plat::KEY_R) frame_scene(cam, sc);
+                    if (e.k == plat::KEY_F) {
+                        follow_mode = !follow_mode;
+                        std::printf("camera: %s\n", follow_mode ? "follow" : "free-fly");
+                        std::fflush(stdout);
+                    }
                     if (e.k == plat::KEY_T) {
                         show_traps = !show_traps;
                         std::printf("triggers %s\n", show_traps ? "on" : "off");
@@ -2182,20 +2209,56 @@ int main(int argc, char** argv) {
         float fwd[3], right[3];
         camera_basis(cam, fwd, right);
 
+        // Two control modes. Follow mode drives the Prince and puts the camera
+        // behind him, which is what the game does; free-fly drives the camera
+        // and is the inspection tool. F toggles. Follow is the default whenever
+        // the level actually spawned a Prince.
+        actor_inst* player = 0;
+        if (follow_mode) {
+            for (size_t i = 0; i < sc.actors.size(); ++i)
+                if (!sc.actors[i].is_enemy) { player = &sc.actors[i]; break; }
+        }
+
         float mv[3] = {0.0f, 0.0f, 0.0f};
-        if (down[plat::KEY_W]) for (int a = 0; a < 3; ++a) mv[a] += fwd[a];
+        if (down[plat::KEY_W] || autowalk) for (int a = 0; a < 3; ++a) mv[a] += fwd[a];
         if (down[plat::KEY_S]) for (int a = 0; a < 3; ++a) mv[a] -= fwd[a];
         if (down[plat::KEY_D]) for (int a = 0; a < 3; ++a) mv[a] += right[a];
         if (down[plat::KEY_A]) for (int a = 0; a < 3; ++a) mv[a] -= right[a];
-        if (down[plat::KEY_E] || down[plat::KEY_SPACE]) mv[1] += 1.0f;
-        if (down[plat::KEY_Q]) mv[1] -= 1.0f;
 
-        const float ml = std::sqrt(mv[0]*mv[0] + mv[1]*mv[1] + mv[2]*mv[2]);
-        if (ml > 1e-6f) {
-            float sp = cam.speed * dt;
-            if (down[plat::KEY_LSHIFT] || down[plat::KEY_RSHIFT]) sp *= 4.0f;
-            if (down[plat::KEY_LCTRL]  || down[plat::KEY_RCTRL])  sp *= 0.25f;
-            for (int a = 0; a < 3; ++a) cam.pos[a] += mv[a] / ml * sp;
+        if (player) {
+            // Movement is horizontal: the Prince walks, he does not fly. There
+            // is no collision or ground query yet, so he keeps his spawn height.
+            mv[1] = 0.0f;
+            const float ml = std::sqrt(mv[0]*mv[0] + mv[2]*mv[2]);
+            k2::engine::transform& lt = player->node->local;
+            if (ml > 1e-6f) {
+                float sp = walk_speed * dt;
+                if (down[plat::KEY_LSHIFT] || down[plat::KEY_RSHIFT]) sp *= 2.5f;  // run
+                lt.translate[0] += mv[0] / ml * sp;
+                lt.translate[2] += mv[2] / ml * sp;
+                // Face the way he is going. Matches camera_basis: forward is
+                // (sin yaw, 0, -cos yaw), so yaw = atan2(dx, -dz).
+                player_yaw = std::atan2(mv[0] / ml, -(mv[2] / ml));
+            }
+            lt.set_yaw(player_yaw);
+            sc.root->update_world();
+
+            // Chase camera: behind and above, looking slightly down at him.
+            const k2::engine::transform& w = player->node->world();
+            cam.pos[0] = w.translate[0] - std::sin(cam.yaw) * follow_dist;
+            cam.pos[1] = w.translate[1] + follow_height;
+            cam.pos[2] = w.translate[2] + std::cos(cam.yaw) * follow_dist;
+            camera_basis(cam, fwd, right);
+        } else {
+            if (down[plat::KEY_E] || down[plat::KEY_SPACE]) mv[1] += 1.0f;
+            if (down[plat::KEY_Q]) mv[1] -= 1.0f;
+            const float ml = std::sqrt(mv[0]*mv[0] + mv[1]*mv[1] + mv[2]*mv[2]);
+            if (ml > 1e-6f) {
+                float sp = cam.speed * dt;
+                if (down[plat::KEY_LSHIFT] || down[plat::KEY_RSHIFT]) sp *= 4.0f;
+                if (down[plat::KEY_LCTRL]  || down[plat::KEY_RCTRL])  sp *= 0.25f;
+                for (int a = 0; a < 3; ++a) cam.pos[a] += mv[a] / ml * sp;
+            }
         }
 
         const float at[3] = {cam.pos[0] + fwd[0], cam.pos[1] + fwd[1], cam.pos[2] + fwd[2]};
@@ -2332,9 +2395,18 @@ int main(int argc, char** argv) {
         // --shot: let a couple of frames settle, grab the buffer, quit.
         if (shot_path) {
             static int frames = 0;
-            if (++frames >= 3) {
+            if (++frames >= shot_frame) {
                 std::vector<uint8_t> px(size_t(w) * size_t(h) * 4);
                 gfx::read_pixels(w, h, &px[0]);
+                for (size_t a = 0; a < sc.actors.size(); ++a) {
+                    if (sc.actors[a].is_enemy) continue;
+                    const k2::engine::transform& tw = sc.actors[a].node->world();
+                    std::printf("player at (%.2f, %.2f, %.2f) yaw %.2f  camera (%.2f, %.2f, %.2f)\n",
+                                tw.translate[0], tw.translate[1], tw.translate[2],
+                                std::atan2(tw.rotate[2], tw.rotate[8]),
+                                cam.pos[0], cam.pos[1], cam.pos[2]);
+                    break;
+                }
                 if (write_bmp(shot_path, w, h, &px[0]))
                     std::printf("wrote %s (%dx%d)\n", shot_path, w, h);
                 else

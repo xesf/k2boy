@@ -10,6 +10,7 @@
 #   make actor A=... render a character from its master.dat
 #   make prince     render the Prince (shortcut)
 #
+#   In the viewer: F toggles follow-the-Prince vs free-fly.
 #   In the viewer: WASD move, Q/E or Space up/down, drag LMB to look,
 #   scroll to change speed, Shift fast, Ctrl slow, R reframe,
 #   T toggle trigger volumes, Esc quit.
