@@ -299,3 +299,43 @@ both this:
 
 Fixed, and both scenes now render correctly. A reminder that "the geometry is
 wrong" and "the shading is wrong" look identical from inside a fog bank.
+
+## Two parser bugs, found and fixed
+
+Both were invisible in `prisonfix`, which is why they survived: the boot level
+happens to use the simple form of each construct.
+
+### `[Fog] rooms` — section headers may carry trailing text
+
+`is_section()` required the line to *end* with `]`. `Solar1.lvl` writes
+`[Fog] rooms`, and `cliffsBU.lvl` writes `[Fog] outside` and
+`[SkyColor] outside`. Those lines were not recognised as headers, so the parser
+stayed inside `[Rooms]` and pushed the header and its numbers in as **room
+names**:
+
+```
+before:  bodies 3, regions 1, rooms 8, items 0, fog 0
+         MISSING room [Fog] rooms.k2a
+after:   bodies 3, regions 1, rooms 5, items 0, fog 2
+```
+
+Solar1 was reporting three phantom rooms and parsing **no fog at all**.
+
+### `[Prince]` may name the body as well as index it
+
+Two forms ship:
+
+```
+0 22,0.01,1.92,83.25             prisonfix
+0 "prince" -153.10,-85,240,110   Solar1, and every one of cliffs' 10 regions
+```
+
+The parser took `vals[1]` as `x`, so the quoted name became `0.0` and every
+coordinate shifted one place. All ten cliffs region spawns were wrong:
+
+```
+after:  region 'cliffsA': prince 0 at (-153.10, -85.00, 240.00) heading 110.00
+        region 'cliffsB': prince 0 at (-141.20, -70.00, 197.00) heading -38.00
+```
+
+matching the file exactly.
