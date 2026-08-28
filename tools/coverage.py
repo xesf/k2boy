@@ -77,9 +77,9 @@ SUBSYSTEMS = [
     ('LVL + NBR loaders',        100, 'all 21 levels parse; 18 resolve every path; '
                                       'fog factors are far-clip fractions'),
     ('master.dat loader',        100, '42/42 parse, 0 unresolved geometry or actor'),
-    ('ACT skeleton hierarchy',    80, 'transforms are local-to-parent, bind rotations identity, '
-                                      'ENCODING FOUND: count-prefixed recursive child list at the tail of each '
-                                      'node record; parser rewrite + version-gated fields remain'),
+    ('ACT skeleton hierarchy',    95, 'transforms are local-to-parent, bind rotations identity, '
+                                      'RECOVERED: recursive child list at the tail of each node record; parent '
+                                      'links parsed and validated on 144/145 actors, 2065 nodes'),
     ('ACT loader',                75, 'properties 145/145; node layout + write order recovered'),
     ('Mf serialization iface',    90, 'interface, tags, write order, and the +0x14 MI this-adjust'),
     ('Image loaders',            100, 'BMP + TGA, 1035/1035 decode'),

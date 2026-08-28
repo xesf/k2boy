@@ -51,14 +51,23 @@ struct act_property {
 // The parent/child linkage is NOT yet decoded. MfProtoNode serialises its child
 // MfDblList as one 20-byte record per child, and those 20 bytes are unknown, so
 // `nodes` is a flat list in file order rather than a tree.
+// The skeleton is a tree. `parent` is an index into act_file::nodes, -1 for the
+// root; `child_count` is what the file stores. Nodes appear in depth-first
+// order, so parent links are recovered by consuming the counts in sequence.
+// See docs/formats/act.md.
 struct act_node {
     std::string name;
     float       pos[3];
     float       quat[4];        // w, x, y, z — w first, as in .skl
     size_t      offset;         // byte offset of the length prefix
+    int32_t     child_count;    // as stored in the file
+    int32_t     parent;         // index into act_file::nodes, -1 for the root
 };
 
 struct act_file {
+    // True when the child counts consumed exactly, giving one root and no
+    // orphans. False means the tree was not recovered and parent links are -1.
+    bool         tree_ok;
     std::string  magic;         // "APFM" or " MFB"
     std::string  type;          // "ActP"
     int32_t      version;       // 48, 105 or 106

@@ -837,6 +837,56 @@ gfx::texture_id load_texture(const std::string& bitmap_path, int& decoded, int& 
     return gfx::create_texture(img.width, img.height, &img.rgba[0]);
 }
 
+// Validates the recovered .act skeleton across every shipped actor: one root,
+// every node parented, no cycles, and a plausible depth. See docs/formats/act.md.
+int check_skeletons() {
+    std::vector<std::string> paths;
+    plat::fs_list_paths_by_extension(".act", paths);
+    std::sort(paths.begin(), paths.end());
+
+    size_t files = 0, ok = 0, bad = 0, total_nodes = 0;
+    std::vector<std::string> failures;
+
+    for (size_t i = 0; i < paths.size(); ++i) {
+        size_t size = 0;
+        uint8_t* d = plat::fs_read(paths[i].c_str(), size);
+        if (!d) continue;
+        assets::act_file a;
+        std::string err;
+        const bool parsed = assets::act_parse(d, size, a, &err);
+        plat::fs_free(d);
+        if (!parsed || a.nodes.empty()) continue;
+        ++files;
+        total_nodes += a.nodes.size();
+
+        bool good = a.tree_ok;
+        size_t roots = 0, deepest = 0;
+        if (good) {
+            for (size_t k = 0; k < a.nodes.size(); ++k) {
+                if (a.nodes[k].parent < 0) ++roots;
+                size_t depth = 0;
+                int32_t pth = a.nodes[k].parent;
+                while (pth >= 0 && depth <= a.nodes.size()) {
+                    ++depth;
+                    pth = a.nodes[size_t(pth)].parent;
+                }
+                if (depth > a.nodes.size()) { good = false; break; }   // cycle
+                if (depth > deepest) deepest = depth;
+            }
+            if (roots != 1) good = false;
+        }
+        if (good) ++ok;
+        else { ++bad; if (failures.size() < 8) failures.push_back(paths[i]); }
+    }
+
+    std::printf("skeletons: %zu .act files, %zu nodes\n", files, total_nodes);
+    std::printf("  tree recovered  %zu\n", ok);
+    std::printf("  failed          %zu\n", bad);
+    for (size_t i = 0; i < failures.size(); ++i)
+        std::printf("    %s\n", failures[i].c_str());
+    return bad == 0 ? 0 : 1;
+}
+
 // Sweeps every .K2A in the install and reports how many materials resolve a
 // texture, how many are flagged blended, and how many name a bitmap that cannot
 // be found. Added after the per-channel material fix, which changed *which*
@@ -1832,7 +1882,8 @@ int main(int argc, char** argv) {
     bool rev_draw = false;
     bool materials_only = false;
     bool winding_only = false;
-    bool autowalk = false;      // headless: hold forward, to test movement
+    bool autowalk = false;
+    bool skeletons_only = false;      // headless: hold forward, to test movement
     int  shot_frame = 3;
     // .K2A winding measured as CCW-outward over 1201 actor meshes (--winding),
     // so GL's default front face is correct and back faces can be dropped.
@@ -1865,6 +1916,7 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--materials") == 0) materials_only = true;
         else if (std::strcmp(argv[i], "--winding") == 0) winding_only = true;
         else if (std::strcmp(argv[i], "--autowalk") == 0) autowalk = true;
+        else if (std::strcmp(argv[i], "--skeletons") == 0) skeletons_only = true;
         else if (std::strcmp(argv[i], "--frames") == 0 && i + 1 < argc) shot_frame = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--cull") == 0 && i + 1 < argc) {
             const char* m = argv[++i];
@@ -1909,6 +1961,7 @@ int main(int argc, char** argv) {
     if (modules_only)   return dump_modules();
     if (materials_only) return check_materials();
     if (winding_only)   return check_winding();
+    if (skeletons_only) return check_skeletons();
     if (actnodes_path)  return dump_act_nodes(actnodes_path);
     if (dumpskl_path) {
         size_t sz = 0;

@@ -671,3 +671,59 @@ name+transform shape. It can now be rewritten to walk the record properly and
 build the tree, which is the prerequisite for posing body parts. The
 version-gated fields between the property table and the child count need pinning
 down first — the reader branches on `stream[+4] >= 0x68`.
+
+## Recovering the tree without parsing the payloads
+
+`MfProtoNode__ReadStream` writes each node's children **immediately after** its
+child count, and nodes are laid out depth-first. So for consecutive nodes in the
+file:
+
+```
+childCount(node i) == u32 at (offset of node i+1) - 4
+```
+
+No need to decode the kind payloads, the version-gated fields or the property
+table to reach it. The last node has nothing after it, but a valid tree only
+needs `sum(child_count) == n - 1`, and in a depth-first layout the final node is
+always a leaf.
+
+For `Prince.act` the counts sum to exactly 30 over 31 nodes and reconstruct:
+
+```
+Prince (1)
+  Prime (1)
+    Pelvis (3)
+      LLeg1 -> LLeg2 -> LHeel -> LToes
+      RLeg1 -> RLeg2 -> RHeel -> RToes
+      Mid (1)
+        DumChest (5)
+          LArm1 -> LArm2 -> LHand (3) -> LThumb1, LFingers1 -> LFingers2, LGrip
+          RArm1 -> RArm2 -> RHand (3) -> RThumb1, RFingers1 -> RFingers2, RGrip
+          Neck -> Head
+          Chest
+          Scabbard
+```
+
+`DumChest` carrying the arms, neck, chest and scabbard confirms — from a third
+independent direction — the finding that first came out of the bind-pose work.
+
+`act_node` now has `parent` and `child_count`, and `act_file::tree_ok` says
+whether the counts consumed exactly. When they do not, every `parent` is left
+at -1 rather than half-built.
+
+### Validated across the install
+
+`k2boy --skeletons` (`make skeletons`):
+
+```
+skeletons: 145 .act files, 2065 nodes
+  tree recovered  144
+  failed          1
+    actors/monkess/monkess.act
+```
+
+**144 of 145.** `monkess` writes node **kind 2** where the Prince writes kind 3,
+so its records have a different payload layout and the shape-based node scanner
+in `act_parse` most likely misses one. The failure is in finding the nodes, not
+in the count arithmetic — but that has not been confirmed, and one file is not
+worth a special case until the kind-2 payload is decoded.

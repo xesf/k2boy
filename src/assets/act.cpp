@@ -3,6 +3,7 @@
 #include "assets/act.h"
 
 #include <cstring>
+#include <vector>
 
 namespace k2 {
 namespace assets {
@@ -47,6 +48,7 @@ const act_property* act_file::find(const char* key) const {
 
 bool act_parse(const uint8_t* d, size_t size, act_file& out, std::string* error) {
     out = act_file();
+    out.tree_ok = false;
 
     if (!d || size < 16) { if (error) *error = "too small"; return false; }
 
@@ -154,12 +156,66 @@ bool act_parse(const uint8_t* d, size_t size, act_file& out, std::string* error)
         if (!sane || n2 < 0.998 || n2 > 1.002) { ++i; continue; }
 
         act_node nd;
+        nd.child_count = 0;
+        nd.parent      = -1;
         nd.name.assign(reinterpret_cast<const char*>(name), len);
         for (int k = 0; k < 3; ++k) nd.pos[k]  = pos[k];
         for (int k = 0; k < 4; ++k) nd.quat[k] = q[k];
         nd.offset = i;
         out.nodes.push_back(nd);
         i = t + 28;
+    }
+
+    // --- skeleton hierarchy
+    //
+    // Child nodes are written immediately after their parent's child count, and
+    // nodes appear depth-first (see MfProtoNode__ReadStream, docs/formats/act.md).
+    // So node i's child count is the u32 sitting just before node i+1's length
+    // prefix - no need to parse the variable-length payloads in between.
+    //
+    // The last node has nothing after it to read, but a valid tree only needs
+    // sum(child_count) == n-1, so its count is whatever the others leave over,
+    // and for a depth-first layout that is always 0.
+    if (!out.nodes.empty()) {
+        const size_t n = out.nodes.size();
+        int64_t total = 0;
+        for (size_t i = 0; i + 1 < n; ++i) {
+            const size_t at = out.nodes[i + 1].offset;
+            if (at < 4) { total = -1; break; }
+            const uint32_t c = rd32(d + at - 4);
+            if (c > n) { total = -1; break; }        // not a plausible count
+            out.nodes[i].child_count = int32_t(c);
+            total += c;
+        }
+        out.nodes[n - 1].child_count = 0;
+
+        out.tree_ok = (total == int64_t(n) - 1);
+        if (out.tree_ok) {
+            // Walk depth-first, consuming counts, to assign parents.
+            std::vector<int32_t> stack;      // (index, remaining children)
+            std::vector<int32_t> left;
+            size_t i = 0;
+            for (; i < n; ++i) {
+                if (!stack.empty()) {
+                    out.nodes[i].parent = stack.back();
+                    --left.back();
+                    while (!left.empty() && left.back() == 0) {
+                        stack.pop_back();
+                        left.pop_back();
+                    }
+                } else if (i != 0) {
+                    out.tree_ok = false;     // a second root: not a tree
+                    break;
+                }
+                if (out.nodes[i].child_count > 0) {
+                    stack.push_back(int32_t(i));
+                    left.push_back(out.nodes[i].child_count);
+                }
+            }
+            if (!stack.empty()) out.tree_ok = false;   // counts ran out early
+        }
+        if (!out.tree_ok)
+            for (size_t k = 0; k < n; ++k) out.nodes[k].parent = -1;
     }
 
     return true;

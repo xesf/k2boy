@@ -7,9 +7,9 @@ Regenerate with `python3 tools/coverage.py`. Subsystem percentages are judgement
 | Bucket | Count | Share |
 |---|---:|---:|
 | Total | 39,695 | 100.0% |
-| Named by this project | 793 | 2.0% |
-| Named by IDA / FLIRT (library code) | 1,379 | 3.5% |
-| Still `sub_*` | 37,523 | 94.5% |
+| Named by this project | 794 | 2.0% |
+| Named by IDA / FLIRT (library code) | 1,380 | 3.5% |
+| Still `sub_*` | 37,521 | 94.5% |
 
 The headline number is deliberately unflattering. Most of the binary is NetImmerse and Motivate middleware that does not need naming to be reimplemented - see `docs/plan/03-reimplementation.md`. Progress is better read per subsystem below.
 
@@ -50,7 +50,7 @@ K2A keyword grammar          [####################] 100%  77 keywords incl. K2_T
 K2A loader (engine code)     [####################] 100%  parser + mesh build; 501/501 parse; per-channel material reading (MAP_DIFFUSE bitmap, MAP_OPACITY = blended)
 LVL + NBR loaders            [####################] 100%  all 21 levels parse; 18 resolve every path; fog factors are far-clip fractions
 master.dat loader            [####################] 100%  42/42 parse, 0 unresolved geometry or actor
-ACT skeleton hierarchy       [################....]  80%  transforms are local-to-parent, bind rotations identity, ENCODING FOUND: count-prefixed recursive child list at the tail of each node record; parser rewrite + version-gated fields remain
+ACT skeleton hierarchy       [###################.]  95%  transforms are local-to-parent, bind rotations identity, RECOVERED: recursive child list at the tail of each node record; parent links parsed and validated on 144/145 actors, 2065 nodes
 ACT loader                   [###############.....]  75%  properties 145/145; node layout + write order recovered
 Mf serialization iface       [##################..]  90%  interface, tags, write order, and the +0x14 MI this-adjust
 Image loaders                [####################] 100%  BMP + TGA, 1035/1035 decode

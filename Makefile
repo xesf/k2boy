@@ -21,6 +21,7 @@
 #   make actnodes A=... headless: dump .act node records and their surroundings
 #   make materials  headless: resolve every material's texture across all .K2A
 #   make winding    headless: measure .K2A triangle winding (gates backface cull)
+#   make skeletons  headless: recover and validate every .act skeleton tree
 #   make config     headless: parse distribution.dat the way WinMain does
 #   make modules    headless: print the module table and check its ordering
 #   make boot       launch the way WinMain does: startup module -> level
@@ -44,7 +45,7 @@ JOBS      ?= $(shell sysctl -n hw.ncpu 2>/dev/null || echo 4)
 
 DEFAULT_ROOM ?= geometry\\rooms\\prisonfix\\prison1.k2a
 
-.PHONY: all build run verify images dump room level levels actor prince actors skills spawns shot bind actnodes materials winding config modules boot skl check release coverage web webindex clean rebuild help
+.PHONY: all build run verify images dump room level levels actor prince actors skills spawns shot bind actnodes materials winding skeletons config modules boot skl check release coverage web webindex clean rebuild help
 
 all: build
 
@@ -97,6 +98,9 @@ boot: $(BIN)
 
 modules: $(BIN)
 	@$(BIN) --modules $(DATA)
+
+skeletons: $(BIN)
+	@$(BIN) --skeletons $(DATA)
 
 winding: $(BIN)
 	@$(BIN) --winding $(DATA)
