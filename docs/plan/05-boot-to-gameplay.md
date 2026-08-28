@@ -100,11 +100,55 @@ Slots 1, 2, 4 and 5 remain stubs. Naming them enter/update/render would be
 guessing, and `gameModule`'s slot 2 is a nullsub while `sMenuModuleClass`'s is
 248 bytes, so the split is not uniform. See `engine-structure.md`.
 
+## The `gameModule` constructor arguments, decoded
+
+```c
+gameModule(const char* name, const char* level,
+           int ordinal, void* a, void* b, int flag);   // 0x526213, retn 18h
+```
+
+stored as `+0x10 = ordinal`, `+0x18 = a`, `+0x1C = b`, `+0x14 = flag`,
+`+0x20 = level`. Ground truth from the `prison` call site (`0x5263C2`):
+
+```
+push 0FFFFFFFFh              ; flag  -> +0x14
+push offset unk_74CDE0       ; b     -> +0x1C
+push ds:off_74D128           ; a     -> +0x18
+push 0Bh                     ; ordinal -> +0x10   = 11
+push "geometry\rooms\prisonfix\prisonfix.lvl"
+push "prison"
+```
+
+**Correction.** An earlier note here guessed one of these ints selects a start
+region. It does not: `a` and `b` are **object pointers** — `a` is `off_74D128`,
+the very global WinMain posts its module message to — and `flag` is -1 in every
+case seen. Nothing here concerns regions.
+
+### `ordinal` is a second, different numbering
+
+`+0x10` runs 0..17 across the seventeen game modules, and it is **not** the
+module id. It matches an alphabetical index over the modules *excluding* `NIS`
+and `title`:
+
+| name | ordinal (+0x10) | module id |
+|---|---:|---:|
+| burning | 0 | 0 |
+| lower2 | 6 | 6 |
+| *(menu occupies 7)* | — | 7 |
+| palace2 | 8 | 9 |
+| **prison** | **11** | **12** |
+| upper | 17 | 19 |
+
+So the game carries two numbering schemes over the same modules, diverging after
+`NIS`. The module id is what `Game__PostModuleMessage` uses; what consumes the
+ordinal has not been traced — savegame or progression order are the obvious
+guesses and neither has been checked.
+
 ## Next, in order
 
-1. **Region transitions.** Region 0 loads; nothing yet moves between regions, and
-   the trailing ints on the `gameModule` constructor (`"finale", lvl, 4, 0, 0,
-   -1`) are still undecoded — one of them plausibly selects the start region.
+1. **Region transitions.** Region 0 loads; nothing yet moves between regions.
+   The constructor arguments turned out not to help, so the lead is the trap
+   data instead.
 2. **Region streaming.** `prisonfix` has two `[Region]`s with separate room lists
    and separate `[Prince]` entries. The loader currently flattens every region
    into one scene. The original clearly loads a region at a time.
