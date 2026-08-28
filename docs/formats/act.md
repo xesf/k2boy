@@ -602,3 +602,72 @@ already parses. Ruled out.
 `Prince.act` has 31 nodes, and no node-creating loop appears in the node reader.
 Something outside `vf1` walks the file. That is the next question, and it is now
 a narrow one.
+
+---
+
+# The hierarchy is a recursive child list. Found.
+
+The question left open across three previous attempts — *where are the child
+nodes read* — is answered. It is the **last thing in every node record**, at the
+tail of `MfProtoNode__ReadStream` (`0x603E30`):
+
+```
+604101  MfStream__ReadDword(&count)          ; child count
+60410e  if (count <= 0) skip
+loop count times:
+60411e    operator new(0x80)                 ; a full MfProtoNode
+604139    MfProtoNode__ctor
+604151    ecx = child + 0x14                 ; the MfStreamObject subobject
+604156    MfStream__ReadObject(child+0x14)   ; RECURSIVE - reads the whole subtree
+60416a    MfProtoNode__AddChild(_, child)
+604173  loop
+```
+
+So the on-disk node record is:
+
+```
+u32 len, name                     (length-prefixed, no NUL)
+28 bytes                          transform: pos[3] + quat[4], w first
+u32                               kind        (3 for geometry nodes)
+...                               kind payload, size selected by kind
+u32 N, N * 20 bytes               attachment records {vec3, u32, u32}
+MfPropertyTable                   the MF_ properties
+...                               version-gated fields (stream version >= 0x68)
+u32 childCount
+childCount * <this whole record>  <-- recursion
+```
+
+`MfProtoActor__ReadStream` (`0x600A5B`, **slot 1 of `vtbl_MfProtoActor`**) creates
+exactly one `MfProtoNode` and calls `MfProtoActor__SetRootNode`, because the root
+node pulls in the entire tree by itself. The flat array at `actor+0x18` is
+derived afterwards by traversal, which is why counting `new(0x80)` call sites
+never explained 31 nodes.
+
+## Why this took four attempts
+
+Worth recording, since each failure looked reasonable:
+
+1. **child-count hypothesis** — matched 0/115 files. It assumed the count sat
+   near the front of the record; it is at the *end*, after two variable-length
+   sections.
+2. **geometry-derived parents** — anatomically correct on the Prince, but cycles
+   and 1.5 units of drift on A1. A heuristic, and it failed.
+3. **`this`-adjust confusion** — the reader's offsets sit 0x14 below the
+   constructor's because it runs on the `MfStreamObject` subobject. Reading them
+   against the wrong base made the layout look self-contradictory.
+4. **searching the data** — the trailing `[3, 0, 11, N]` block, the 140-byte
+   material payload and the file tail were each checked and ruled out. All three
+   were correct eliminations, but the answer was only reachable by reading the
+   loader, because the recursion means the child data is not at any fixed offset.
+
+The depth-first node order observed in `Prince.act` is exactly what a recursive
+writer produces, and `Mid -> DumChest -> LArm1` falls out of it — which is why
+that ordering observation was right even while the encoding was still unknown.
+
+## Not yet done
+
+The parser in `src/assets/act.cpp` still finds nodes by scanning for the
+name+transform shape. It can now be rewritten to walk the record properly and
+build the tree, which is the prerequisite for posing body parts. The
+version-gated fields between the property table and the child count need pinning
+down first — the reader branches on `stream[+4] >= 0x68`.
