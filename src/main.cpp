@@ -1330,6 +1330,40 @@ bool bind_actor_skeleton(const assets::master_file& m, actor_inst& inst, scene& 
         for (size_t j = 0; j < n; ++j)
             if (inst.joint_names[j] == mesh_name) { di.joint = int(j); ++bound; break; }
     }
+    // Some bodies (the prisoners) are modelled about the pelvis rather than
+    // the feet: every part sits ~1.03 below its joint, where the Prince's sit
+    // within a bone's length. Measured as the median part-to-joint offset;
+    // when it is that large the mesh is taken back into the skeleton's space
+    // by the pelvis's bind position, or the limbs pivot in the wrong places.
+    {
+        std::vector<float> dy;
+        for (size_t k = 0; k < inst.item_count; ++k) {
+            const draw_item& di = sc.items[inst.first_item + k];
+            if (di.joint >= 0) dy.push_back(di.center[1] - world[size_t(di.joint)].translate[1]);
+        }
+        if (!dy.empty()) {
+            std::nth_element(dy.begin(), dy.begin() + long(dy.size() / 2), dy.end());
+            const float med = dy[dy.size() / 2];
+            if (std::fabs(med) > 0.5f) {
+                float d[3] = { 0.0f, med, 0.0f };
+                for (size_t j = 0; j < n; ++j)
+                    if (inst.joint_names[j] == "Pelvis") {
+                        for (int k = 0; k < 3; ++k) d[k] = -world[j].translate[k];
+                        break;
+                    }
+                k2::engine::transform shift;     // mesh space -> skeleton space
+                for (int k = 0; k < 9; ++k) shift.rotate[k] = (k % 4 == 0) ? 1.0f : 0.0f;
+                for (int k = 0; k < 3; ++k) shift.translate[k] = -d[k];
+                shift.scale = 1.0f;
+                for (size_t j = 0; j < n; ++j) {
+                    k2::engine::transform b;
+                    k2::engine::transform_compose(inst.bind_inv[j], shift, b);
+                    inst.bind_inv[j] = b;
+                }
+                std::printf("  %s: mesh is %.2f off its skeleton, rebound\n", inst.name.c_str(), med);
+            }
+        }
+    }
     inst.skinned = bound > 0;
     if (inst.skinned) {
         load_loco_clips(act_path, inst);
@@ -2427,13 +2461,11 @@ void spawn_fixtures(scene& sc) {
             continue;
         }
         float gy;
-        // The prisoners' meshes are built around the pelvis, not the feet:
-        // lift them by how far they reach below their origin.
         // Probed from the box's floor: some (the Mopers) sit in pits under
         // a grate that a probe from the centre would land on.
         const float base[3] = { t.center[0], t.bbox[1] + 0.2f, t.center[2] };
         if (ground_under(sc.coll, base, gy) || ground_under(sc.coll, t.center, gy))
-            an->local.translate[1] = gy - std::min(0.0f, lmn[1]);
+            an->local.translate[1] = gy;
         const int owner = int(sc.actors.size());
         for (size_t k = 0; k < inst.item_count; ++k) sc.items[inst.first_item + k].owner = owner;
         inst.script_name = t.node;
@@ -4565,6 +4597,7 @@ int main(int argc, char** argv) {
     hang_ctl  ledges;
     bool      draw_was_down = false, atk_was_down = false;
     bool      jump_was_down = false;
+    bool      pad_act_down = false;   // pad X last frame; areas run before the pad is read
     std::printf("scripts: %zu traps, %zu areas, %zu plates%s\n", sc.traps.size(),
                 sc.areas.size(), sc.plates.size(),
                 noscript ? " (disabled by --noscript)" : "");
@@ -4698,7 +4731,7 @@ int main(int argc, char** argv) {
             const float* pp = 0;
             for (size_t i = 0; i < sc.actors.size(); ++i)
                 if (is_prince(sc.actors[i])) { pp = sc.actors[i].node->local.translate; break; }
-            const bool action = follow_mode && down[plat::KEY_E];
+            const bool action = follow_mode && (down[plat::KEY_E] || pad_act_down);
             for (size_t i = 0; i < sc.areas.size(); ++i)
                 sc.areas[i]->update(game_time, pp && sc.areas[i]->contains(pp), action);
             for (size_t i = 0; i < sc.plates.size(); ++i)
@@ -4815,6 +4848,7 @@ int main(int argc, char** argv) {
         //     behind him.
         plat::pad_state pad;
         plat::pad_poll(pad);
+        pad_act_down = pad.connected && pad.button[plat::PAD_X];
         float in_x = 0.0f, in_y = 0.0f;                 // stick: x right, y forward
         bool  pad_run = false;
         if (!(player && snoozed)) {
@@ -5371,7 +5405,7 @@ int main(int argc, char** argv) {
                     const uint16_t ix[6] = { 0, 1, 2, 0, 2, 3 };
                     quad = gfx::create_mesh(v, 4, ix, 6);
                 }
-                enum { B_FULL, B_HALF, B_THIRD, B_EMPTY, B_SWORD, B_COUNT };
+                enum { B_FULL, B_HALF, B_THIRD, B_EMPTY, B_SWORD, B_ACT, B_COUNT };
                 static gfx::texture_id hud_tex[B_COUNT];
                 static int hud_w[B_COUNT], hud_h[B_COUNT];
                 static bool hud_loaded = false;
@@ -5380,10 +5414,11 @@ int main(int argc, char** argv) {
                     const char* files[B_COUNT] = {
                         "2D/health bottles/redFull.BMP", "2D/health bottles/REDHALF.BMP",
                         "2D/health bottles/REDTHIRD.BMP", "2D/health bottles/empty.bmp",
-                        "2D/interface icons/sword icon.bmp" };
+                        "2D/interface icons/sword icon.bmp", 0 };
                     for (int k = 0; k < B_COUNT; ++k) {
                         hud_tex[k] = gfx::INVALID_TEXTURE;
                         hud_w[k] = hud_h[k] = 0;
+                        if (!files[k]) continue;
                         size_t size = 0;
                         uint8_t* data = plat::fs_read(files[k], size);
                         if (!data) { std::printf("hud: %s missing\n", files[k]); continue; }
@@ -5398,6 +5433,25 @@ int main(int argc, char** argv) {
                         }
                         plat::fs_free(data);
                     }
+                    // The action prompt: the game ships no icon for it, so a
+                    // key cap with an "E", drawn here. 32x32, 5x7 glyph x3.
+                    static const char* glyph[7] = { "11111", "10000", "10000", "11110",
+                                                    "10000", "10000", "11111" };
+                    std::vector<uint8_t> px(32 * 32 * 4, 0);
+                    for (int yy = 0; yy < 32; ++yy)
+                        for (int xx = 0; xx < 32; ++xx) {
+                            const float dx = xx - 15.5f, dy = yy - 15.5f;
+                            const float r = std::sqrt(dx * dx + dy * dy);
+                            uint8_t* q = &px[size_t(yy * 32 + xx) * 4];
+                            if (r > 15.5f) continue;
+                            const bool rim = r > 13.5f;
+                            const int gx = (xx - 8) / 3, gy = (yy - 5) / 3;
+                            const bool ink = xx >= 8 && gx < 5 && yy >= 5 && gy < 7 && glyph[gy][gx] == '1';
+                            q[0] = rim || ink ? 235 : 40; q[1] = rim || ink ? 205 : 28; q[2] = rim || ink ? 130 : 18;
+                            q[3] = rim || ink ? 255 : 190;
+                        }
+                    hud_tex[B_ACT] = gfx::create_texture(32, 32, &px[0]);
+                    hud_w[B_ACT] = hud_h[B_ACT] = 32;
                 }
                 float ident[16];
                 mat4_identity(ident);
@@ -5436,6 +5490,20 @@ int main(int argc, char** argv) {
                     m[0] = side * sx; m[5] = side * sy; m[12] = x + 8.0f * sx; m[13] = y;
                     gfx::set_model(m);
                     gfx::set_texture(hud_tex[B_SWORD]);
+                    gfx::draw(quad);
+                }
+                // Something to do here (talk, pull, use): the highlight icon
+                // above the bottles, pulsing, until E is pressed.
+                bool can_act = false;
+                for (size_t i = 0; i < sc.areas.size() && !can_act; ++i) can_act = sc.areas[i]->can_act();
+                if (can_act && hud_tex[B_ACT] != gfx::INVALID_TEXTURE) {
+                    const float side = 30.0f;
+                    const float pulse = 0.7f + 0.3f * float(std::sin(game_time * 5.0));
+                    m[0] = side * sx; m[5] = side * sy;
+                    m[12] = -1.0f + 12.0f * sx; m[13] = y + 42.0f * sy;
+                    gfx::set_model(m);
+                    gfx::set_tint(1.0f, 1.0f, 1.0f, pulse);
+                    gfx::set_texture(hud_tex[B_ACT]);
                     gfx::draw(quad);
                 }
                 gfx::set_texture(gfx::INVALID_TEXTURE);

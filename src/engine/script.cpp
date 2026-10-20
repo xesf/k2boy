@@ -173,6 +173,15 @@ void pressure_plate::update(double now, bool pressed) {
     }
 }
 
+bool area_trap::can_act() const {
+    if (!m_enabled || !m_inside || m_acted || m_exit_delay < 0.0 || m_action.empty()) return false;
+    if (m_action.find('{') == std::string::npos) return true;
+    std::string a = m_action, key = "{" + m_state + ":";
+    for (size_t i = 0; i < a.size(); ++i) a[i] = char(std::tolower(static_cast<unsigned char>(a[i])));
+    for (size_t i = 0; i < key.size(); ++i) key[i] = char(std::tolower(static_cast<unsigned char>(key[i])));
+    return a.find(key) != std::string::npos;
+}
+
 void area_trap::update(double now, bool inside, bool action) {
     if (!m_enabled) return;
 

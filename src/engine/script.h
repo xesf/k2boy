@@ -122,6 +122,11 @@ public:
 
     bool contains(const float* p) const { return m_volume.contains(p); }
 
+    // Ours, for the on-screen prompt: a character is inside, has not acted
+    // this visit, and the action message does something in the current
+    // state (a "{state:...}" block for it, or no blocks at all).
+    bool can_act() const;
+
 private:
     std::string m_enter, m_exit, m_action, m_repeat;
     double      m_exit_delay, m_interval;
