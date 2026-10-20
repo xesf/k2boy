@@ -334,7 +334,11 @@ bool fs_resolve(const char* path, char* out, size_t out_size) {
     if (!g_indexed) {
         if (resolve_direct(path, out, out_size)) return true;
         if (g_case_blind) return false;
-        ensure_index(path);
+        // Fallback disabled for now: a miss stays a miss rather than walking
+        // the whole install. Listings (fs_list_*) still index.
+        // ensure_index(path);
+        std::printf("vfs: not found: %s\n", path);
+        return false;
     }
 
     std::unordered_map<std::string, std::string>::const_iterator it =
@@ -377,7 +381,9 @@ bool fs_resolve_basename(const char* name, char* out, size_t out_size) {
                 std::memcpy(out, found.c_str(), found.size() + 1);
                 return true;
             }
-        if (!g_indexed) ensure_index(name);
+        // Fallback disabled for now (see fs_resolve).
+        // if (!g_indexed) ensure_index(name);
+        if (!g_indexed) { std::printf("vfs: not found by name: %s\n", name); return false; }
     }
 
     std::unordered_map<std::string, std::string>::const_iterator it = g_by_name.find(key);
