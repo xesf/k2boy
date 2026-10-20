@@ -159,6 +159,29 @@ else with `"Doors can't handle message %s"`. The skills are `SklK` keyframe clip
 
 The rotation is about the trap's `K2_TRAP_PIVOT`.
 
+## Fixture: actors placed by a trap
+
+```
+argv0  "<state>,<visible>,<collide>,<?>"   ",true,true,false", "Empty,true,true,false", "1"
+argv1  actor directory under Actors        Prisoner3, PRISONER_TALKY, rat, Lever01, FIX_Crane
+argv2  idle skills, comma separated        "BasePose_L,...,AmbientType_G6", "Breathe"
+```
+
+The actor has no master.dat: its skeleton is `Actors/<argv1>/<argv1>.act`
+and its body the `.K2A` beside it. It answers scripts under the trap's node
+name. Messages seen in prisonfix are its own skill names
+(`Prisoner3,LookUp`, `Moper2,Talktoprince`, `P4FIX_Crane01,lower4m`,
+`P5_CrushLever01,RunFromOff`) plus `enable:T` and `Visible:T`. A `false` or
+`F` visible field starts it hidden (the box rats, the strongbox).
+
+Ours: idles are picked at random from argv2. A named state in argv0 is posed
+and held. A skill sent by a script returns to the idles if there are any;
+otherwise its last frame is held. The prisoners' meshes are built around the
+pelvis (y −1.02 … 1.12), so the body is lifted by that much off the floor
+found under the trap. Not traced in the binary: the idle selection and
+timing, and what `<collide>` and the fourth field do. Rats' idles are SklK and
+not played yet.
+
 ## `move` (Force, Mover; TranslateMotion)
 
 ```
