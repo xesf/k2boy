@@ -1616,6 +1616,14 @@ void scene_reset(scene& sc) {
     sc.mx[0] = sc.mx[1] = sc.mx[2] = -1e30f;
 }
 
+// Darts in flight, from Launcher traps ("fire"). Traps.txt: argv1 Dart (1)
+// or Fireball (2). A dart flies straight from the launcher along its facing
+// until it hits the Prince (a bottle, Arrow::kArrowNormalDamage 12) or a
+// wall; its speed and the facing convention (-Z turned by the trap's pivot)
+// are ours - the Launcher class is not traced.
+struct dart { float p[3], d[3]; double born; };
+std::vector<dart> g_darts;
+
 // Parses one .K2A and appends its meshes to `sc`, growing the bounds.
 // A trap node in a room. The base handles reset / state / enable / visible /
 // collide (0x4552B7); this adds what those mean for drawing and collision, and
@@ -1636,6 +1644,12 @@ public:
     float             box[6];   // K2_TRAP_BBOX at rest, engine space
     std::string       actor;    // whose skills a message can name (Door: argv1)
     float             pivot[3]; // K2_TRAP_PIVOT: a skill's rotation is about this
+    float             pivot_angle = 0.0f;   // K2_TRAP_PIVOT_ANGLE about its axis (Launcher)
+    // A Volume ForceTrap's current ("current,green,4": along the trap's
+    // green axis turned by its pivot, 4 units a second), pushing whoever
+    // swims inside its box. Ours: ForceTrap's Volume type is not traced.
+    bool              has_current = false;
+    float             current[3] = { 0.0f, 0.0f, 0.0f };
 
     // Where the trap sits now, relative to rest.
     const float* offset() const { return m_base; }
@@ -1678,6 +1692,17 @@ public:
             m.begin(m_world.now());
             m_motion = m;
             m_moving = true;
+            return true;
+        }
+        if (type == "Launcher" && msg.size() >= 4 && (msg.compare(0, 4, "fire") == 0 || msg.compare(0, 4, "Fire") == 0)) {
+            dart dt;
+            for (int k = 0; k < 3; ++k) dt.p[k] = (box[k] + box[k + 3]) * 0.5f + m_base[k];
+            // -Z turned about +y by the pivot (signed by its axis).
+            const float a = pivot_angle;
+            dt.d[0] = -std::sin(a); dt.d[1] = 0.0f; dt.d[2] = -std::cos(a);
+            dt.born = m_world.now();
+            g_darts.push_back(dt);
+            play_sound("MULdartshoot", dt.p, 14.0f, false);
             return true;
         }
         // A Door plays the skill its message names ("openslow", "pivot90");
@@ -2683,6 +2708,20 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
                 scene_trap* st = new scene_trap(sc.script, n.name, hdr, sc,
                                    int(sc.items.size()) - 1, node, n.trap.name, n.trap.bbox);
                 for (int k = 0; k < 3; ++k) st->pivot[k] = n.trap.pivot[k];
+                st->pivot_angle = n.trap.pivot_angle * (n.trap.pivot_axis[1] < 0.0f ? -1.0f : 1.0f);
+                if (n.trap.name == "Force" && n.trap.argv.size() > 2 && equals_nocase(n.trap.argv[1], "Volume") &&
+                    n.trap.argv[2].compare(0, 8, "current,") == 0) {
+                    k2::engine::translate_motion m;     // the axis words as "move" reads them
+                    const std::string rest = n.trap.argv[2].substr(8);
+                    if (m.parse(rest + ",1,0,0")) {
+                        const float c = std::cos(st->pivot_angle), sn = std::sin(st->pivot_angle);
+                        // about +y: x' = c x + s z, z' = -s x + c z
+                        st->current[0] = c * m.dir[0] + sn * m.dir[2];
+                        st->current[1] = m.dir[1];
+                        st->current[2] = -sn * m.dir[0] + c * m.dir[2];
+                        st->has_current = true;
+                    }
+                }
                 if (n.trap.name == "Door")
                     st->actor = (n.trap.argv.size() > 1 && !n.trap.argv[1].empty())
                                 ? n.trap.argv[1] : std::string("TRAP_Door");
@@ -7026,6 +7065,42 @@ int main(int argc, char** argv) {
                 scene_trap* st = dynamic_cast<scene_trap*>(sc.traps[i]);
                 if (st) { st->collapse_update(game_time, dt, pp); st->update(game_time); }
             }
+            // Darts in flight: straight on until the Prince or a wall.
+            for (size_t i = 0; i < g_darts.size(); ) {
+                dart& d = g_darts[i];
+                const float step = 18.0f * dt;
+                bool gone = game_time - d.born > 3.0;
+                k2::engine::pick_hit h;
+                float travel = step;
+                if (!gone && sc.coll.pick(d.p, d.d, step, false, h)) { travel = h.distance; gone = true; }
+                // The Prince: his body a column from his feet up 1.8.
+                if (pp && combat.dead_since < 0.0) {
+                    const float ex = d.p[0] + d.d[0] * travel, ez = d.p[2] + d.d[2] * travel;
+                    const float vx = ex - d.p[0], vz = ez - d.p[2];
+                    const float wx = pp[0] - d.p[0], wz = pp[2] - d.p[2];
+                    const float l2 = vx * vx + vz * vz;
+                    const float u = l2 > 0.0f ? std::max(0.0f, std::min(1.0f, (wx * vx + wz * vz) / l2)) : 0.0f;
+                    const float cx = d.p[0] + vx * u - pp[0], cz = d.p[2] + vz * u - pp[2];
+                    if (cx * cx + cz * cz < 0.4f * 0.4f && d.p[1] > pp[1] && d.p[1] < pp[1] + 1.8f) {
+                        for (size_t a = 0; a < sc.actors.size(); ++a)
+                            if (is_prince(sc.actors[a])) {
+                                prince_damage(combat, sc, sc.actors[a], combat_tuning::BOTTLE, DIR_CENTER, game_time);
+                                break;
+                            }
+                        play_sound("MULdarthitz", d.p, 12.0f, false);
+                        gone = true;
+                    }
+                }
+                for (int k = 0; k < 3; ++k) d.p[k] += d.d[k] * travel;
+                if (gone) {
+                    fx_spawn("DartImpact.NIF", d.p, 0.0f, game_time, 0.5);
+                    g_darts.erase(g_darts.begin() + long(i));
+                    continue;
+                }
+                if (int(game_time * 30.0) % 2 == 0)
+                    fx_spawn("DartTrail.NIF", d.p, std::atan2(d.d[0], d.d[2]), game_time, 0.2);
+                ++i;
+            }
         }
         const bool snoozed = !noscript && game_time < (prince_msgs ? prince_msgs->snooze_until : 0.0);
         input_locked = snoozed;
@@ -7322,6 +7397,16 @@ int main(int argc, char** argv) {
                     in_swim = swim_update(swim, sc, *player, lt.translate, player_yaw, surf, mv, ml,
                                           jump_key, act, act_pressed && swim.state == swim_ctl::SURFACE,
                                           classic, dt, drowning);
+                    // Currents carry a swimmer along.
+                    if (in_swim)
+                        for (size_t i = 0; i < sc.traps.size(); ++i) {
+                            scene_trap* ft = dynamic_cast<scene_trap*>(sc.traps[i]);
+                            if (!ft || !ft->has_current || !ft->enabled()) continue;
+                            const float* b = ft->box;
+                            const float* q = lt.translate;
+                            if (q[0] < b[0] || q[0] > b[3] || q[1] < b[1] || q[1] > b[4] || q[2] < b[2] || q[2] > b[5]) continue;
+                            move_horizontal(sc.coll, lt.translate, ft->current[0] * dt, ft->current[2] * dt);
+                        }
                     if (drowning && game_time >= drown_tick) {
                         drown_tick = game_time + 1.0;
                         prince_damage(combat, sc, *player, combat_tuning::BOTTLE / 3, 0, game_time);
