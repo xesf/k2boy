@@ -15,6 +15,7 @@
 #include "engine/module_table.h"
 #include "engine/module.h"
 #include "engine/collision.h"
+#include "engine/trap.h"
 
 #include <cstdio>
 #include <cstring>
@@ -1195,7 +1196,13 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
         // a large Area trap cannot throw off camera framing. See the note below
         // on why a trap block alone is not enough to classify a node.
         const bool is_volume = n.has_trap && n.material_ref < 0;
-        if (!is_volume) {
+        // Every trap's argv[0] carries Visible and Collideable (0x454A41).
+        // An invisible trap is not drawn; it joins the trigger-volume view.
+        k2::engine::trap_header hdr;
+        if (n.has_trap && !n.trap.argv.empty())
+            hdr = k2::engine::parse_trap_header(n.trap.argv[0]);
+        const bool hidden = n.has_trap && !hdr.visible;
+        if (!is_volume && !hidden) {
             for (size_t v = 0; v < vb.size(); ++v) {
                 const float p[3] = {vb[v].x, vb[v].y, vb[v].z};
                 for (int a = 0; a < 3; ++a) {
@@ -1235,7 +1242,7 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
         // must still be drawn normally. The pure trigger volumes are the ones
         // with no material at all; those are what rendered as black boxes,
         // because they fall through to their (black) vertex colours.
-        it.is_trap   = is_volume;
+        it.is_trap   = is_volume || hidden;
         it.trap_type = -1;
         it.owner     = -1;
         it.joint     = -1;
@@ -1251,10 +1258,16 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
         sc.items.push_back(it);
         sc.item_names.push_back(n.name);
 
-        // Room geometry is solid. Blended materials (flame sheets, water,
-        // grates) are left out: which nodes the original picks against is
-        // decided per category at room load, and that rule is not traced yet.
-        if (collide && !it.is_trap && !it.transparent)
+        // What the floor and wall picks (mask 6) see, per 0x449546 and
+        // 0x474525: room geometry minus its alpha leaves, plus any Generic
+        // trap that is Collideable, visible or not. For other trap types with
+        // real geometry (doors, crates) the same flag is applied; how the
+        // original picks those is not traced. Trigger volumes never collide.
+        bool solid;
+        if (!n.has_trap)                 solid = !it.transparent;
+        else if (n.trap.name == "Generic") solid = hdr.collideable;
+        else                             solid = hdr.collideable && !is_volume;
+        if (collide && solid)
             sc.coll.add_mesh(&vb[0].x, sizeof(assets::k2a_vertex) / sizeof(float),
                              vb.size(), &ib[0], ib.size());
     }

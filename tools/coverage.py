@@ -101,9 +101,10 @@ SUBSYSTEMS = [
                                       'and drives the boot load, GOTO log matches the original'),
     ('Scene graph (NiNode)',      60, 'transform layout measured from NiAVObject__LoadBinary; 8/8 self-test'),
     ('Actor spawn / New Game',    70, 'chain traced; ported and validated: 134/142 spawn points resolve'),
-    ('Collision / pick',          40, 'one masked raycast (0x512183) serves every floor and wall test; '
-                                      'chain, nearest-hit rule, face normal and mask->category table recovered '
-                                      'and ported; the room-load rule assigning nodes to categories is open'),
+    ('Collision / pick',          70, 'one masked raycast (0x512183) serves every floor and wall test; '
+                                      'chain, nearest-hit rule, face normal, mask->category table and the '
+                                      'category rule (room leaves minus alpha; Generic by Visible/Collideable) '
+                                      'recovered and ported; ring shells and mover traps open'),
     ('K2*Activity family',         5, 'identified and named only'),
     ('Motivate planner',           0, 'MfLocoPlanner / MfManipActivity - not started'),
 

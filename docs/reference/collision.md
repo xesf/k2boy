@@ -62,28 +62,64 @@ Each room keeps four index lists per category: `+0x1FC..` for category 0, `+0x21
 flag word has a bit in common with `flag_bits`. These are presumably the room itself, then wider
 neighbour sets.
 
-**Not yet traced:** the code that puts a node into category 0, 1 or 2 at room load. Category 0 is
-almost certainly static room geometry. The `'!' / '$' / '#'` markers (collidable but invisible,
-and so on) found near this code belong to a scene-dump legend (`0x510CB3`). They are not a
-node-naming convention, and no shipped `.K2A` node name uses them.
+Each room fills those lists in `0x4152EE` → `0x4153D0`, once per ring. Rings are distance
+shells, not graph neighbours. The room's bound is grown by a per-ring margin and collided against
+the level-wide array for that category (horizontal and vertical margins: ring 0 `5, 0.5`; ring 1
+`5, -2`; ring 2 `8, -2`; ring 3 `10, 10`). Every node it touches is kept.
+
+### Which node lands in which category
+
+The level-wide arrays are copied (`0x41AC53`) from a load-time collector (`dword_7E9BF0`) that
+`LevelFileParser__Parse` creates. Three adders feed it:
+
+| adder | list | category | called for |
+|---|---|---:|---|
+| `0x41FF5D` → `0x41FF71` | `+0x04` | 0 | the `RoomGroup`'s imported `.k2a` (`0x449546`, node `+0xD0`); a Generic trap that is Visible and Collideable |
+| `0x420266` → `0x420293` | `+0x0C` | 1 | a Generic trap that is Visible but not Collideable |
+| `0x42015E` → `0x42018C` | `+0x14` | 2 | a Generic trap that is Collideable but not Visible |
+
+`0x41FF71` recurses through `NiNode`s and files every `NiTriShape` leaf, without filtering. The
+room's alpha leaves are split into `+0xDC` and go to `+0x1C` (`0x42032E`), a list no mask picks.
+So blended room geometry is never collided with.
+
+Visible and Collideable are fields 2 and 3 of every trap's `argv[0]`. Traps.txt documents the
+whole field as `InitialState, ResetEnabled, Visible, Collideable`. The Trap base (`0x454A41`)
+splits it on commas (`0x50BD02`, untrimmed) and parses each flag with `0x50BBB6`:
+`t/true/yes/on/1` and `f/false/no/off/0`, case-insensitive. Anything else keeps the default, which is
+true. Across every shipped room there are 1684 Generic traps:
+
+| argv[0] | count | category |
+|---|---:|---|
+| `,true,true,false` | 965 | 1: visible decoration, not solid |
+| `,true,false,true` | 540 | 2: invisible collision box |
+| `,true,true,true` | 109 | 0: visible and solid |
+| `,true,false,false` | 70 | none |
+
+A Generic whose `argv[2]` is true is a mover. It goes to a separate list (`0x4203C5`, collector
+`+0x24`) instead, and isn't covered here.
 
 ## What the port does
 
 `collision_world` holds every static room triangle, in world space, in an XZ grid. It answers
 `pick(origin, dir, max_t, front_only)` with the nearest hit and the face normal, as above.
 
-Differences from the original, all because of the untraced categories:
+What it holds is mask 6's set: room geometry without its blended (alpha) materials, plus every
+Generic trap that is Collideable, visible or not. Generic traps with Visible false are not drawn.
 
-- one node set stands in for every mask
-- blended materials (flame sheets, water, grates) are left out, on the same reasoning as the
-  `web/` experiment
+Differences from the original:
+
+- one node set stands in for every mask. The rings are not modelled, so the whole loaded region
+  is pickable.
+- other trap types with real geometry (doors, crates) use the same Collideable flag. How the
+  original picks those (collector `+0x24`, movers) is not traced.
 - actor bodies and trigger volumes are left out
 
 The movement in `main.cpp` (`ground_under`, `move_horizontal`, gravity) is a stand-in built on
 the primitive. The original's `PrinceMotion` is animation-driven and much larger. The step
 height, radius and slope limit are our values, not the game's.
 
-Evidence: in `prisonfix` region 0, 5786 triangles are collected. The down-probe at the spawn
+Evidence: in `prisonfix` region 0, 5314 triangles are collected (5786 before the Collideable
+flag was honoured). The down-probe at the spawn
 point finds the floor at the spawn height (y = 0.010). Walking into the first cell wall stops at
 x = 25.35 and slides along it; with `--noclip`, the same input walks to x = 43.15, outside the
 level.
