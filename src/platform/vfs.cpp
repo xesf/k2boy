@@ -65,12 +65,21 @@ void index_dir(const std::string& abs, const std::string& rel) {
         std::string child_abs = abs + "/" + name;
         std::string child_rel = rel.empty() ? std::string(name) : rel + "/" + name;
 
+#ifdef __vita__
+        // The Vita's readdir carries each entry's status: a stat() per file
+        // over thousands of files takes the better part of a minute.
+        const bool is_dir = SCE_S_ISDIR(e->d_stat.st_mode);
+        const bool is_reg = SCE_S_ISREG(e->d_stat.st_mode);
+#else
         struct stat st;
         if (::stat(child_abs.c_str(), &st) != 0) continue;
+        const bool is_dir = S_ISDIR(st.st_mode);
+        const bool is_reg = S_ISREG(st.st_mode);
+#endif
 
-        if (S_ISDIR(st.st_mode)) {
+        if (is_dir) {
             index_dir(child_abs, child_rel);
-        } else if (S_ISREG(st.st_mode)) {
+        } else if (is_reg) {
             // First writer wins. data/Rooms duplicates data/Geometry/Rooms; either
             // resolves to a byte-identical file, so collisions are harmless.
             g_index.emplace(normalise(child_rel.c_str()), child_abs);

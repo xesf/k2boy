@@ -5555,6 +5555,8 @@ int main(int argc, char** argv) {
         else                                            data_root = argv[i];
     }
 
+    std::printf("mounting %s\n", data_root);
+    std::fflush(stdout);
     if (!plat::fs_mount(data_root)) {
         std::fprintf(stderr,
                      "k2boy: could not mount data root '%s'\n"

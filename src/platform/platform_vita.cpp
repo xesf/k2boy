@@ -278,6 +278,7 @@ void ensure_log() {
     if (err) { std::setvbuf(err, 0, _IONBF, 0); r->_stderr = err; _impure_ptr->_stderr = err; }
     // Closed at exit: an emulator may hold writes until the close.
     std::atexit([] { if (out) std::fclose(out); if (err) std::fclose(err); });
+    std::printf("k2boy: started\n");
 }
 
 } // namespace
