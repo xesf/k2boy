@@ -49,6 +49,7 @@ set(K2_SOURCES
     src/engine/script.cpp
     src/engine/mixer.cpp
     src/engine/fight.cpp
+    src/engine/jobs.cpp
 )
 
 if(APPLE)

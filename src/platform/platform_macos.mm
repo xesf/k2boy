@@ -15,6 +15,10 @@
 
 #include <dlfcn.h>
 #include <chrono>
+#include <cstdlib>
+#include <sys/stat.h>
+#include <thread>
+#include <unistd.h>
 #include <deque>
 #include <vector>
 
@@ -449,6 +453,38 @@ void* native_window_handle() {
 double time_seconds() {
     std::chrono::duration<double> d = std::chrono::steady_clock::now() - g_start;
     return d.count();
+}
+
+// ---------------------------------------------------------------- process
+
+void default_args(std::vector<std::string>& out) { out.clear(); }
+
+std::string user_dir() {
+    const char* h = std::getenv("HOME");
+    std::string d = std::string(h ? h : ".") + "/.k2boy";
+    ::mkdir(d.c_str(), 0755);
+    return d;
+}
+
+void relaunch(const char* argv0, const std::vector<std::string>& args) {
+    std::vector<char*> v;
+    v.push_back(const_cast<char*>(argv0));
+    for (size_t i = 0; i < args.size(); ++i) v.push_back(const_cast<char*>(args[i].c_str()));
+    v.push_back(0);
+    ::execv(argv0, &v[0]);
+}
+
+// ---------------------------------------------------------------- threads
+
+bool thread_start(thread_fn fn, void* arg, int core, const char* name) {
+    (void)core; (void)name;         // macOS has no affinity API worth using
+    std::thread(fn, arg).detach();
+    return true;
+}
+
+int cpu_count() {
+    const unsigned n = std::thread::hardware_concurrency();
+    return n ? int(n) : 1;
 }
 
 // ---------------------------------------------------------------- audio

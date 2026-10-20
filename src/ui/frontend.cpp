@@ -35,12 +35,7 @@ enum {
     T_NONE = -1
 };
 
-std::string home_dir() {
-    const char* h = std::getenv("HOME");
-    std::string d = std::string(h ? h : ".") + "/.k2boy";
-    ::mkdir(d.c_str(), 0755);
-    return d;
-}
+std::string home_dir() { return plat::user_dir(); }
 
 std::string slot_path(int slot) {
     char b[32];

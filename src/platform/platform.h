@@ -120,6 +120,10 @@ struct pad_state {
     bool  connected;
     float axis[PAD_AXIS_COUNT];
     bool  button[PAD_BUTTON_COUNT];
+    // A gyroscope in the pad or the device (the Vita's): angular velocity in
+    // radians per second about the device's x (pitch), y (yaw) and z (roll).
+    bool  has_motion;
+    float motion[3];
 };
 void pad_poll(pad_state& out);
 
@@ -143,6 +147,31 @@ void* native_window_handle();
 
 // Monotonic seconds since init(). Not wall clock.
 double time_seconds();
+
+// ---------------------------------------------------------------- process
+
+// Arguments to run with when the program was started without any (a console
+// launching it from its home screen): data root, front end, controls.
+// Empty on a desktop, where the command line says what to do.
+void default_args(std::vector<std::string>& out);
+
+// Directory for saves and settings, created if missing. ~/.k2boy on a
+// desktop, the app's data folder on a console.
+std::string user_dir();
+
+// Starts this program again with `args` (argv[1..]), replacing the running
+// one. `argv0` is the path it was started with. Returns only on failure.
+void relaunch(const char* argv0, const std::vector<std::string>& args);
+
+// ---------------------------------------------------------------- threads
+//
+// Worker threads for engine/jobs. `core` pins the thread to one CPU core
+// where the platform allows it (the Vita's cores 0-2), -1 for any.
+
+typedef void (*thread_fn)(void* arg);
+bool thread_start(thread_fn fn, void* arg, int core, const char* name);
+// Cores the game may use, the calling (main) thread's included.
+int  cpu_count();
 
 // ---------------------------------------------------------------- audio
 

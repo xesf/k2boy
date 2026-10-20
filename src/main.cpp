@@ -17,6 +17,7 @@
 #include "engine/collision.h"
 #include "engine/trap.h"
 #include "engine/script.h"
+#include "engine/jobs.h"
 #include "engine/mixer.h"
 #include "engine/fight.h"
 #include "assets/sfx.h"
@@ -1234,11 +1235,23 @@ float clip_speed(const assets::skl_file& s) {
 int32_t play_sound(const std::string& raw, const float* pos, float radius, bool loop);
 
 // A clip's sound keys (SKey) between two play-head times fire at the actor.
-void fire_sound_keys(const assets::skl_file& s, double from_ms, double to_ms, const float* at) {
+// A sound key reached while posing on a worker thread, played afterwards on
+// the main thread (the mixer is not thread-safe).
+struct deferred_sound { const std::string* name; float at[3]; };
+
+void fire_sound_keys(const assets::skl_file& s, double from_ms, double to_ms, const float* at,
+                     std::vector<deferred_sound>* defer = 0) {
     for (size_t i = 0; i < s.sound_keys.size(); ++i) {
         const double t = s.sound_keys[i].time;
-        if (t > from_ms && t <= to_ms) play_sound(s.sound_keys[i].sound, at, 14.0f, false);
-        else if (from_ms == 0.0 && t == 0.0 && to_ms > 0.0) play_sound(s.sound_keys[i].sound, at, 14.0f, false);
+        if (!((t > from_ms && t <= to_ms) || (from_ms == 0.0 && t == 0.0 && to_ms > 0.0))) continue;
+        if (defer) {
+            deferred_sound d;
+            d.name = &s.sound_keys[i].sound;
+            for (int k = 0; k < 3; ++k) d.at[k] = at[k];
+            defer->push_back(d);
+        } else {
+            play_sound(s.sound_keys[i].sound, at, 14.0f, false);
+        }
     }
 }
 
@@ -1254,7 +1267,7 @@ void set_clip(actor_inst& a, int clip) {
 // sampler and re-poses the skeleton. Joints the clip does not drive keep their
 // own transform, as 0x63BA81 does. The root's translation is the clip's root
 // motion; the caller moves the actor node instead, so it is held at bind here.
-void animate_actor(actor_inst& a, float dt) {
+void animate_actor(actor_inst& a, float dt, std::vector<deferred_sound>* defer = 0) {
     if (!a.skinned || a.posed_hold) return;
     if (a.clip < 0 && !a.stance) return;
     const assets::skl_file& s = a.stance ? *a.stance : a.loco[size_t(a.clip)];
@@ -1264,10 +1277,10 @@ void animate_actor(actor_inst& a, float dt) {
     if (!s.sound_keys.empty() && a.node) {
         const float* at = a.node->local.translate;
         if (len && !a.clip_once && a.clip_ms >= double(len)) {
-            fire_sound_keys(s, before, double(len), at);       // the end of this cycle
-            fire_sound_keys(s, -1.0, a.clip_ms - double(len), at);
+            fire_sound_keys(s, before, double(len), at, defer);       // the end of this cycle
+            fire_sound_keys(s, -1.0, a.clip_ms - double(len), at, defer);
         } else {
-            fire_sound_keys(s, before, a.clip_ms, at);
+            fire_sound_keys(s, before, a.clip_ms, at, defer);
         }
     }
     if (len) a.clip_ms = a.clip_once ? std::min(a.clip_ms, double(len))
@@ -4813,7 +4826,6 @@ void relaunch(int argc, char** argv, const std::vector<std::string>& extra) {
     static const char* drop1[] = { "--menu", "--menu-game", "--armed", "--boot", 0 };
     static const char* drop2[] = { "--place", "--region", "--health", "--send", "--movie", 0 };
     std::vector<std::string> args;
-    args.push_back(argv[0]);
     std::string root;
     for (int i = 1; i < argc; ++i) {
         bool skip = false;
@@ -4825,14 +4837,11 @@ void relaunch(int argc, char** argv, const std::vector<std::string>& extra) {
     }
     args.insert(args.end(), extra.begin(), extra.end());
     if (!root.empty()) args.push_back(root);
-    std::vector<char*> cargs;
-    for (size_t i = 0; i < args.size(); ++i) cargs.push_back(const_cast<char*>(args[i].c_str()));
-    cargs.push_back(0);
     std::fflush(stdout);
     plat::audio_close();
     gfx::shutdown();
     plat::shutdown();
-    ::execv(argv[0], &cargs[0]);
+    plat::relaunch(argv[0], args);
     std::perror("relaunch");
     std::exit(1);
 }
@@ -4873,6 +4882,7 @@ bool play_movie(const std::string& name) {
             if (e.type == plat::EVENT_KEY_DOWN &&
                 (e.k == plat::KEY_ESCAPE || e.k == plat::KEY_SPACE || e.k == plat::KEY_RETURN)) skip = true;
             if (e.type == plat::EVENT_MOUSE_DOWN) skip = true;
+            if (e.type == plat::EVENT_PAD_BUTTON && e.pad_pressed) skip = true;
         }
         const double t = plat::time_seconds() - start;
         if (t >= mv.duration()) break;
@@ -5388,6 +5398,20 @@ private:
 };
 
 int main(int argc, char** argv) {
+    // Started without arguments on a console: the platform's defaults.
+    std::vector<std::string> default_args;
+    std::vector<char*> default_argv;
+    if (argc <= 1) {
+        plat::default_args(default_args);
+        if (!default_args.empty()) {
+            default_argv.push_back(argv[0]);
+            for (size_t i = 0; i < default_args.size(); ++i)
+                default_argv.push_back(const_cast<char*>(default_args[i].c_str()));
+            default_argv.push_back(0);
+            argc = int(default_argv.size()) - 1;
+            argv = &default_argv[0];
+        }
+    }
     const char* data_root = DEFAULT_DATA_ROOT;
     const char* dump_path = 0;
     const char* room_path = 0;
@@ -5750,6 +5774,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "k2boy: platform init failed\n");
         return 1;
     }
+    k2::jobs::init(2);
 
     if (!gfx::init(plat::gl_get_proc_address)) {
         std::fprintf(stderr, "k2boy: gfx init failed\n");
@@ -6158,6 +6183,7 @@ int main(int argc, char** argv) {
 
     bool running = true;
     bool open_menu = false;
+    bool motion_camera = false;
     while (running) {
         plat::event e;
         while (plat::poll_event(e)) {
@@ -6192,10 +6218,25 @@ int main(int argc, char** argv) {
                     if (e.k < plat::KEY_COUNT) down[e.k] = false;
                     break;
                 case plat::EVENT_MOUSE_DOWN:
-                    if (e.button == plat::MOUSE_LEFT) looking = true;
+                    // Left drag on a desktop; right is the Vita's rear touchpad.
+                    if (e.button == plat::MOUSE_LEFT || e.button == plat::MOUSE_RIGHT) looking = true;
                     break;
                 case plat::EVENT_MOUSE_UP:
-                    if (e.button == plat::MOUSE_LEFT) looking = false;
+                    if (e.button == plat::MOUSE_LEFT || e.button == plat::MOUSE_RIGHT) looking = false;
+                    break;
+                case plat::EVENT_PAD_BUTTON:
+                    if (!e.pad_pressed) break;
+                    // Start is Esc: the game menu.
+                    if (e.pad_btn == plat::PAD_START) {
+                        if (!use_menu || !fe_ok || shot_path) running = false;
+                        else open_menu = true;
+                    }
+                    // Select turns aiming the camera by tilting the pad on or off.
+                    if (e.pad_btn == plat::PAD_SELECT) {
+                        motion_camera = !motion_camera;
+                        std::printf("motion camera %s\n", motion_camera ? "on" : "off");
+                        std::fflush(stdout);
+                    }
                     break;
                 case plat::EVENT_MOUSE_MOVE:
                     if (looking && !input_locked) {
@@ -6460,6 +6501,13 @@ int main(int argc, char** argv) {
             const float rx = pad.axis[plat::PAD_AXIS_RX], ry = pad.axis[plat::PAD_AXIS_RY];
             if (std::fabs(rx) > 0.15f) cam.yaw   += rx * 2.6f * dt;
             if (std::fabs(ry) > 0.15f) cam.pitch += ry * 1.6f * dt;
+            // Motion camera (Select): turning and tilting the pad turns the
+            // camera, as its gyroscope reads it. Small rates are noise.
+            if (motion_camera && pad.has_motion && !input_locked) {
+                const float gy = pad.motion[1], gx = pad.motion[0];
+                if (std::fabs(gy) > 0.05f) cam.yaw   -= gy * dt;
+                if (std::fabs(gx) > 0.05f) cam.pitch += gx * dt;
+            }
             if (cam.pitch >  1.2f) cam.pitch =  1.2f;
             if (cam.pitch < -1.2f) cam.pitch = -1.2f;
         }
@@ -6880,9 +6928,29 @@ int main(int argc, char** argv) {
         // Every actor plays its clip; enemies and an undriven Prince stand in
         // BasePose_L. --pose and --noanim hold the pose instead, so the bind
         // pose and a single posed joint can still be checked.
-        if (!pose_arg && !noanim)
-            for (size_t i = 0; i < sc.actors.size(); ++i)
-                if (!sc.actors[i].scripted) animate_actor(sc.actors[i], dt);
+        // Each actor touches only its own skeleton, so they are posed in
+        // parallel across the cores; sound keys they cross play afterwards.
+        if (!pose_arg && !noanim) {
+            struct pose_job {
+                scene* sc;
+                float dt;
+                std::vector<std::vector<deferred_sound> > sounds;
+                static void run(size_t i, void* u) {
+                    pose_job& j = *static_cast<pose_job*>(u);
+                    actor_inst& a = j.sc->actors[i];
+                    if (!a.scripted) animate_actor(a, j.dt, &j.sounds[i]);
+                }
+            };
+            static pose_job job;
+            job.sc = &sc;
+            job.dt = dt;
+            job.sounds.resize(sc.actors.size());
+            for (size_t i = 0; i < job.sounds.size(); ++i) job.sounds[i].clear();
+            k2::jobs::parallel_for(sc.actors.size(), &pose_job::run, &job);
+            for (size_t i = 0; i < job.sounds.size(); ++i)
+                for (size_t k = 0; k < job.sounds[i].size(); ++k)
+                    play_sound(*job.sounds[i][k].name, job.sounds[i][k].at, 14.0f, false);
+        }
 
         if (g_mixer) g_mixer->set_listener(cam.pos, right);
 
