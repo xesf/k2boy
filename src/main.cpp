@@ -1312,6 +1312,7 @@ public:
 
     // Where the trap sits now, relative to rest.
     const float* offset() const { return m_base; }
+    int32_t coll_node() const { return m_node; }
     // Puts it somewhere directly, as a crate carried by the Prince is.
     void place(const float* off) {
         for (int k = 0; k < 3; ++k) m_base[k] = off[k];
@@ -3505,6 +3506,16 @@ int main(int argc, char** argv) {
             lt.set_yaw(player_yaw);
             sc.root->update_world();
 
+            // Holding a crate, the camera swings round behind the Prince so
+            // the crate is in view ahead of him, not between him and the lens.
+            if (crates.state != crate_ctl::NONE) {
+                const float want = 3.14159265f - player_yaw;   // camera faces his way
+                float dy = std::fmod(want - cam.yaw + 3.14159265f, 6.2831853f);
+                if (dy < 0) dy += 6.2831853f;
+                dy -= 3.14159265f;
+                cam.yaw += dy * std::min(1.0f, dt * 4.0f);
+            }
+
             // Chase camera: behind and above, looking slightly down at him.
             const k2::engine::transform& w = player->node->world();
             cam.pos[0] = w.translate[0] - std::sin(cam.yaw) * follow_dist;
@@ -3512,19 +3523,40 @@ int main(int argc, char** argv) {
             cam.pos[2] = w.translate[2] + std::cos(cam.yaw) * follow_dist;
             // Keep the camera on the Prince's side of any wall: cast the arm
             // from his head and stop short of the first surface it meets. A
-            // stand-in until CameraLogic / camera.dat are reversed.
+            // stand-in until CameraLogic / camera.dat are reversed. Under a low
+            // ceiling a lower arm often clears where the default one does not,
+            // so a few heights are tried and the longest clear arm wins. The
+            // crate being held is not an obstacle for the camera.
             if (!noclip) {
+                const int32_t held = (crates.state != crate_ctl::NONE && crates.crate)
+                                     ? crates.crate->coll_node() : -1;
+                if (held >= 0) sc.coll.set_node_enabled(held, false);
                 const float head[3] = { w.translate[0], w.translate[1] + 1.5f, w.translate[2] };
-                const float arm[3]  = { cam.pos[0] - head[0], cam.pos[1] - head[1], cam.pos[2] - head[2] };
-                const float len = std::sqrt(arm[0]*arm[0] + arm[1]*arm[1] + arm[2]*arm[2]);
-                k2::engine::pick_hit h;
-                if (len > 1e-4f && sc.coll.pick(head, arm, 1.0f, false, h)) {
-                    // Back off 0.25 units from the hit, but never closer than
-                    // half a unit to the head.
-                    float t = h.distance - 0.25f / len;
-                    if (t < 0.5f / len) t = 0.5f / len;
-                    for (int k = 0; k < 3; ++k) cam.pos[k] = head[k] + arm[k] * t;
+                const float heights[3] = { follow_height, 1.5f, 0.9f };
+                float best_pos[3] = { cam.pos[0], cam.pos[1], cam.pos[2] };
+                float best_len = -1.0f;
+                for (int hi = 0; hi < 3; ++hi) {
+                    const float target[3] = { cam.pos[0], w.translate[1] + heights[hi], cam.pos[2] };
+                    const float arm[3] = { target[0] - head[0], target[1] - head[1], target[2] - head[2] };
+                    const float len = std::sqrt(arm[0]*arm[0] + arm[1]*arm[1] + arm[2]*arm[2]);
+                    if (len < 1e-4f) continue;
+                    float t = 1.0f;
+                    k2::engine::pick_hit h;
+                    if (sc.coll.pick(head, arm, 1.0f, false, h)) {
+                        // Back off 0.25 units from the hit, but never closer
+                        // than half a unit to the head.
+                        t = h.distance - 0.25f / len;
+                        if (t < 0.5f / len) t = 0.5f / len;
+                    }
+                    // Prefer the higher arm unless a lower one is clearly longer.
+                    if (t * len > best_len * 1.25f) {
+                        best_len = t * len;
+                        for (int k = 0; k < 3; ++k) best_pos[k] = head[k] + arm[k] * t;
+                    }
+                    if (t >= 1.0f) break;
                 }
+                for (int k = 0; k < 3; ++k) cam.pos[k] = best_pos[k];
+                if (held >= 0 && crates.crate->collideable()) sc.coll.set_node_enabled(held, true);
             }
             // A scripted camera replaces the chase camera. The chase camera's
             // own yaw and pitch are left alone, so "camera,DD" returns to it.
