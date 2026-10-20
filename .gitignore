@@ -4,3 +4,4 @@ build/
 
 # Derived from the retail install by tools/webindex.py; regenerate with "make webindex".
 web/data-index.txt
+build-release/

@@ -1,5 +1,17 @@
 # k2boy — convenience wrapper around CMake.
 #
+#   make play       build optimised and play the game: boots like the original
+#                   (startup module -> prisonfix), with every feature on —
+#                   animation, collision, trap scripts, crates, doors, plates.
+#                   Options: REGION=n  start region (default 0)
+#                            TRACE=1   print every trap message
+#                            ARGS=...  extra flags passed straight through
+#   make play-debug same, from the Debug build
+#
+#   Playing: WASD move (relative to the camera), Shift run, drag LMB to look,
+#   Space act / grab a crate (hold), then W push, S pull; F free-fly camera,
+#   T show trigger volumes, Esc quit.
+#
 #   make            build (Debug)
 #   make run        build and launch the default room
 #   make verify     headless: mount the VFS and probe awkward paths
@@ -43,23 +55,60 @@ BUILD     ?= build
 TYPE      ?= Debug
 DATA      ?= data
 BIN        = $(BUILD)/k2boy
+RBUILD     = $(BUILD)-release
+RBIN       = $(RBUILD)/k2boy
 JOBS      ?= $(shell sysctl -n hw.ncpu 2>/dev/null || echo 4)
+
+REGION    ?= 0
+TRACE     ?= 0
+ARGS      ?=
+PLAY_FLAGS = --boot --region $(REGION) $(if $(filter 1,$(TRACE)),--trapmsg) $(ARGS)
+
+# Configures a build directory, or reconfigures it when its cache points at a
+# CMake that no longer exists (a CMake upgrade otherwise breaks every target
+# with "cmake: No such file or directory").
+#   $(call configure,<dir>,<build type>)
+define configure
+	@c="$(1)/CMakeCache.txt"; \
+	if [ -f "$$c" ]; then \
+	    cm=$$(sed -n 's/^CMAKE_COMMAND:INTERNAL=//p' "$$c"); \
+	    if [ ! -x "$$cm" ]; then \
+	        echo "k2boy: $(1) was configured with a CMake that is gone ($$cm); reconfiguring"; \
+	        rm -rf "$$c" "$(1)/CMakeFiles"; \
+	    fi; \
+	fi; \
+	[ -f "$$c" ] || cmake -B "$(1)" -DCMAKE_BUILD_TYPE=$(2) >/dev/null
+endef
+
+# The retail install is not in the repository; say so instead of failing later.
+define need_data
+	@test -d "$(DATA)" || { echo "k2boy: no game data at '$(DATA)'. Copy the retail install there, or pass DATA=<path>."; exit 1; }
+endef
 
 DEFAULT_ROOM ?= geometry\\rooms\\prisonfix\\prison1.k2a
 
-.PHONY: all build run verify images dump room level levels actor prince actors skills spawns shot bind actnodes materials winding skeletons config modules boot skl check release coverage web webindex clean rebuild help
+.PHONY: all play play-debug configure build run verify images dump room level levels actor prince actors skills spawns shot bind actnodes materials winding skeletons config modules boot skl check release coverage web webindex clean rebuild help
 
 all: build
 
-$(BUILD)/CMakeCache.txt:
-	@cmake -B $(BUILD) -DCMAKE_BUILD_TYPE=$(TYPE)
+configure:
+	$(call configure,$(BUILD),$(TYPE))
 
-build: $(BUILD)/CMakeCache.txt
+build: configure
 	@cmake --build $(BUILD) -j $(JOBS)
 
 release:
-	@cmake -B $(BUILD)-release -DCMAKE_BUILD_TYPE=Release
-	@cmake --build $(BUILD)-release -j $(JOBS)
+	$(call configure,$(RBUILD),Release)
+	@cmake --build $(RBUILD) -j $(JOBS)
+
+# The game, as far as it goes: the boot sequence with everything enabled.
+play: release
+	$(need_data)
+	@./$(RBIN) $(PLAY_FLAGS) $(DATA)
+
+play-debug: build
+	$(need_data)
+	@./$(BIN) $(PLAY_FLAGS) $(DATA)
 
 run: build
 	@./$(BIN) --room "$(DEFAULT_ROOM)" $(DATA)
@@ -92,34 +141,34 @@ prince: build
 actors: build
 	@./$(BIN) --actors $(DATA) | tail -4
 
-shot: $(BIN)
+shot: build
 	@$(BIN) --room "$(DEFAULT_ROOM)" --shot "$(S)" $(DATA)
 
-boot: $(BIN)
+boot: build
 	@$(BIN) --boot $(DATA)
 
-modules: $(BIN)
+modules: build
 	@$(BIN) --modules $(DATA)
 
-skeletons: $(BIN)
+skeletons: build
 	@$(BIN) --skeletons $(DATA)
 
-winding: $(BIN)
+winding: build
 	@$(BIN) --winding $(DATA)
 
-materials: $(BIN)
+materials: build
 	@$(BIN) --materials $(DATA)
 
-config: $(BIN)
+config: build
 	@$(BIN) --config $(DATA)
 
-actnodes: $(BIN)
+actnodes: build
 	@$(BIN) --actnodes "$(A)" $(DATA)
 
-bind: $(BIN)
+bind: build
 	@$(BIN) --bind "$(A)" $(DATA)
 
-spawns: $(BIN)
+spawns: build
 	@$(BIN) --spawns
 
 skills: build
@@ -182,7 +231,7 @@ web: webindex
 	@python3 -m http.server $(WEB_PORT) --bind 127.0.0.1
 
 clean:
-	@rm -rf $(BUILD) $(BUILD)-release
+	@rm -rf $(BUILD) $(RBUILD)
 
 rebuild: clean build
 
