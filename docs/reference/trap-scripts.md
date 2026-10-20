@@ -179,8 +179,7 @@ and held. A skill sent by a script returns to the idles if there are any;
 otherwise its last frame is held. The prisoners' meshes are built around the
 pelvis (y −1.02 … 1.12), so the body is lifted by that much off the floor
 found under the trap. Not traced in the binary: the idle selection and
-timing, and what `<collide>` and the fourth field do. Rats' idles are SklK and
-not played yet.
+timing, and what `<collide>` and the fourth field do.
 
 ## `move` (Force, Mover; TranslateMotion)
 

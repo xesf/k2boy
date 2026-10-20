@@ -1140,8 +1140,21 @@ uint32_t clip_length_ms(const assets::skl_file& s) {
     for (size_t j = 0; j < s.joints.size(); ++j) {
         const assets::skl_joint_path& p = s.joints[j].path;
         if (s.joints[j].present && p.frames * p.interval_ms > len) len = p.frames * p.interval_ms;
+        // SklK: keyframed joints end at their last key.
+        if (!s.joints[j].keys.empty() && s.joints[j].keys.back().time > len) len = s.joints[j].keys.back().time;
     }
     return len;
+}
+
+// One joint of a skill at `t`: SklS sampled paths or SklK keyframes. False
+// when the skill does not drive it.
+bool skill_joint(const assets::skl_file& s, size_t j, uint32_t t, float* pos, float* q) {
+    if (j >= s.joints.size()) return false;
+    const assets::skl_joint& jt = s.joints[j];
+    if (!jt.keys.empty()) return assets::skl_sample_keys(jt.keys, t, pos, q);
+    if (!jt.present) return false;
+    assets::skl_sample(jt.path, t, s.interpolate != 0, pos, q);
+    return true;
 }
 
 // Root motion: how far joint 0 travels in one cycle, in its parent's space.
@@ -1675,9 +1688,8 @@ bool update_scripted(actor_inst& a, double now) {
 
     const size_t n = std::min(a.joint_local_cur.size(), s.joints.size());
     for (size_t j = 0; j < n; ++j) {
-        if (!s.joints[j].present) { a.joint_local_cur[j] = a.joint_local_bind[j]; continue; }
         float pos[3], q[4];
-        assets::skl_sample(s.joints[j].path, t, s.interpolate != 0, pos, q);
+        if (!skill_joint(s, j, t, pos, q)) { a.joint_local_cur[j] = a.joint_local_bind[j]; continue; }
         if (j == 0)
             for (int k = 0; k < 3; ++k) pos[k] = a.joint_local_bind[0].translate[k];
         transform_from_pos_quat(pos, q, a.joint_local_cur[j]);
@@ -1686,10 +1698,8 @@ bool update_scripted(actor_inst& a, double now) {
 
     float p0[3], pt[3], q[4];
     p0[0] = p0[1] = p0[2] = pt[0] = pt[1] = pt[2] = 0.0f;
-    if (!s.joints.empty() && s.joints[0].present) {
-        assets::skl_sample(s.joints[0].path, 0, s.interpolate != 0, p0, q);
-        assets::skl_sample(s.joints[0].path, t, s.interpolate != 0, pt, q);
-    }
+    if (!skill_joint(s, 0, 0, p0, q) || !skill_joint(s, 0, t, pt, q))
+        p0[0] = p0[1] = p0[2] = pt[0] = pt[1] = pt[2] = 0.0f;
     const float dx = pt[0] - p0[0], dy = pt[1] - p0[1], dz = pt[2] - p0[2];
     const float c = std::cos(a.scripted_yaw), sn = std::sin(a.scripted_yaw);
     k2::engine::transform& lt = a.node->local;
@@ -1722,7 +1732,8 @@ const assets::skl_file* find_actor_skill(scene& sc, const actor_inst& a, const s
     assets::skl_file* sk = 0;
     if (d) {
         sk = new assets::skl_file();
-        if (!assets::skl_parse(d, size, *sk) || sk->chunk_tag != "SklS") { delete sk; sk = 0; }
+        if (!assets::skl_parse(d, size, *sk) ||
+            (sk->chunk_tag != "SklS" && sk->chunk_tag != "SklK")) { delete sk; sk = 0; }
         plat::fs_free(d);
     }
     sc.trap_skills[path] = sk;
