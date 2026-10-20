@@ -107,7 +107,7 @@ struct {
     GLint tint;
 } g_u;
 
-float g_view[16], g_proj[16], g_model[16];
+float g_view[16], g_proj[16], g_model[16], g_vp[16];
 float g_fog_start = 0.0f, g_fog_end = 1000.0f;
 float g_fog_col[3] = {0.0f, 0.0f, 0.0f};
 float g_tint[4] = {1.0f, 1.0f, 1.0f, 1.0f};
@@ -209,6 +209,7 @@ bool init(gl_proc_loader load) {
 
     mat4_identity(g_view);
     mat4_identity(g_proj);
+    mat4_identity(g_vp);
     mat4_identity(g_model);
 
     glEnable(GL_DEPTH_TEST);
@@ -389,6 +390,7 @@ void destroy_mesh(mesh_id id) {
 void set_view_projection(const float* view16, const float* proj16) {
     std::memcpy(g_view, view16, 16 * sizeof(float));
     std::memcpy(g_proj, proj16, 16 * sizeof(float));
+    mat4_mul(g_vp, g_proj, g_view);
 }
 
 void set_model(const float* model16) {
@@ -461,9 +463,8 @@ void draw_range(mesh_id id, int32_t index_offset, int32_t index_count) {
     std::unordered_map<mesh_id, mesh_rec>::iterator it = g_meshes.find(id);
     if (it == g_meshes.end() || index_count <= 0) return;
 
-    float vp[16], mvp[16];
-    mat4_mul(vp, g_proj, g_view);
-    mat4_mul(mvp, vp, g_model);
+    float mvp[16];
+    mat4_mul(mvp, g_vp, g_model);
 
     glUniformMatrix4fv(g_u.mvp, 1, GL_FALSE, mvp);
     glUniformMatrix4fv(g_u.model, 1, GL_FALSE, g_model);

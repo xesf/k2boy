@@ -239,6 +239,25 @@ void frontend::frame_end() {
     plat::swap_buffers();
 }
 
+// The original's loading screen (LoadingScreen__Begin / __Tick, 0x526EEA /
+// 0x5271AE): Loading.bmp, then Slider Back and Loading Slider at
+// g_LoadingSliderPos (230, 309), g_LoadingSliderSize 179 x 24. The original
+// fills the slider a tenth at a time on a 500 ms timer, round and round;
+// here it shows how far the load has actually got.
+void frontend::loading(float progress) {
+    if (progress < 0.0f) progress = 0.0f;
+    if (progress > 1.0f) progress = 1.0f;
+    poll();                         // keep the system responsive (and the window alive)
+    frame_begin(0);
+    m_canvas.draw(m_canvas.load("2D/Loading.bmp"), 0, 0, 640, 480);
+    const float X = 230, Y = 309, W = 179, H = 24;
+    const image& back = m_canvas.load("2D/Slider Back.bmp");
+    const image& fill = m_canvas.load("2D/Loading Slider.bmp");
+    if (back.ok()) m_canvas.draw_part(back, X, Y, W, H, 0.0f, W / float(back.w));
+    if (fill.ok()) m_canvas.draw_part(fill, X, Y, W * progress, H, 0.0f, W * progress / float(fill.w));
+    frame_end();
+}
+
 bool frontend::hover(const input& in, float x, float y, float w, float h) const {
     return in.mx >= x && in.mx < x + w && in.my >= y && in.my < y + h;
 }

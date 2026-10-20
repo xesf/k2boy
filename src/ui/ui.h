@@ -43,6 +43,9 @@ public:
 
     void begin();                           // 2D state; call once a frame before drawing
     void draw(const image& im, float x, float y, float w = -1, float h = -1, float alpha = 1.0f);
+    // The part of an image from texel column u0 to u1 (0..1 of its width),
+    // full height, into the rectangle.
+    void draw_part(const image& im, float x, float y, float w, float h, float u0, float u1);
     void fill(float x, float y, float w, float h, color c);
     // Text with its baseline at y, starting at x (align: 0 left, 1 centre, 2 right).
     void text(const std::string& s, float x, float y, float px, color c, int align = 0);
@@ -56,6 +59,7 @@ private:
     int m_w, m_h;
     float m_scale, m_ox, m_oy;
     gfx::mesh_id m_quad;
+    gfx::mesh_id m_part;        // draw_part's quad, its UVs rewritten per draw
     gfx::xf_font m_font;
     bool m_font_ok;
     std::map<std::string, image> m_images;

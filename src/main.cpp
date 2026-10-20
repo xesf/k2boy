@@ -634,6 +634,7 @@ struct draw_item {
     int             owner;          // index into scene::actors; -1 for static room geometry
     int             joint;          // index into actor_inst::joint_*; -1 if unbound
     float           center[3];      // world centroid, for back-to-front sorting
+    float           radius;         // bounding sphere about `center`, for frustum culling
     float           tint[3];        // filled by assign_trap_colors once the scene is loaded
     bool            hidden;         // a trap made invisible (argv[0] or "visible:F")
     float           offset[3];      // a trap moved by script ("move,...")
@@ -720,6 +721,9 @@ struct actor_inst {
     // The whole body tipped forward about the pelvis (radians, + face
     // down): swimming lays him flat; the swim clips are authored upright.
     float                             body_pitch;
+    // Each body part's model matrix for this frame (16 floats a part),
+    // computed with the poses on the worker cores; empty when not skinned.
+    std::vector<float>                part_mats;
 
     actor_inst() : node(0), is_enemy(false), first_item(0), item_count(0),
                    skinned(false), clip(-1), clip_ms(0.0), clip_once(false), scripted(0), scripted_start(0),
@@ -905,13 +909,23 @@ struct texture_cache_entry { gfx::texture_id tex; bool has_alpha; };
 std::map<std::string, texture_cache_entry> g_texture_cache;
 size_t g_texture_bytes = 0;
 
-gfx::texture_id load_image_texture(const std::string& path, bool chroma, bool& has_alpha,
-                                   int& decoded, int& failed) {
+// Images decoded ahead on the worker cores (prefetch_rooms), by the same
+// lower-case basename; load_image_texture takes them from here.
+std::map<std::string, assets::image> g_decoded_images;
+
+std::string image_key(const std::string& path) {
     std::string key = path;
     const size_t slash = key.find_last_of("/\\");
     if (slash != std::string::npos) key = key.substr(slash + 1);
     for (size_t i = 0; i < key.size(); ++i)
         if (key[i] >= 'A' && key[i] <= 'Z') key[i] = char(key[i] - 'A' + 'a');
+    return key;
+}
+
+gfx::texture_id load_image_texture(const std::string& path, bool chroma, bool& has_alpha,
+                                   int& decoded, int& failed) {
+    const std::string name_key = image_key(path);
+    std::string key = name_key;
     if (chroma) key += "#chroma";
     std::map<std::string, texture_cache_entry>::const_iterator hit = g_texture_cache.find(key);
     if (hit != g_texture_cache.end()) {
@@ -919,15 +933,19 @@ gfx::texture_id load_image_texture(const std::string& path, bool chroma, bool& h
         ++decoded;
         return hit->second.tex;
     }
-    size_t size = 0;
-    uint8_t* data = plat::fs_read_basename(path.c_str(), size);
-    if (!data) { ++failed; return gfx::INVALID_TEXTURE; }
-
     assets::image img;
-    std::string err;
-    const bool ok = assets::image_load(data, size, img, &err);
-    plat::fs_free(data);
-    if (!ok || !img.valid()) { ++failed; return gfx::INVALID_TEXTURE; }
+    std::map<std::string, assets::image>::iterator pre = g_decoded_images.find(name_key);
+    if (pre != g_decoded_images.end()) {
+        img = pre->second;          // a copy: the chroma key below changes it
+    } else {
+        size_t size = 0;
+        uint8_t* data = plat::fs_read_basename(path.c_str(), size);
+        if (!data) { ++failed; return gfx::INVALID_TEXTURE; }
+        std::string err;
+        const bool ok = assets::image_load(data, size, img, &err);
+        plat::fs_free(data);
+        if (!ok || !img.valid()) { ++failed; return gfx::INVALID_TEXTURE; }
+    }
 
     for (size_t i = 0; i + 3 < img.rgba.size(); i += 4) {
         if (chroma && img.rgba[i] == 0 && img.rgba[i + 1] == 0 && img.rgba[i + 2] == 0)
@@ -942,6 +960,7 @@ gfx::texture_id load_image_texture(const std::string& path, bool chroma, bool& h
         if (img.rgba[i] != 255) { e.has_alpha = true; break; }
     g_texture_cache[key] = e;
     g_texture_bytes += img.rgba.size();
+    if (pre != g_decoded_images.end()) g_decoded_images.erase(pre);   // uploaded: the CPU copy can go
     return e.tex;
 }
 
@@ -1262,6 +1281,28 @@ float clip_speed(const assets::skl_file& s) {
 int32_t play_sound(const std::string& raw, const float* pos, float radius, bool loop);
 
 // A clip's sound keys (SKey) between two play-head times fire at the actor.
+// The six planes of the view frustum from a GL projection * view matrix
+// (column-major), each normalised: a sphere is outside when it is wholly
+// behind any one of them.
+struct frustum {
+    float p[6][4];
+    void from(const float* m) {
+        for (int i = 0; i < 3; ++i)
+            for (int sgn = 0; sgn < 2; ++sgn) {
+                float* q = p[i * 2 + sgn];
+                const float k = sgn ? -1.0f : 1.0f;
+                for (int c = 0; c < 4; ++c) q[c] = m[c * 4 + 3] + k * m[c * 4 + i];
+                const float l = std::sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2]);
+                if (l > 0) for (int c = 0; c < 4; ++c) q[c] /= l;
+            }
+    }
+    bool sphere(const float* c, float r) const {
+        for (int i = 0; i < 6; ++i)
+            if (p[i][0] * c[0] + p[i][1] * c[1] + p[i][2] * c[2] + p[i][3] < -r) return false;
+        return true;
+    }
+};
+
 // A sound key reached while posing on a worker thread, played afterwards on
 // the main thread (the mixer is not thread-safe).
 struct deferred_sound { const std::string* name; float at[3]; };
@@ -1336,6 +1377,10 @@ void animate_actor(actor_inst& a, float dt, std::vector<deferred_sound>* defer =
     }
     pose_actor(a);
 }
+
+// Every body part's model matrix for this frame into a.part_mats:
+// actor_world * cur[j] * bind_inv[j], or the actor's own for an unbound part.
+void actor_part_matrices(const scene& sc, actor_inst& a, bool skin);
 
 // The .act's directory inside the VFS, e.g. "actors/prince/". Skills live in its
 // "skills" subdirectory. Found by matching the .act's basename against every
@@ -2238,17 +2283,96 @@ double actor_skill_seconds(const std::string& actor, const char* skill) {
     return ok ? double(sk.duration_ms) / 1000.0 : 0.0;
 }
 
-bool append_scene(const char* path, scene& sc, bool collide = true) {
+// The loading screen, when there is a front end: set by main, called through
+// loading_progress as a level loads. At most twenty updates a second; the
+// last one (1.0) always shows.
+void (*g_loading_fn)(float) = 0;
+
+void loading_progress(float p) {
+    if (!g_loading_fn) return;
+    static double last = -1.0;
+    const double now = plat::time_seconds();
+    static const bool every = std::getenv("K2_MENU_SHOT") != 0;     // headless checks see each step
+    if (!every && p < 1.0f && last >= 0.0 && now - last < 0.05) return;
+    last = now;
+    g_loading_fn(p);
+}
+
+// .K2A files parsed ahead on the worker cores (prefetch_rooms), by path.
+std::map<std::string, assets::k2a_file> g_parsed_k2a;
+
+bool read_k2a(const char* path, assets::k2a_file& f) {
     size_t size = 0;
     uint8_t* data = plat::fs_read_basename(path, size);
     if (!data) data = plat::fs_read(path, size);
     if (!data) return false;
-
-    assets::k2a_file f;
     std::string err;
     const bool ok = assets::k2a_parse(data, size, f, &err);
     plat::fs_free(data);
-    if (!ok) return false;
+    return ok;
+}
+
+// Loading a level is mostly parsing text and decoding images, each file and
+// each image on its own: they are spread over the cores first, and the
+// scene is then built from the results on the main thread (which owns the
+// GPU and the scene).
+void prefetch_rooms(const std::vector<std::string>& paths) {
+    struct job {
+        const std::vector<std::string>* paths;
+        std::vector<assets::k2a_file> files;
+        std::vector<char> ok;
+        std::vector<std::string> images;
+        std::vector<assets::image> decoded;
+        static void parse(size_t i, void* u) {
+            job& j = *static_cast<job*>(u);
+            j.ok[i] = read_k2a((*j.paths)[i].c_str(), j.files[i]) ? 1 : 0;
+        }
+        static void decode(size_t i, void* u) {
+            job& j = *static_cast<job*>(u);
+            size_t size = 0;
+            uint8_t* data = plat::fs_read_basename(j.images[i].c_str(), size);
+            if (!data) return;
+            std::string err;
+            if (!assets::image_load(data, size, j.decoded[i], &err)) j.decoded[i] = assets::image();
+            plat::fs_free(data);
+        }
+    };
+    const double t0 = plat::time_seconds();
+    job j;
+    j.paths = &paths;
+    j.files.resize(paths.size());
+    j.ok.assign(paths.size(), 0);
+    k2::jobs::parallel_for(paths.size(), &job::parse, &j);
+    std::map<std::string, size_t> seen;
+    for (size_t i = 0; i < paths.size(); ++i) {
+        if (!j.ok[i]) continue;
+        for (size_t m = 0; m < j.files[i].materials.size(); ++m) {
+            const std::string& b = j.files[i].materials[m].bitmap;
+            const std::string k = image_key(b);
+            if (b.empty() || k.size() < 4 || k.compare(k.size() - 4, 4, ".ifl") == 0) continue;
+            if (g_decoded_images.count(k) || g_texture_cache.count(k) || seen.count(k)) continue;
+            seen[k] = j.images.size();
+            j.images.push_back(b);
+        }
+        std::swap(g_parsed_k2a[paths[i]], j.files[i]);
+    }
+    j.decoded.resize(j.images.size());
+    k2::jobs::parallel_for(j.images.size(), &job::decode, &j);
+    for (size_t i = 0; i < j.images.size(); ++i)
+        if (j.decoded[i].valid()) std::swap(g_decoded_images[image_key(j.images[i])], j.decoded[i]);
+    std::printf("prefetch: %zu files, %zu images in %.2f s on %d workers\n", paths.size(),
+                j.images.size(), plat::time_seconds() - t0, k2::jobs::worker_count());
+}
+
+bool append_scene(const char* path, scene& sc, bool collide = true) {
+    assets::k2a_file f;
+    std::map<std::string, assets::k2a_file>::iterator pre = g_parsed_k2a.find(path);
+    if (pre != g_parsed_k2a.end()) {
+        std::swap(f, pre->second);
+        g_parsed_k2a.erase(pre);
+    } else if (!read_k2a(path, f)) {
+        return false;
+    }
 
     // Texture ids are per-file, so remember where this file's block starts.
     const size_t tex_base = sc.textures.size();
@@ -2366,6 +2490,9 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
         // k2a_vertex and gfx::vertex have identical layout by construction.
         draw_item it;
         for (int a = 0; a < 3; ++a) it.center[a] = (cmn[a] + cmx[a]) * 0.5f;
+        it.radius = 0.5f * std::sqrt((cmx[0] - cmn[0]) * (cmx[0] - cmn[0]) +
+                                     (cmx[1] - cmn[1]) * (cmx[1] - cmn[1]) +
+                                     (cmx[2] - cmn[2]) * (cmx[2] - cmn[2]));
         it.mesh = gfx::create_mesh(
             reinterpret_cast<const gfx::vertex*>(&vb[0]), int32_t(vb.size()),
             &ib[0], int32_t(ib.size()));
@@ -2660,6 +2787,7 @@ void spawn_fixtures(scene& sc);
 void spawn_level_actors(scene& sc, k2::engine::body_table& bodies,
                         std::vector<k2::engine::actor_spawn>& spawns) {
     for (size_t i = 0; i < sc.spawn_points.size(); ++i) {
+        loading_progress(0.7f + 0.2f * float(i) / float(sc.spawn_points.size()));
         const assets::k2a_trap& t = sc.spawn_points[i];
         const bool is_enemy = (t.name == "EnemyStart");
 
@@ -2722,6 +2850,7 @@ void spawn_level_actors(scene& sc, k2::engine::body_table& bodies,
                     lmn[0], lmx[0], lmn[1], lmx[1], lmn[2], lmx[2]);
     }
     spawn_fixtures(sc);
+    loading_progress(1.0f);
     std::printf("textures: %zu unique, %.1f MB\n", g_texture_cache.size(), g_texture_bytes / 1048576.0);
 }
 
@@ -2790,6 +2919,7 @@ int spawn_prop(scene& sc, const assets::k2a_trap& t, const std::string& who,
 
 void spawn_fixtures(scene& sc) {
     for (size_t i = 0; i < sc.fixture_points.size(); ++i) {
+        loading_progress(0.9f + 0.1f * float(i) / float(sc.fixture_points.size()));
         const assets::k2a_trap& t = sc.fixture_points[i];
         const std::string& who = t.argv[1];
         const int idx = spawn_prop(sc, t, who, t.node);
@@ -2994,6 +3124,20 @@ bool load_level(const char* path, scene& sc, assets::lvl_file& lv, int region) {
                 lv.room_count(), lv.items.size());
 
     int loaded = 0, missing = 0;
+    {
+        std::vector<std::string> files;
+        for (size_t r = 0; r < lv.regions.size(); ++r) {
+            if (region >= 0 && int(r) != region) continue;
+            for (size_t i = 0; i < lv.regions[r].rooms.size(); ++i)
+                files.push_back(assets::lvl_room_filename(lv.regions[r].rooms[i]));
+        }
+        loading_progress(0.05f);
+        prefetch_rooms(files);
+        loading_progress(0.3f);
+    }
+    int room_index = 0, room_total = 0;
+    for (size_t r = 0; r < lv.regions.size(); ++r)
+        if (region < 0 || int(r) == region) room_total += int(lv.regions[r].rooms.size());
     for (size_t r = 0; r < lv.regions.size(); ++r) {
         if (region >= 0 && int(r) != region) continue;
         const assets::lvl_region& reg = lv.regions[r];
@@ -3001,6 +3145,7 @@ bool load_level(const char* path, scene& sc, assets::lvl_file& lv, int region) {
             const std::string file = assets::lvl_room_filename(reg.rooms[i]);
             if (append_scene(file.c_str(), sc)) ++loaded;
             else { ++missing; std::printf("  missing room %s\n", file.c_str()); }
+            loading_progress(0.3f + 0.4f * float(++room_index) / float(room_total ? room_total : 1));
         }
     }
     std::printf("  region %s: rooms loaded %d, missing %d\n",
@@ -5504,6 +5649,26 @@ private:
     bool    m_loaded;
 };
 
+void actor_part_matrices(const scene& sc, actor_inst& a, bool skin) {
+    a.part_mats.resize(a.item_count * 16);
+    if (!a.node || a.item_count == 0) return;
+    const k2::engine::transform& aw = a.node->world();
+    float am[16];
+    aw.to_matrix(am);
+    for (size_t k = 0; k < a.item_count; ++k) {
+        const draw_item& di = sc.items[a.first_item + k];
+        float* m = &a.part_mats[k * 16];
+        if (a.skinned && skin && di.joint >= 0 && size_t(di.joint) < a.cur.size()) {
+            k2::engine::transform t0, t1;
+            k2::engine::transform_compose(a.cur[size_t(di.joint)], a.bind_inv[size_t(di.joint)], t0);
+            k2::engine::transform_compose(aw, t0, t1);
+            t1.to_matrix(m);
+        } else {
+            std::memcpy(m, am, sizeof(am));
+        }
+    }
+}
+
 int main(int argc, char** argv) {
     // Started without arguments on a console: the platform's defaults.
     std::vector<std::string> default_args;
@@ -5901,6 +6066,11 @@ int main(int argc, char** argv) {
     static std::string fe_place, fe_region;
     ui::frontend frontend;
     const bool fe_ok = use_menu && frontend.init([](const std::string& n) { return play_movie(n); });
+    static ui::frontend* loading_fe = 0;
+    if (fe_ok) {
+        loading_fe = &frontend;
+        g_loading_fn = [](float p) { loading_fe->loading(p); };
+    }
     if (use_menu && !menu_in_game_only) {
         k2::engine::mixer fe_mixer(44100);
         fe_mixer.set_volume(frontend.prefs().sound_volume);
@@ -7039,20 +7209,26 @@ int main(int argc, char** argv) {
         // pose and a single posed joint can still be checked.
         // Each actor touches only its own skeleton, so they are posed in
         // parallel across the cores; sound keys they cross play afterwards.
-        if (!pose_arg && !noanim) {
+        // Each part's model matrix is worked out there too, so the draw loop
+        // only submits.
+        {
             struct pose_job {
                 scene* sc;
                 float dt;
+                bool animate, skin;
                 std::vector<std::vector<deferred_sound> > sounds;
                 static void run(size_t i, void* u) {
                     pose_job& j = *static_cast<pose_job*>(u);
                     actor_inst& a = j.sc->actors[i];
-                    if (!a.scripted) animate_actor(a, j.dt, &j.sounds[i]);
+                    if (j.animate && !a.scripted) animate_actor(a, j.dt, &j.sounds[i]);
+                    actor_part_matrices(*j.sc, a, j.skin);
                 }
             };
             static pose_job job;
             job.sc = &sc;
             job.dt = dt;
+            job.animate = !pose_arg && !noanim;
+            job.skin = !noskin;
             job.sounds.resize(sc.actors.size());
             for (size_t i = 0; i < job.sounds.size(); ++i) job.sounds[i].clear();
             k2::jobs::parallel_for(sc.actors.size(), &pose_job::run, &job);
@@ -7095,6 +7271,23 @@ int main(int argc, char** argv) {
         }
         gfx::set_render_state(rs);
 
+        // What the camera can see: room parts and actors outside the view
+        // are not submitted at all.
+        frustum view_frustum;
+        {
+            float vp[16];
+            m4_mul(proj, view, vp);
+            view_frustum.from(vp);
+        }
+        struct visible {
+            static bool item(const frustum& f, const draw_item& di) {
+                if (di.has_model || di.radius <= 0.0f) return true;
+                const float c[3] = { di.center[0] + di.offset[0], di.center[1] + di.offset[1],
+                                     di.center[2] + di.offset[2] };
+                return f.sphere(c, di.radius);
+            }
+        };
+
         float model[16];
         mat4_identity(model);
         gfx::set_model(model);
@@ -7109,6 +7302,7 @@ int main(int argc, char** argv) {
             const size_t i = rev_draw ? sc.items.size() - 1 - n : n;
             if (sc.items[i].transparent || sc.items[i].is_trap || sc.items[i].cutout) continue;
             if (sc.items[i].owner >= 0 || sc.items[i].hidden) continue;
+            if (!visible::item(view_frustum, sc.items[i])) continue;
             set_item_model(sc.items[i]);
             gfx::set_texture(item_texture(sc, sc.items[i], game_time));
             gfx::draw(sc.items[i].mesh);
@@ -7121,6 +7315,7 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < sc.items.size(); ++i) {
             const draw_item& di = sc.items[i];
             if (!di.cutout || di.transparent || di.is_trap || di.owner >= 0 || di.hidden) continue;
+            if (!visible::item(view_frustum, di)) continue;
             set_item_model(di);
             gfx::set_texture(item_texture(sc, di, game_time));
             gfx::draw(di.mesh);
@@ -7144,25 +7339,15 @@ int main(int argc, char** argv) {
                 const actor_inst& ai = sc.actors[a];
                 if (ai.hidden) continue;
                 const k2::engine::transform& aw = ai.node->world();
-                float am[16];
-                aw.to_matrix(am);
+                // A body fits in a few units about its node.
+                const float ac[3] = { aw.translate[0], aw.translate[1] + 1.0f, aw.translate[2] };
+                if (!view_frustum.sphere(ac, 3.0f)) continue;
+                // actor_world * cur[j] * bind_inv[j], from the pose job.
                 for (size_t k = 0; k < ai.item_count; ++k) {
                     const draw_item& di = sc.items[ai.first_item + k];
                     if (di.is_trap) continue;
-                    if (ai.skinned && di.joint >= 0 && !noskin) {
-                        // actor_world * cur[j] * bind_inv[j]. Identity at the
-                        // bind pose, so this cannot change the image until a
-                        // joint is actually moved.
-                        k2::engine::transform t0, t1;
-                        k2::engine::transform_compose(ai.cur[size_t(di.joint)],
-                                                      ai.bind_inv[size_t(di.joint)], t0);
-                        k2::engine::transform_compose(aw, t0, t1);
-                        float jm[16];
-                        t1.to_matrix(jm);
-                        gfx::set_model(jm);
-                    } else {
-                        gfx::set_model(am);
-                    }
+                    if (ai.part_mats.size() < (k + 1) * 16) continue;
+                    gfx::set_model(&ai.part_mats[k * 16]);
                     gfx::set_texture(di.tex);
                     gfx::draw(di.mesh);
                 }
@@ -7227,6 +7412,7 @@ int main(int argc, char** argv) {
             for (size_t i = 0; i < sc.items.size(); ++i) {
                 const draw_item& di = sc.items[i];
                 if (!di.transparent || di.is_trap || di.owner >= 0 || di.hidden) continue;
+                if (!visible::item(view_frustum, di)) continue;
                 const float dx = di.center[0] - cam.pos[0];
                 const float dy = di.center[1] - cam.pos[1];
                 const float dz = di.center[2] - cam.pos[2];

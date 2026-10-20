@@ -15,7 +15,7 @@
 namespace k2 {
 namespace ui {
 
-canvas::canvas() : m_w(640), m_h(480), m_scale(1), m_ox(0), m_oy(0), m_quad(0), m_font_ok(false) {
+canvas::canvas() : m_w(640), m_h(480), m_scale(1), m_ox(0), m_oy(0), m_quad(0), m_part(0), m_font_ok(false) {
     std::memset(&m_font, 0, sizeof(m_font));
 }
 
@@ -39,6 +39,7 @@ bool canvas::init() {
     }
     const uint16_t ix[6] = { 0, 1, 2, 0, 2, 3 };
     m_quad = gfx::create_mesh(v, 4, ix, 6);
+    m_part = gfx::create_dynamic_mesh(4, 6);
     return m_font_ok;
 }
 
@@ -109,6 +110,25 @@ void canvas::draw(const image& im, float x, float y, float w, float h, float alp
     gfx::set_texture(im.tex);
     gfx::set_tint(1, 1, 1, alpha);
     quad(x, y, w < 0 ? float(im.w) : w, h < 0 ? float(im.h) : h);
+}
+
+void canvas::draw_part(const image& im, float x, float y, float w, float h, float u0, float u1) {
+    if (!im.ok() || w <= 0.0f) return;
+    gfx::vertex v[4];
+    std::memset(v, 0, sizeof(v));
+    const float xy[4][2] = { {0, 0}, {1, 0}, {1, 1}, {0, 1} };
+    for (int k = 0; k < 4; ++k) {
+        v[k].x = xy[k][0]; v[k].y = xy[k][1];
+        v[k].u = xy[k][0] ? u1 : u0; v[k].v = xy[k][1];
+        v[k].nz = 1.0f; v[k].r = v[k].g = v[k].b = v[k].a = 255;
+    }
+    const uint16_t ix[6] = { 0, 1, 2, 0, 2, 3 };
+    gfx::update_mesh(m_part, v, 4, ix, 6);
+    gfx::set_texture(im.tex);
+    gfx::set_tint(1, 1, 1, 1);
+    std::swap(m_quad, m_part);      // quad() draws m_quad
+    quad(x, y, w, h);
+    std::swap(m_quad, m_part);
 }
 
 void canvas::fill(float x, float y, float w, float h, color c) {

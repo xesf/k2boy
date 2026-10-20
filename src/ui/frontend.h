@@ -62,6 +62,8 @@ public:
     result main_menu(save_game& loaded);
     // Esc during play. `current` is what Save writes; on R_LOAD, `loaded`.
     result game_menu(const save_game& current, save_game& loaded);
+    // The Loading screen with its slider filled to `progress` (0..1).
+    void loading(float progress);
 
     settings& prefs() { return m_settings; }
     game_text& text() { return m_text; }

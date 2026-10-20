@@ -229,7 +229,13 @@ std::unordered_map<mesh_id, mesh_rec> g_meshes;
 mesh_id g_next_mesh = 1;
 mesh_id g_screen_quad = INVALID_MESH;
 
-float g_view[16], g_proj[16], g_model[16];
+float g_view[16], g_proj[16], g_model[16], g_vp[16];
+
+// What the context has bound, so a run of draws sharing a program or a
+// texture sets it once. Reset at each scene start.
+const SceGxmFragmentProgram* g_cur_fp = 0;
+const SceGxmTexture*         g_cur_tex = 0;
+bool                         g_cur_vp = false;
 float g_fog_start = 0.0f, g_fog_end = 1000.0f;
 float g_fog_col[3] = { 0, 0, 0 };
 float g_tint[4] = { 1, 1, 1, 1 };
@@ -490,8 +496,8 @@ int fragment_for(const render_state& s) {
 
 void submit(const mesh_rec& m, int32_t first, int32_t count, const float* mvp,
             int fp, const float* tint, texture_id tex, const render_state& s) {
-    sceGxmSetVertexProgram(g_ctx, g_vprog);
-    sceGxmSetFragmentProgram(g_ctx, g_fprog[fp]);
+    if (!g_cur_vp) { sceGxmSetVertexProgram(g_ctx, g_vprog); g_cur_vp = true; }
+    if (g_cur_fp != g_fprog[fp]) { sceGxmSetFragmentProgram(g_ctx, g_fprog[fp]); g_cur_fp = g_fprog[fp]; }
     void* vu = 0;
     sceGxmReserveVertexDefaultUniformBuffer(g_ctx, &vu);
     sceGxmSetUniformDataF(vu, g_u_mvp, 0, 16, mvp);
@@ -507,7 +513,8 @@ void submit(const mesh_rec& m, int32_t first, int32_t count, const float* mvp,
     if (g_u_fog) sceGxmSetUniformDataF(fu, g_u_fog, 0, 4, fog);
     if (g_u_fog_color) sceGxmSetUniformDataF(fu, g_u_fog_color, 0, 4, fogc);
     // A sampler must always have a texture: white when untextured.
-    sceGxmSetFragmentTexture(g_ctx, 0, &g_tex[textured ? tex : g_white].t);
+    const SceGxmTexture* t = &g_tex[textured ? tex : g_white].t;
+    if (t != g_cur_tex) { sceGxmSetFragmentTexture(g_ctx, 0, t); g_cur_tex = t; }
     sceGxmSetVertexStream(g_ctx, 0, m.vbuf);
     sceGxmDraw(g_ctx, SCE_GXM_PRIMITIVE_TRIANGLES, SCE_GXM_INDEX_FORMAT_U16,
                static_cast<const uint16_t*>(m.ibuf) + first, unsigned(count));
@@ -634,6 +641,7 @@ bool init(gl_proc_loader) {
 
     mat4_identity(g_view);
     mat4_identity(g_proj);
+    mat4_identity(g_vp);
     mat4_identity(g_model);
     std::printf("gxm: ready, %dx%d\n", W, H);
     return true;
@@ -658,6 +666,9 @@ void begin_frame() {
 
     sceGxmBeginScene(g_ctx, 0, g_rt, 0, 0, g_sync[g_back], &g_surface[g_back], &g_depth);
     g_in_scene = true;
+    g_cur_fp = 0;
+    g_cur_tex = 0;
+    g_cur_vp = false;
     // GL's NDC: y up, z -1..1.
     sceGxmSetViewport(g_ctx, W * 0.5f, W * 0.5f, H * 0.5f, -H * 0.5f, 0.5f, 0.5f);
     sceGxmSetRegionClip(g_ctx, SCE_GXM_REGION_CLIP_OUTSIDE, 0, 0, W - 1, H - 1);
@@ -820,6 +831,7 @@ void destroy_mesh(mesh_id id) {
 void set_view_projection(const float* view16, const float* proj16) {
     std::memcpy(g_view, view16, 16 * sizeof(float));
     std::memcpy(g_proj, proj16, 16 * sizeof(float));
+    mat4_mul(g_vp, g_proj, g_view);
 }
 
 void set_model(const float* model16) { std::memcpy(g_model, model16, 16 * sizeof(float)); }
@@ -851,9 +863,8 @@ void draw_range(mesh_id id, int32_t index_offset, int32_t index_count) {
     if (!g_in_scene || index_count <= 0) return;
     std::unordered_map<mesh_id, mesh_rec>::iterator it = g_meshes.find(id);
     if (it == g_meshes.end() || !it->second.vbuf) return;
-    float vp[16], mvp[16];
-    mat4_mul(vp, g_proj, g_view);
-    mat4_mul(mvp, vp, g_model);
+    float mvp[16];
+    mat4_mul(mvp, g_vp, g_model);
     submit(it->second, index_offset, index_count, mvp, fragment_for(g_state), g_tint, g_bound, g_state);
 }
 
