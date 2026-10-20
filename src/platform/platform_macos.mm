@@ -506,6 +506,8 @@ void sema_wait(sema s) {
     --r->count;
 }
 
+void sema_destroy(sema s) { delete static_cast<sema_rec*>(s); }
+
 void sema_signal(sema s, int count) {
     sema_rec* r = static_cast<sema_rec*>(s);
     {

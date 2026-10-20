@@ -274,7 +274,7 @@ void ensure_log() {
     err = std::fopen("ux0:data/k2boy/err.txt", "w");
     // Both this thread's streams and the global ones: code compiled to
     // either view of stdout/stderr ends up in the files.
-    if (out) { std::setvbuf(out, 0, _IONBF, 0); r->_stdout = out; _impure_ptr->_stdout = out; }
+    if (out) { std::setvbuf(out, 0, _IOLBF, 1024); r->_stdout = out; _impure_ptr->_stdout = out; }
     if (err) { std::setvbuf(err, 0, _IONBF, 0); r->_stderr = err; _impure_ptr->_stderr = err; }
     // Closed at exit: an emulator may hold writes until the close.
     std::atexit([] { if (out) std::fclose(out); if (err) std::fclose(err); });
@@ -423,6 +423,8 @@ sema sema_create(int initial) {
 void sema_wait(sema s) { sceKernelWaitSema(SceUID(intptr_t(s)), 1, 0); }
 
 void sema_signal(sema s, int count) { sceKernelSignalSema(SceUID(intptr_t(s)), count); }
+
+void sema_destroy(sema s) { if (s) sceKernelDeleteSema(SceUID(intptr_t(s))); }
 
 // ---------------------------------------------------------------- audio
 

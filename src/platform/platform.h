@@ -180,6 +180,7 @@ typedef void* sema;
 sema sema_create(int initial);
 void sema_wait(sema s);
 void sema_signal(sema s, int count);
+void sema_destroy(sema s);
 
 // ---------------------------------------------------------------- audio
 

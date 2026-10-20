@@ -25,6 +25,12 @@ bool mixer::has_sound(const std::string& name) const {
     return m_sounds.count(lower(name)) != 0;
 }
 
+int16_t* mixer::sound_samples(const std::string& name) {
+    std::lock_guard<std::mutex> g(m_lock);
+    std::map<std::string, assets::sfx_file>::iterator it = m_sounds.find(lower(name));
+    return it == m_sounds.end() || it->second.samples.empty() ? 0 : &it->second.samples[0];
+}
+
 int32_t mixer::play(const std::string& name, const float* pos, float radius, bool loop, float gain) {
     std::lock_guard<std::mutex> g(m_lock);
     std::map<std::string, assets::sfx_file>::const_iterator it = m_sounds.find(lower(name));

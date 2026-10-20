@@ -35,6 +35,7 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <atomic>
 #include <vector>
 #include <map>
 #include <array>
@@ -897,8 +898,27 @@ std::string resolve_ifl(const std::string& path) {
 
 // Loads one image. `chroma` keys pure black to transparent, as an
 // ALPHA_SOURCE Chroma map or a trap's ChromaKey/Transparent flag asks.
+// Rooms of one level share most of their textures (prison3_hall and
+// prison3_junction carry prison3's whole material list), and every copy of
+// an actor names the same ones: each image is decoded and uploaded once.
+struct texture_cache_entry { gfx::texture_id tex; bool has_alpha; };
+std::map<std::string, texture_cache_entry> g_texture_cache;
+size_t g_texture_bytes = 0;
+
 gfx::texture_id load_image_texture(const std::string& path, bool chroma, bool& has_alpha,
                                    int& decoded, int& failed) {
+    std::string key = path;
+    const size_t slash = key.find_last_of("/\\");
+    if (slash != std::string::npos) key = key.substr(slash + 1);
+    for (size_t i = 0; i < key.size(); ++i)
+        if (key[i] >= 'A' && key[i] <= 'Z') key[i] = char(key[i] - 'A' + 'a');
+    if (chroma) key += "#chroma";
+    std::map<std::string, texture_cache_entry>::const_iterator hit = g_texture_cache.find(key);
+    if (hit != g_texture_cache.end()) {
+        if (hit->second.has_alpha) has_alpha = true;
+        ++decoded;
+        return hit->second.tex;
+    }
     size_t size = 0;
     uint8_t* data = plat::fs_read_basename(path.c_str(), size);
     if (!data) { ++failed; return gfx::INVALID_TEXTURE; }
@@ -915,7 +935,14 @@ gfx::texture_id load_image_texture(const std::string& path, bool chroma, bool& h
         if (img.rgba[i + 3] != 255) has_alpha = true;
     }
     ++decoded;
-    return gfx::create_texture(img.width, img.height, &img.rgba[0]);
+    texture_cache_entry e;
+    e.tex = gfx::create_texture(img.width, img.height, &img.rgba[0]);
+    e.has_alpha = false;
+    for (size_t i = 3; i < img.rgba.size(); i += 4)
+        if (img.rgba[i] != 255) { e.has_alpha = true; break; }
+    g_texture_cache[key] = e;
+    g_texture_bytes += img.rgba.size();
+    return e.tex;
 }
 
 // An IFL ("Image File List") is one image name per line, optionally followed
@@ -2695,6 +2722,7 @@ void spawn_level_actors(scene& sc, k2::engine::body_table& bodies,
                     lmn[0], lmx[0], lmn[1], lmx[1], lmn[2], lmx[2]);
     }
     spawn_fixtures(sc);
+    std::printf("textures: %zu unique, %.1f MB\n", g_texture_cache.size(), g_texture_bytes / 1048576.0);
 }
 
 // Fixture traps: "<skill>,<visible>,<collide>,<?>" "<actor>" "<ambient,...>".
@@ -4851,6 +4879,50 @@ void relaunch(int argc, char** argv, const std::vector<std::string>& extra) {
 // Plays a movie (data/Movies/<name>.mov) full screen, its sound through the
 // mixer. Esc, Space, Enter or a click skips it. Returns false if the window
 // was closed.
+// A cutscene, spread over the cores: one thread decodes the sound into the
+// mixer's buffer ahead of playback, another decodes frames a few ahead into
+// a ring, and the main thread shows whichever is due. On the Vita a frame of
+// SVQ1 or a second of QDM2 is too slow to do in the frame loop.
+namespace {
+struct movie_play {
+    static const int RING = 4;
+    media::movie* mv;
+    // Frames: the decode thread fills slot head % RING; `space` counts the
+    // slots it may still fill (the one on screen is never one of them).
+    std::vector<uint8_t> frame[RING];
+    double               time[RING];
+    std::atomic<int>     head;
+    plat::sema           space;
+    plat::sema           done;
+    volatile bool        stop;
+    int                  bytes;
+    // Sound.
+    int16_t*             pcm;
+    size_t               pcm_cap;
+    movie_play() : mv(0), head(0), space(0), done(0), stop(false), bytes(0), pcm(0), pcm_cap(0) {}
+
+    static void video(void* u) {
+        movie_play& p = *static_cast<movie_play*>(u);
+        for (;;) {
+            plat::sema_wait(p.space);
+            double t = 0.0;
+            if (p.stop || !p.mv->next_frame(t) || !p.mv->rgba()) break;
+            const int slot = p.head.load() % RING;
+            std::memcpy(&p.frame[slot][0], p.mv->rgba(), size_t(p.bytes));
+            p.time[slot] = t;
+            p.head.fetch_add(1);
+        }
+        plat::sema_signal(p.done, 1);
+    }
+
+    static void audio(void* u) {
+        movie_play& p = *static_cast<movie_play*>(u);
+        p.mv->decode_audio_into(p.pcm, p.pcm_cap, &p.stop);
+        plat::sema_signal(p.done, 1);
+    }
+};
+} // namespace
+
 bool play_movie(const std::string& name) {
     media::movie mv;
     std::string path = "movies/" + name;
@@ -4858,22 +4930,40 @@ bool play_movie(const std::string& name) {
     for (size_t i = 0; i < path.size(); ++i) path[i] = char(std::tolower(static_cast<unsigned char>(path[i])));
     if (!mv.open(path)) { std::printf("movie: %s not found\n", path.c_str()); return true; }
     std::printf("movie: %s %dx%d, %.1f s, %zu audio samples\n", path.c_str(), mv.width(), mv.height(),
-                mv.duration(), mv.pcm().size());
+                mv.duration(), mv.audio_samples());
+
+    static movie_play p;
+    p.mv = &mv;
+    p.stop = false;
+    p.head.store(0);
+    p.bytes = mv.width() * mv.height() * 4;
+    for (int i = 0; i < movie_play::RING; ++i) p.frame[i].assign(size_t(p.bytes), 0);
+    // Fresh semaphores per movie: the last one's leave counts behind.
+    p.space = plat::sema_create(movie_play::RING - 1);
+    p.done = plat::sema_create(0);
+    int threads = 0;
+
+    // The sound: a silent buffer of the track's length, registered and
+    // playing at once, filled ahead of the play head by its own thread.
     int32_t voice = 0;
     if (!g_mixer) std::printf("movie: no mixer, silent\n");
-    if (g_mixer && !mv.pcm().empty()) {
+    if (g_mixer && mv.audio_samples()) {
         assets::sfx_file sf;
         sf.channels = mv.audio_channels();
         sf.rate = mv.audio_rate();
-        sf.samples = mv.pcm();
+        sf.samples.assign(mv.audio_samples(), 0);
         g_mixer->add_sound("__movie", sf);
+        p.pcm = g_mixer->sound_samples("__movie");
+        p.pcm_cap = sf.samples.size();
+        if (p.pcm && plat::thread_start(&movie_play::audio, &p, 2, "k2 movie audio")) ++threads;
         voice = g_mixer->play("__movie", 0, 0.0f, false, 1.0f);
-        std::printf("movie: sound voice %d (%zu voices), %d Hz %dch\n", voice, g_mixer->voices(),
-                    sf.rate, sf.channels);
-        std::fflush(stdout);
     }
+    if (plat::thread_start(&movie_play::video, &p, 1, "k2 movie video")) ++threads;
+    std::fflush(stdout);
+
     gfx::texture_id tex = gfx::INVALID_TEXTURE;
     const double start = plat::time_seconds();
+    int shown = -1;
     bool alive = true, skip = false;
     while (alive && !skip) {
         plat::event e;
@@ -4886,9 +4976,17 @@ bool play_movie(const std::string& name) {
         }
         const double t = plat::time_seconds() - start;
         if (t >= mv.duration()) break;
-        if (mv.seek_video(t) && mv.rgba()) {
+        // The newest decoded frame that is due; the one it replaces goes back
+        // to the decode thread.
+        bool changed = false;
+        while (shown + 1 < p.head.load() && p.time[(shown + 1) % movie_play::RING] <= t) {
+            if (shown >= 0) plat::sema_signal(p.space, 1);
+            ++shown;
+            changed = true;
+        }
+        if (changed) {
             if (tex == gfx::INVALID_TEXTURE) tex = gfx::create_stream_texture(mv.width(), mv.height());
-            gfx::update_texture(tex, mv.rgba());
+            gfx::update_texture(tex, &p.frame[shown % movie_play::RING][0]);
         }
         gfx::begin_frame();
         gfx::set_clear_color(0.0f, 0.0f, 0.0f);
@@ -4897,6 +4995,15 @@ bool play_movie(const std::string& name) {
         gfx::end_frame();
         plat::swap_buffers();
     }
+    // Stop both threads and wait for them before the movie goes away.
+    p.stop = true;
+    plat::sema_signal(p.space, movie_play::RING);
+    for (int i = 0; i < threads; ++i) plat::sema_wait(p.done);
+    std::printf("movie: %d of %d frames decoded shown, %.1f s\n", shown + 1, p.head.load(),
+                plat::time_seconds() - start);
+    plat::sema_destroy(p.space);
+    plat::sema_destroy(p.done);
+    p.space = p.done = 0;
     if (g_mixer && voice) g_mixer->stop(voice);
     if (tex != gfx::INVALID_TEXTURE) gfx::destroy_texture(tex);
     return alive;

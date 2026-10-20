@@ -34,6 +34,10 @@ public:
     // Registers a decoded sound under a lower-case name.
     void add_sound(const std::string& name, const assets::sfx_file& s);
     bool has_sound(const std::string& name) const;
+    // A registered sound's samples, for filling while it plays (a movie's
+    // track decoded on another thread into a buffer sized up front). Valid
+    // until the sound is replaced.
+    int16_t* sound_samples(const std::string& name);
 
     // Starts a voice; returns its id, 0 when the sound is unknown. `pos` null
     // for a non-positional sound. `loop` honours the file's loop points.
