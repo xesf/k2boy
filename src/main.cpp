@@ -661,8 +661,15 @@ struct actor_inst {
 // The original's locomotion set, in the order of its name table at 0x749C30:
 // { "BasePose_L", "Running_L", "Walk_L", "AmbientType_G" }. AmbientType_G is a
 // stem that gets a random 1..6 suffix (see 0x4BDDA4), so it is not loaded here.
-enum loco_clip { LOCO_BASE = 0, LOCO_RUN, LOCO_WALK, LOCO_COUNT };
-const char* const k_loco_names[LOCO_COUNT] = { "BasePose_L", "Running_L", "Walk_L" };
+//
+// The crate set follows: the skills StStartCrateMove (0x4D648C) chooses from,
+// in its own order of names (off_74AB28 .. off_74AB3C), plus the grab.
+enum loco_clip { LOCO_BASE = 0, LOCO_RUN, LOCO_WALK,
+                 CRATE_FINISH, CRATE_BASE, CRATE_PUSH, CRATE_PUSH_FAIL,
+                 CRATE_PULL, CRATE_PULL_FAIL, CRATE_ANTIC, LOCO_COUNT };
+const char* const k_loco_names[LOCO_COUNT] = { "BasePose_L", "Running_L", "Walk_L",
+    "PushOrPullFinish_M", "PushOrPullBase_M", "Push_M", "PushFail_M",
+    "Pull_M", "PullFail_M", "PushOrPullAntic_M" };
 
 
 struct scene {
@@ -1181,9 +1188,23 @@ void scene_reset(scene& sc) {
 class scene_trap : public k2::engine::trap_object {
 public:
     scene_trap(k2::engine::script_world& w, const std::string& name,
-               const k2::engine::trap_header& h, scene& sc, int item, int32_t coll_node)
-        : trap_object(w, name, h), m_sc(sc), m_item(item), m_node(coll_node), m_moving(false) {
+               const k2::engine::trap_header& h, scene& sc, int item, int32_t coll_node,
+               const std::string& type, const float* bbox)
+        : trap_object(w, name, h), type(type), m_sc(sc), m_item(item), m_node(coll_node),
+          m_moving(false) {
         m_base[0] = m_base[1] = m_base[2] = 0.0f;
+        for (int i = 0; i < 6; ++i) box[i] = bbox[i];
+    }
+
+    const std::string type;     // the K2_TRAP_NAME: "Crate", "Force", ...
+    float             box[6];   // K2_TRAP_BBOX at rest, engine space
+
+    // Where the trap sits now, relative to rest.
+    const float* offset() const { return m_base; }
+    // Puts it somewhere directly, as a crate carried by the Prince is.
+    void place(const float* off) {
+        for (int k = 0; k < 3; ++k) m_base[k] = off[k];
+        apply(off);
     }
 
     void set_visible(bool b) {
@@ -1387,7 +1408,7 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
                 t = a;
             } else {
                 t = new scene_trap(sc.script, n.name, hdr, sc,
-                                   int(sc.items.size()) - 1, node);
+                                   int(sc.items.size()) - 1, node, n.trap.name, n.trap.bbox);
             }
             sc.traps.push_back(t);
             sc.script.add(t);
@@ -2171,6 +2192,179 @@ void move_horizontal(const k2::engine::collision_world& w, float* p, float dx, f
     p[2] += dz;
 }
 
+// --- crates -------------------------------------------------------------------
+//
+// The Prince's crate states, StStartCrateGrab -> StIdleCrate -> StStartCrateMove
+// (0x4D648C). The rules come from the binary: a crate moves one step of
+// flt_7C1F5C = 1.5 units, and only when sub_4D1719 finds floor at the far end
+// at the Prince's own height. The clips carry the motion: Push_M's root moves
+// exactly +1.5, Pull_M's -1.5, the antic and finish 0.7 in and out. How a crate
+// is found and grabbed is ours; that part of the state machine is not traced.
+namespace crate_tuning {
+const float  STEP      = 1.5f;      // flt_7C1F5C
+const double FLOOR_TOL = 0.01;      // dbl_743AD0
+const float  REACH     = 1.2f;      // ours: furthest grabbable gap
+}
+
+// Port of sub_4D1719. `mv` is +1 to push, -1 to pull; `fwd` the facing.
+bool crate_move_ok(const k2::engine::collision_world& w, const float* pos,
+                   const float* fwd, int mv) {
+    const float S = crate_tuning::STEP;
+    const float dist = mv == 1 ? S * 0.5f + S : S * 0.5f - (S + S);
+    const float probe[3] = { pos[0] + fwd[0] * dist, pos[1], pos[2] + fwd[2] * dist };
+    const float o[3] = { probe[0], probe[1] + S, probe[2] };    // + up * flt_7C1F5C
+    const float d[3] = { 0.0f, -1.0f, 0.0f };
+    k2::engine::pick_hit h;
+    if (!w.pick(o, d, 1.0e6f, true, h)) return false;           // mask 6, front only
+    return std::fabs(double(h.point[1]) - double(probe[1])) <= crate_tuning::FLOOR_TOL;
+}
+
+// The nearest Crate trap ahead of the Prince, and the axis to face it along.
+scene_trap* crate_in_front(scene& sc, const float* pos, const float* fwd, float* axis) {
+    scene_trap* best = 0;
+    float best_gap = crate_tuning::REACH;
+    for (size_t i = 0; i < sc.traps.size(); ++i) {
+        scene_trap* t = dynamic_cast<scene_trap*>(sc.traps[i]);
+        if (!t || t->type != "Crate" || !t->collideable()) continue;
+        const float* o = t->offset();
+        const float mn[3] = { t->box[0] + o[0], t->box[1] + o[1], t->box[2] + o[2] };
+        const float mx[3] = { t->box[3] + o[0], t->box[4] + o[1], t->box[5] + o[2] };
+        if (std::fabs(mn[1] - pos[1]) > 0.3f) continue;          // not on our floor
+        const float cx = (mn[0] + mx[0]) * 0.5f, cz = (mn[2] + mx[2]) * 0.5f;
+        const float dx = cx - pos[0], dz = cz - pos[2];
+        const bool along_x = std::fabs(dx) > std::fabs(dz);
+        const float ax[3] = { along_x ? (dx > 0 ? 1.0f : -1.0f) : 0.0f, 0.0f,
+                              along_x ? 0.0f : (dz > 0 ? 1.0f : -1.0f) };
+        if (fwd[0] * ax[0] + fwd[2] * ax[2] < 0.7f) continue;     // not facing it
+        const float half = along_x ? (mx[0] - mn[0]) * 0.5f : (mx[2] - mn[2]) * 0.5f;
+        const float side = along_x ? std::fabs(dz) - (mx[2] - mn[2]) * 0.5f
+                                   : std::fabs(dx) - (mx[0] - mn[0]) * 0.5f;
+        if (side > 0.0f) continue;                                // beside it, not before
+        const float gap = std::fabs(along_x ? dx : dz) - half;
+        if (gap < 0.0f || gap > best_gap) continue;
+        best = t;
+        best_gap = gap;
+        for (int k = 0; k < 3; ++k) axis[k] = ax[k];
+    }
+    return best;
+}
+
+// Root motion of `clip` from its start to `t_ms`, rotated into the world by
+// `yaw` the way transform::set_yaw rotates the body.
+void root_delta(const assets::skl_file& s, uint32_t t_ms, float yaw, float* out) {
+    out[0] = out[1] = out[2] = 0.0f;
+    if (s.joints.empty() || !s.joints[0].present) return;
+    float p0[3], pt[3], q[4];
+    assets::skl_sample(s.joints[0].path, 0, s.interpolate != 0, p0, q);
+    assets::skl_sample(s.joints[0].path, t_ms, s.interpolate != 0, pt, q);
+    const float dx = pt[0] - p0[0], dz = pt[2] - p0[2];
+    const float c = std::cos(yaw), sn = std::sin(yaw);
+    out[0] = c * dx + sn * dz;
+    out[2] = -sn * dx + c * dz;
+}
+
+struct crate_ctl {
+    enum state_t { NONE, ANTIC, IDLE, MOVE, FINISH } state;
+    scene_trap* crate;
+    int         clip;
+    bool        moves_crate;
+    double      t0;
+    float       origin[3];
+    float       crate_origin[3];
+
+    crate_ctl() : state(NONE), crate(0), clip(-1), moves_crate(false), t0(0) {
+        for (int k = 0; k < 3; ++k) origin[k] = crate_origin[k] = 0.0f;
+    }
+
+    void begin(actor_inst& a, int c, double now, const float* pos, bool carry) {
+        clip = c;
+        set_clip(a, c);
+        t0 = now;
+        moves_crate = carry;
+        for (int k = 0; k < 3; ++k) origin[k] = pos[k];
+        if (crate) for (int k = 0; k < 3; ++k) crate_origin[k] = crate->offset()[k];
+    }
+};
+
+// One frame of the crate states. Returns false when the Prince is not
+// handling a crate, so normal movement applies.
+bool update_crate(crate_ctl& cc, scene& sc, actor_inst& a, float* pos, float& yaw,
+                  double now, bool action, bool push, bool pull) {
+    if (a.clip >= 0 && size_t(a.clip) >= a.loco.size()) return false;
+    const float fwd[3] = { std::sin(yaw), 0.0f, std::cos(yaw) };
+
+    if (cc.state == crate_ctl::NONE) {
+        if (!action || !a.loco_ok[CRATE_ANTIC]) return false;
+        float axis[3];
+        scene_trap* t = crate_in_front(sc, pos, fwd, axis);
+        if (!t) return false;
+        cc.crate = t;
+        yaw = std::atan2(axis[0], axis[2]);               // square up to it
+        cc.state = crate_ctl::ANTIC;
+        cc.begin(a, CRATE_ANTIC, now, pos, false);
+        std::printf("crate: grab %s\n", t->name().c_str());
+        return true;
+    }
+
+    const assets::skl_file& s = a.loco[size_t(cc.clip)];
+    const uint32_t len = clip_length_ms(s);
+    const double el_ms = (now - cc.t0) * 1000.0;
+    const bool finished = el_ms >= double(len);
+    const uint32_t t_ms = finished ? len : uint32_t(el_ms);
+
+    float d[3];
+    root_delta(s, t_ms, yaw, d);
+    pos[0] = cc.origin[0] + d[0];
+    pos[2] = cc.origin[2] + d[2];
+    if (cc.moves_crate && cc.crate) {
+        const float off[3] = { cc.crate_origin[0] + d[0], cc.crate_origin[1],
+                               cc.crate_origin[2] + d[2] };
+        cc.crate->place(off);
+    }
+    if (!finished) return true;
+
+    switch (cc.state) {
+    case crate_ctl::ANTIC:
+    case crate_ctl::MOVE:
+        cc.state = crate_ctl::IDLE;
+        cc.begin(a, CRATE_BASE, now, pos, false);
+        break;
+    case crate_ctl::IDLE:
+        cc.begin(a, CRATE_BASE, now, pos, false);          // hold the pose
+        break;
+    case crate_ctl::FINISH:
+        cc.state = crate_ctl::NONE;
+        cc.crate = 0;
+        set_clip(a, LOCO_BASE);
+        return true;
+    default:
+        break;
+    }
+    return true;
+}
+
+// Inputs while holding a crate: release, push or pull (StStartCrateMove).
+void crate_input(crate_ctl& cc, scene& sc, actor_inst& a, const float* pos, float yaw,
+                 double now, bool action, bool push, bool pull) {
+    if (cc.state != crate_ctl::IDLE) return;
+    const float fwd[3] = { std::sin(yaw), 0.0f, std::cos(yaw) };
+    if (!action) {
+        cc.state = crate_ctl::FINISH;
+        cc.begin(a, CRATE_FINISH, now, pos, false);
+        return;
+    }
+    if (push || pull) {
+        const int mv = push ? 1 : -1;
+        const bool ok = crate_move_ok(sc.coll, pos, fwd, mv);
+        const int clip = push ? (ok ? CRATE_PUSH : CRATE_PUSH_FAIL)
+                              : (ok ? CRATE_PULL : CRATE_PULL_FAIL);
+        cc.state = crate_ctl::MOVE;
+        cc.begin(a, clip, now, pos, ok);
+        std::printf("crate: %s %s -> %s\n", push ? "push" : "pull",
+                    cc.crate ? cc.crate->name().c_str() : "?", k_loco_names[clip]);
+    }
+}
+
 // The game module, as the original structures it: `gameModule` owns a level and
 // is entered through the module manager rather than being loaded inline.
 //
@@ -2242,6 +2436,8 @@ int main(int argc, char** argv) {
     bool noanim   = false;
     bool noclip   = false;
     bool noscript = false;
+    bool autopush = false;
+    const char* place_arg = 0;
     bool trapmsg  = false;
     float fixed_dt = 0.0f;
     bool noskin = false;
@@ -2283,6 +2479,8 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--noanim") == 0) noanim = true;
         else if (std::strcmp(argv[i], "--noclip") == 0) noclip = true;
         else if (std::strcmp(argv[i], "--noscript") == 0) noscript = true;
+        else if (std::strcmp(argv[i], "--autopush") == 0) autopush = true;
+        else if (std::strcmp(argv[i], "--place") == 0 && i + 1 < argc) place_arg = argv[++i];
         else if (std::strcmp(argv[i], "--trapmsg") == 0) trapmsg = true;
         else if (std::strcmp(argv[i], "--fixeddt") == 0 && i + 1 < argc) fixed_dt = float(std::atof(argv[++i]));
         else if (std::strcmp(argv[i], "--noskin") == 0) noskin = true;
@@ -2549,6 +2747,20 @@ int main(int argc, char** argv) {
         (void)pi;
         cam.pitch = -0.22f;
     }
+    // --place x,y,z,yaw puts the Prince somewhere for a test; yaw in degrees,
+    // 0 facing +z.
+    if (place_arg) {
+        float v[4] = {0,0,0,0};
+        if (std::sscanf(place_arg, "%f,%f,%f,%f", &v[0], &v[1], &v[2], &v[3]) >= 3)
+            for (size_t i = 0; i < sc.actors.size(); ++i)
+                if (!sc.actors[i].is_enemy) {
+                    for (int k = 0; k < 3; ++k) sc.actors[i].node->local.translate[k] = v[k];
+                    player_yaw = v[3] * 3.14159265f / 180.0f;
+                    cam.yaw = 3.14159265f - player_yaw;   // look the way he faces
+                    sc.root->update_world();
+                    break;
+                }
+    }
     {
         std::printf("collision: %zu triangles\n", sc.coll.triangle_count());
         for (size_t i = 0; i < sc.actors.size(); ++i) {
@@ -2566,6 +2778,7 @@ int main(int argc, char** argv) {
     sc.script.add(&prince_msgs);
     sc.script.trace = trapmsg;
     double game_time = 0.0;
+    crate_ctl crates;
     std::printf("scripts: %zu traps, %zu areas%s\n", sc.traps.size(), sc.areas.size(),
                 noscript ? " (disabled by --noscript)" : "");
 
@@ -2722,13 +2935,22 @@ int main(int argc, char** argv) {
         }
 
         if (player) {
-            // Movement is horizontal: the Prince walks, he does not fly. There
-            // is no collision or ground query yet, so he keeps his spawn height.
+            // Movement is horizontal: the Prince walks, he does not fly; the
+            // floor below decides his height.
             mv[1] = 0.0f;
             const float ml = std::sqrt(mv[0]*mv[0] + mv[2]*mv[2]);
             k2::engine::transform& lt = player->node->local;
             const bool run = autorun || down[plat::KEY_LSHIFT] || down[plat::KEY_RSHIFT];
-            if (ml > 1e-6f) {
+            // Crates take over the body while one is held: Space grabs and
+            // holds, W pushes, S pulls (see update_crate).
+            const bool act  = !snoozed && (down[plat::KEY_SPACE] || autopush);
+            const bool push = !snoozed && (down[plat::KEY_W] || autopush);
+            const bool pull = !snoozed && down[plat::KEY_S];
+            const bool in_crate = update_crate(crates, sc, *player, lt.translate, player_yaw,
+                                               game_time, act, push, pull);
+            if (in_crate) {
+                crate_input(crates, sc, *player, lt.translate, player_yaw, game_time, act, push, pull);
+            } else if (ml > 1e-6f) {
                 // Walk_L or Running_L, moved at the speed its own root motion
                 // covers, so the feet do not slide. Without the clip, the old
                 // fixed speeds stand in.
