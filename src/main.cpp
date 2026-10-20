@@ -5140,37 +5140,56 @@ void relaunch(int argc, char** argv, const std::vector<std::string>& extra) {
 // Plays a movie (data/Movies/<name>.mov) full screen, its sound through the
 // mixer. Esc, Space, Enter or a click skips it. Returns false if the window
 // was closed.
-// A cutscene, spread over the cores: one thread decodes the sound into the
-// mixer's buffer ahead of playback, another decodes frames a few ahead into
-// a ring, and the main thread shows whichever is due. On the Vita a frame of
-// SVQ1 or a second of QDM2 is too slow to do in the frame loop.
+// A cutscene, spread over the cores. Core 1 decodes the SVQ1 frames (the
+// bit stream is serial), core 2 turns each into RGBA, and the sound decodes
+// into the mixer's buffer beside the main thread on core 0, which only
+// uploads the frame that is due. A ring of RING slots carries frames from
+// the decoder to the converter to the screen; `space` counts the slots the
+// decoder may still fill (the one on screen is never one of them).
 namespace {
 struct movie_play {
     static const int RING = 4;
     media::movie* mv;
-    // Frames: the decode thread fills slot head % RING; `space` counts the
-    // slots it may still fill (the one on screen is never one of them).
+    int width, height, bytes;
+    media::svq1_decoder::yuv_frame yuv[RING];
     std::vector<uint8_t> frame[RING];
     double               time[RING];
-    std::atomic<int>     head;
-    plat::sema           space;
-    plat::sema           done;
+    std::atomic<int>     decoded;           // frames handed to the converter
+    std::atomic<int>     head;              // frames ready to show
+    plat::sema           space, to_convert, done;
     volatile bool        stop;
-    int                  bytes;
-    // Sound.
+    volatile bool        decode_finished;
     int16_t*             pcm;
     size_t               pcm_cap;
-    movie_play() : mv(0), head(0), space(0), done(0), stop(false), bytes(0), pcm(0), pcm_cap(0) {}
+    movie_play() : mv(0), width(0), height(0), bytes(0), decoded(0), head(0), space(0), to_convert(0),
+                   done(0), stop(false), decode_finished(false), pcm(0), pcm_cap(0) {}
 
     static void video(void* u) {
         movie_play& p = *static_cast<movie_play*>(u);
         for (;;) {
             plat::sema_wait(p.space);
             double t = 0.0;
-            if (p.stop || !p.mv->next_frame(t) || !p.mv->rgba()) break;
-            const int slot = p.head.load() % RING;
-            std::memcpy(&p.frame[slot][0], p.mv->rgba(), size_t(p.bytes));
+            if (p.stop || !p.mv->next_frame(t) || !p.mv->yuv()) break;
+            const int slot = p.decoded.load() % RING;
+            p.yuv[slot] = *p.mv->yuv();
             p.time[slot] = t;
+            p.decoded.fetch_add(1);
+            plat::sema_signal(p.to_convert, 1);
+        }
+        p.decode_finished = true;
+        plat::sema_signal(p.to_convert, 1);             // wake the converter to see it
+        plat::sema_signal(p.done, 1);
+    }
+
+    static void convert(void* u) {
+        movie_play& p = *static_cast<movie_play*>(u);
+        for (;;) {
+            plat::sema_wait(p.to_convert);
+            if (p.stop) break;
+            const int n = p.head.load();
+            if (n >= p.decoded.load()) { if (p.decode_finished) break; continue; }
+            const int slot = n % RING;
+            media::svq1_decoder::yuv_to_rgba(p.yuv[slot], p.width, p.height, &p.frame[slot][0]);
             p.head.fetch_add(1);
         }
         plat::sema_signal(p.done, 1);
@@ -5196,11 +5215,17 @@ bool play_movie(const std::string& name) {
     static movie_play p;
     p.mv = &mv;
     p.stop = false;
+    p.decode_finished = false;
     p.head.store(0);
+    p.decoded.store(0);
+    p.width = mv.width();
+    p.height = mv.height();
     p.bytes = mv.width() * mv.height() * 4;
+    mv.set_convert(false);
     for (int i = 0; i < movie_play::RING; ++i) p.frame[i].assign(size_t(p.bytes), 0);
     // Fresh semaphores per movie: the last one's leave counts behind.
     p.space = plat::sema_create(movie_play::RING - 1);
+    p.to_convert = plat::sema_create(0);
     p.done = plat::sema_create(0);
     int threads = 0;
 
@@ -5216,10 +5241,11 @@ bool play_movie(const std::string& name) {
         g_mixer->add_sound("__movie", sf);
         p.pcm = g_mixer->sound_samples("__movie");
         p.pcm_cap = sf.samples.size();
-        if (p.pcm && plat::thread_start(&movie_play::audio, &p, 2, "k2 movie audio")) ++threads;
+        if (p.pcm && plat::thread_start(&movie_play::audio, &p, 0, "k2 movie audio")) ++threads;
         voice = g_mixer->play("__movie", 0, 0.0f, false, 1.0f);
     }
     if (plat::thread_start(&movie_play::video, &p, 1, "k2 movie video")) ++threads;
+    if (plat::thread_start(&movie_play::convert, &p, 2, "k2 movie colour")) ++threads;
     std::fflush(stdout);
 
     gfx::texture_id tex = gfx::INVALID_TEXTURE;
@@ -5259,12 +5285,14 @@ bool play_movie(const std::string& name) {
     // Stop both threads and wait for them before the movie goes away.
     p.stop = true;
     plat::sema_signal(p.space, movie_play::RING);
+    plat::sema_signal(p.to_convert, movie_play::RING);
     for (int i = 0; i < threads; ++i) plat::sema_wait(p.done);
     std::printf("movie: %d of %d frames decoded shown, %.1f s\n", shown + 1, p.head.load(),
                 plat::time_seconds() - start);
     plat::sema_destroy(p.space);
+    plat::sema_destroy(p.to_convert);
     plat::sema_destroy(p.done);
-    p.space = p.done = 0;
+    p.space = p.to_convert = p.done = 0;
     if (g_mixer && voice) g_mixer->stop(voice);
     if (tex != gfx::INVALID_TEXTURE) gfx::destroy_texture(tex);
     return alive;
@@ -5333,6 +5361,11 @@ fx_def* fx_load(const std::string& name) {
                             i, unsigned(b[i].av_flags), b[i].type.c_str(), b[i].name.c_str(), b[i].translate[0], b[i].translate[1],
                             b[i].translate[2], b[i].rotate[0], b[i].rotate[1], b[i].rotate[2], b[i].rotate[3],
                             b[i].rotate[4], b[i].rotate[5], b[i].rotate[6], b[i].rotate[7], b[i].rotate[8], b[i].scale);
+                {
+                    std::printf("        children");
+                    for (size_t c = 0; c < b[i].children.size(); ++c) std::printf(" %d", d->nif.find(b[i].children[c]));
+                    std::printf("\n");
+                }
                 if (b[i].kind == assets::nif_block::RAW_IMAGE && !b[i].rgba.empty()) {
                     int amin = 255, amax = 0, mag = 0;
                     for (size_t q = 0; q + 3 < b[i].rgba.size(); q += 4) {
@@ -5491,9 +5524,10 @@ void fx_world(const fx_instance& fi, int i, float t, float* out) {
         place[0] = c;  place[2] = -s;               // set_yaw: model +X -> (c, 0, -s)
         place[8] = s;  place[10] = c;               //          model +Z -> (s, 0, c)
         place[12] = fi.pos[0]; place[13] = fi.pos[1]; place[14] = fi.pos[2];
-        mat4_identity(conv);                        // (x, y, z) -> (x, z, -y)
-        conv[5] = 0.0f; conv[6] = -1.0f;            // column y: Max +Y -> engine -Z
-        conv[9] = 1.0f; conv[10] = 0.0f;            // column z: Max +Z -> engine +Y
+        // The effects are exported y-up, as the engine is: the shower's floor
+        // splash node sits 3.1 below its jet, the nozzle's height above the
+        // shower room floor. No Max -> engine swap here.
+        mat4_identity(conv);
         m4_mul(place, conv, out);
         return;
     }
@@ -5561,12 +5595,13 @@ void fx_update(scene& sc, double now, float dt) {
             fi.emit_acc[i] += rate * dt;
             float wm[16];
             fx_world(fi, int(i), t, wm);
-            // The emitter's own axis (node +Y for these SuperSprays), in the world.
-            const float* ax = b.psys.axis;
-            const float up[3] = { wm[0] * ax[0] + wm[4] * ax[1] + wm[8] * ax[2],
-                                  wm[1] * ax[0] + wm[5] * ax[1] + wm[9] * ax[2],
-                                  wm[2] * ax[0] + wm[6] * ax[1] + wm[10] * ax[2] };
+            // A SuperSpray leaves along its node's +Z (the shower's jet points
+            // down, its floor splash up).
+            const float up[3] = { wm[8], wm[9], wm[10] };
             const float ul = std::sqrt(up[0] * up[0] + up[1] * up[1] + up[2] * up[2]);
+            if (std::getenv("K2_FXDUMP") && fi.emit_acc[i] >= 1.0 && fi.parts[i].empty())
+                std::printf("fx %d block %zu emits at (%.2f %.2f %.2f) along (%.2f %.2f %.2f)\n", fi.id, i,
+                            wm[12], wm[13], wm[14], up[0], up[1], up[2]);
             const size_t cap = std::max<size_t>(8, std::min<size_t>(b.psys.max_particles, 200));
             while (fi.emit_acc[i] >= 1.0 && ps.size() < cap) {
                 fi.emit_acc[i] -= 1.0;
@@ -6218,6 +6253,9 @@ int main(int argc, char** argv) {
     if (fe_ok) {
         loading_fe = &frontend;
         g_loading_fn = [](float p) { loading_fe->loading(p); };
+        // Up as soon as there is something to draw it with: a relaunch (Load,
+        // Restart, Main Menu) comes back here, and so does a cold start.
+        loading_progress(0.0f);
     }
     if (use_menu && !menu_in_game_only) {
         k2::engine::mixer fe_mixer(44100);

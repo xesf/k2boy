@@ -71,9 +71,10 @@ public:
 private:
     struct input {
         bool up, down, left, right, enter, back, click, closed;
+        bool moved;                     // the pointer moved (or touched) this frame
         float mx, my;                   // canvas coordinates
         input() : up(false), down(false), left(false), right(false), enter(false), back(false),
-                  click(false), closed(false), mx(-1), my(-1) {}
+                  click(false), closed(false), moved(false), mx(-1), my(-1) {}
     };
     input poll();
     void frame_begin(const char* art, bool key = false);

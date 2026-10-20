@@ -134,7 +134,7 @@ void put16_xy2(uint8_t* b, const uint8_t* p, int line, int h) { put8_xy2(b, p, l
 } // namespace
 
 svq1_decoder::svq1_decoder(int width, int height)
-    : m_width(width), m_height(height), m_frame_width(0), m_frame_height(0) {
+    : m_width(width), m_height(height), m_frame_width(0), m_frame_height(0), m_convert(true) {
     m_last[0] = m_last[1] = m_last[2] = 0;
     m_block_type = new huffman(4, s_svq1BlockTypeCodes, s_svq1BlockTypeLengths);
     for (int i = 0; i < 6; ++i) {
@@ -219,7 +219,15 @@ bool svq1_decoder::decode(const uint8_t* data, size_t size) {
     }
     std::memcpy(current[1] + uv_h * uv_pitch, current[1] + (uv_h - 1) * uv_pitch, uv_w + 1);
     std::memcpy(current[2] + uv_h * uv_pitch, current[2] + (uv_h - 1) * uv_pitch, uv_w + 1);
-    to_rgba(current[0], current[1], current[2], int(y_w), int(uv_pitch));
+    m_yuv.y.assign(current[0], current[0] + size_t(y_w) * (y_h + 1));
+    m_yuv.u.assign(current[1], current[1] + size_t(uv_pitch) * (uv_h + 1));
+    m_yuv.v.assign(current[2], current[2] + size_t(uv_pitch) * (uv_h + 1));
+    m_yuv.y_pitch = int(y_w);
+    m_yuv.uv_pitch = int(uv_pitch);
+    if (m_convert) {
+        m_rgba.resize(size_t(m_width) * m_height * 4);
+        yuv_to_rgba(m_yuv, m_width, m_height, &m_rgba[0]);
+    }
     for (int i = 0; i < 3; ++i) {
         if (reference) { delete[] m_last[i]; m_last[i] = current[i]; }
         else delete[] current[i];
@@ -228,25 +236,47 @@ bool svq1_decoder::decode(const uint8_t* data, size_t size) {
 }
 
 // Full-range BT.601 (ScummVM's kScaleFull), chroma at a quarter resolution
-// both ways, interpolated.
-void svq1_decoder::to_rgba(const uint8_t* ys, const uint8_t* us, const uint8_t* vs, int y_pitch, int uv_pitch) {
-    m_rgba.resize(size_t(m_width) * m_height * 4);
-    for (int y = 0; y < m_height; ++y) {
+// both ways, interpolated. Each row interpolates the chroma rows once, and
+// the per-channel products come from tables: on the Vita this runs once a
+// frame for a 640x387 picture, so it is kept lean.
+void svq1_decoder::yuv_to_rgba(const yuv_frame& f, int width, int height, uint8_t* out) {
+    static int rv[256], gu[256], gv[256], bu[256];
+    static uint8_t clip[1024];
+    static bool init = false;
+    if (!init) {
+        for (int i = 0; i < 256; ++i) {
+            const int c = i - 128;
+            rv[i] = (91881 * c) >> 16;
+            gu[i] = (22554 * c) >> 16;
+            gv[i] = (46802 * c) >> 16;
+            bu[i] = (116130 * c) >> 16;
+        }
+        for (int i = 0; i < 1024; ++i) { const int v = i - 384; clip[i] = uint8_t(v < 0 ? 0 : v > 255 ? 255 : v); }
+        init = true;
+    }
+    const uint8_t* cl = clip + 384;
+    const int cw = width / 4 + 2;
+    std::vector<int> ur(size_t(cw) + 1), vr(size_t(cw) + 1);
+    for (int y = 0; y < height; ++y) {
         const int cy = y >> 2, fy = y & 3;
-        for (int x = 0; x < m_width; ++x) {
+        const uint8_t* u0 = &f.u[size_t(cy) * f.uv_pitch];
+        const uint8_t* v0 = &f.v[size_t(cy) * f.uv_pitch];
+        const uint8_t* u1 = u0 + f.uv_pitch;
+        const uint8_t* v1 = v0 + f.uv_pitch;
+        for (int cx = 0; cx < cw && cx < f.uv_pitch; ++cx) {      // the rows mixed, x4
+            ur[size_t(cx)] = u0[cx] * (4 - fy) + u1[cx] * fy;
+            vr[size_t(cx)] = v0[cx] * (4 - fy) + v1[cx] * fy;
+        }
+        const uint8_t* ys = &f.y[size_t(y) * f.y_pitch];
+        uint8_t* o = out + size_t(y) * width * 4;
+        for (int x = 0; x < width; ++x, o += 4) {
             const int cx = x >> 2, fx = x & 3;
-            const int i00 = cy * uv_pitch + cx, i01 = i00 + 1, i10 = i00 + uv_pitch, i11 = i10 + 1;
-            const int w00 = (4 - fx) * (4 - fy), w01 = fx * (4 - fy), w10 = (4 - fx) * fy, w11 = fx * fy;
-            const int u = (us[i00] * w00 + us[i01] * w01 + us[i10] * w10 + us[i11] * w11 + 8) / 16 - 128;
-            const int v = (vs[i00] * w00 + vs[i01] * w01 + vs[i10] * w10 + vs[i11] * w11 + 8) / 16 - 128;
-            const int lum = ys[y * y_pitch + x];
-            int r = lum + ((91881 * v) >> 16);
-            int g = lum - ((22554 * u + 46802 * v) >> 16);
-            int b = lum + ((116130 * u) >> 16);
-            uint8_t* o = &m_rgba[(size_t(y) * m_width + x) * 4];
-            o[0] = uint8_t(r < 0 ? 0 : r > 255 ? 255 : r);
-            o[1] = uint8_t(g < 0 ? 0 : g > 255 ? 255 : g);
-            o[2] = uint8_t(b < 0 ? 0 : b > 255 ? 255 : b);
+            const int u = (ur[size_t(cx)] * (4 - fx) + ur[size_t(cx) + 1] * fx + 8) >> 4;
+            const int v = (vr[size_t(cx)] * (4 - fx) + vr[size_t(cx) + 1] * fx + 8) >> 4;
+            const int lum = ys[x];
+            o[0] = cl[lum + rv[v]];
+            o[1] = cl[lum - gu[u] - gv[v]];
+            o[2] = cl[lum + bu[u]];
             o[3] = 255;
         }
     }

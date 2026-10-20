@@ -51,6 +51,10 @@ double movie::duration() const {
 
 const uint8_t* movie::rgba() const { return m_dec ? m_dec->rgba() : 0; }
 
+void movie::set_convert(bool on) { if (m_dec) m_dec->set_convert(on); }
+
+const svq1_decoder::yuv_frame* movie::yuv() const { return m_dec ? &m_dec->yuv() : 0; }
+
 bool movie::next_frame(double& t) {
     if (!m_video || !m_dec || !m_video->timescale) return false;
     while (uint32_t(m_next_sample) < m_video->sample_count) {

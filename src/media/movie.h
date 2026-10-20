@@ -18,11 +18,10 @@
 #include <vector>
 
 #include "media/mov.h"
+#include "media/svq1.h"
 
 namespace k2 {
 namespace media {
-
-class svq1_decoder;
 
 class movie {
 public:
@@ -44,6 +43,10 @@ public:
     // Decodes the next frame in order into rgba(); its start time in
     // seconds in `t`. False at the end.
     bool next_frame(double& t);
+    // With conversion off, next_frame() leaves the picture as YUV planes in
+    // yuv() for svq1_decoder::yuv_to_rgba on another thread.
+    void set_convert(bool on);
+    const svq1_decoder::yuv_frame* yuv() const;
 
     // The whole sound track, interleaved 16-bit, at audio_rate(). Empty
     // until decode_audio() runs.

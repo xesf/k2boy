@@ -157,9 +157,11 @@ frontend::input frontend::poll() {
             break;
         case plat::EVENT_MOUSE_MOVE:
             m_canvas.to_canvas(e.mouse_x, e.mouse_y, m_mx, m_my);
+            in.moved = true;
             break;
         case plat::EVENT_MOUSE_DOWN:
             m_canvas.to_canvas(e.mouse_x, e.mouse_y, m_mx, m_my);
+            in.moved = true;
             if (e.button == plat::MOUSE_LEFT) in.click = true;
             break;
         case plat::EVENT_PAD_BUTTON:
@@ -173,6 +175,18 @@ frontend::input frontend::poll() {
             break;
         default: break;
         }
+    }
+    // The left stick steps through menus like the d-pad, once per push.
+    {
+        plat::pad_state pad;
+        plat::pad_poll(pad);
+        static int last_y = 0, last_x = 0;
+        const int y = !pad.connected ? 0 : pad.axis[plat::PAD_AXIS_LY] > 0.6f ? 1 : pad.axis[plat::PAD_AXIS_LY] < -0.6f ? -1 : 0;
+        const int x = !pad.connected ? 0 : pad.axis[plat::PAD_AXIS_LX] > 0.6f ? 1 : pad.axis[plat::PAD_AXIS_LX] < -0.6f ? -1 : 0;
+        if (y != last_y) { if (y > 0) in.up = true; if (y < 0) in.down = true; }
+        if (x != last_x) { if (x > 0) in.right = true; if (x < 0) in.left = true; }
+        last_y = y;
+        last_x = x;
     }
     in.mx = m_mx;
     in.my = m_my;
@@ -276,8 +290,8 @@ bool frontend::confirm(const std::string& question) {
         m_canvas.text(question, 320, by + box.h * 0.38f, 16, INK, 1);
         const float yy = by + box.h * 0.78f;
         const bool hy = hover(in, 230, yy - 22, 80, 30), hn = hover(in, 330, yy - 22, 80, 30);
-        if (hy) sel = 0;
-        if (hn) sel = 1;
+        if (hy && in.moved) sel = 0;
+        if (hn && in.moved) sel = 1;
         m_canvas.text(m_text.get("Yes"), 270, yy, 20, sel == 0 ? HOT : INK, 1);
         m_canvas.text(m_text.get("No"), 370, yy, 20, sel == 1 ? HOT : INK, 1);
         frame_end();
@@ -305,7 +319,9 @@ result frontend::main_menu(save_game& loaded) {
         int clicked = -1;
         for (int i = 0; i < 6; ++i) {
             const float top = i < 5 ? items[i].y - 47 : 368, h = i < 5 ? 47 : 42;
-            if (hover(in, 158, top, 125, h)) { sel = i; if (in.click) clicked = i; }
+            // The pointer selects only when it moves: one left resting over an
+            // item (a touch, a parked mouse) would undo the d-pad every frame.
+            if (in.moved && hover(in, 158, top, 125, h)) { sel = i; if (in.click) clicked = i; }
             const color c = sel == i ? HOT : INK;
             if (items[i].b >= 0) {
                 m_canvas.text(m_text.get(items[i].a), 220, items[i].y - 26, 19, c, 1);
@@ -346,7 +362,7 @@ result frontend::game_menu(const save_game& current, save_game& loaded) {
         int clicked = -1;
         for (int i = 0; i < 7; ++i) {
             const float y = 140 + i * 40.0f;
-            if (hover(in, 132, y - 28, 186, 38)) { sel = i; if (in.click) clicked = i; }
+            if (in.moved && hover(in, 132, y - 28, 186, 38)) { sel = i; if (in.click) clicked = i; }
             m_canvas.text(m_text.get(ids[i]), 225, y, 19, sel == i ? HOT : INK, 1);
         }
         frame_end();
