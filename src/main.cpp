@@ -5205,7 +5205,11 @@ int main(int argc, char** argv) {
             gfx::set_tint(1.0f, 1.0f, 1.0f, 1.0f);
         }
 
-        // HUD: the Prince's health, top left. A unit quad in clip space.
+        // HUD: the Prince's health as potion bottles along the bottom left,
+        // as the game draws it (data/2D/health bottles, black keyed out).
+        // One bottle holds 24 health, what a full potion gives back; each
+        // shows full, half, a third or empty. The sword icon sits beside
+        // them while it is drawn.
         {
             actor_inst* pa = 0;
             for (size_t i = 0; i < sc.actors.size(); ++i)
@@ -5218,10 +5222,39 @@ int main(int argc, char** argv) {
                     const float xy[4][2] = { {0,0}, {1,0}, {1,1}, {0,1} };
                     for (int k = 0; k < 4; ++k) {
                         v[k].x = xy[k][0]; v[k].y = xy[k][1]; v[k].z = 0.0f;
+                        v[k].u = xy[k][0]; v[k].v = 1.0f - xy[k][1];
                         v[k].nz = 1.0f; v[k].r = v[k].g = v[k].b = v[k].a = 255;
                     }
                     const uint16_t ix[6] = { 0, 1, 2, 0, 2, 3 };
                     quad = gfx::create_mesh(v, 4, ix, 6);
+                }
+                enum { B_FULL, B_HALF, B_THIRD, B_EMPTY, B_SWORD, B_COUNT };
+                static gfx::texture_id hud_tex[B_COUNT];
+                static int hud_w[B_COUNT], hud_h[B_COUNT];
+                static bool hud_loaded = false;
+                if (!hud_loaded) {
+                    hud_loaded = true;
+                    const char* files[B_COUNT] = {
+                        "2D/health bottles/redFull.BMP", "2D/health bottles/REDHALF.BMP",
+                        "2D/health bottles/REDTHIRD.BMP", "2D/health bottles/empty.bmp",
+                        "2D/interface icons/sword icon.bmp" };
+                    for (int k = 0; k < B_COUNT; ++k) {
+                        hud_tex[k] = gfx::INVALID_TEXTURE;
+                        hud_w[k] = hud_h[k] = 0;
+                        size_t size = 0;
+                        uint8_t* data = plat::fs_read(files[k], size);
+                        if (!data) { std::printf("hud: %s missing\n", files[k]); continue; }
+                        assets::image img;
+                        if (assets::image_load(data, size, img) && img.valid()) {
+                            for (size_t q = 0; q + 3 < img.rgba.size(); q += 4)
+                                if (img.rgba[q] < 8 && img.rgba[q + 1] < 8 && img.rgba[q + 2] < 8)
+                                    img.rgba[q + 3] = 0;
+                            hud_tex[k] = gfx::create_texture(img.width, img.height, &img.rgba[0]);
+                            hud_w[k] = img.width;
+                            hud_h[k] = img.height;
+                        }
+                        plat::fs_free(data);
+                    }
                 }
                 float ident[16];
                 mat4_identity(ident);
@@ -5234,25 +5267,35 @@ int main(int argc, char** argv) {
                 hs.wireframe = false;
                 hs.fog = false;
                 gfx::set_render_state(hs);
-                gfx::set_texture(gfx::INVALID_TEXTURE);
-                const float frac = pa->max_health > 0 ? float(pa->health) / float(pa->max_health) : 0.0f;
-                const float x0 = -0.95f, y0 = 0.88f, w0 = 0.5f, h0 = 0.04f;
+                gfx::set_tint(1.0f, 1.0f, 1.0f, 1.0f);
+                // Art pixels to clip space, scaled with the window height
+                // against the game's 480-line screen.
+                const float px = float(h ? h : 1) / 480.0f;
+                const float sx = 2.0f * px / float(w ? w : 1), sy = 2.0f * px / float(h ? h : 1);
+                const float per = 24.0f;
+                const int bottles = std::max(1, int(std::ceil(float(pa->max_health) / per)));
+                float x = -1.0f + 12.0f * sx;
+                const float y = -1.0f + 10.0f * sy;
                 float m[16];
                 mat4_identity(m);
-                m[0] = w0 + 0.01f; m[5] = h0 + 0.01f; m[12] = x0 - 0.005f; m[13] = y0 - 0.005f;
-                gfx::set_model(m);
-                gfx::set_tint(0.05f, 0.03f, 0.02f, 0.75f);
-                gfx::draw(quad);
-                m[0] = w0 * frac; m[5] = h0; m[12] = x0; m[13] = y0;
-                gfx::set_model(m);
-                gfx::set_tint(0.75f, 0.08f, 0.05f, 0.95f);
-                if (frac > 0.0f) gfx::draw(quad);
-                if (pa->armed) {                        // a small mark for the sword
-                    m[0] = 0.02f; m[5] = h0; m[12] = x0 + w0 + 0.02f; m[13] = y0;
+                for (int b = 0; b < bottles; ++b) {
+                    const float in = (float(pa->health) - float(b) * per) / per;
+                    const int k = in >= 0.84f ? B_FULL : in >= 0.5f ? B_HALF : in > 0.0f ? B_THIRD : B_EMPTY;
+                    if (hud_tex[k] == gfx::INVALID_TEXTURE) continue;
+                    m[0] = float(hud_w[k]) * sx; m[5] = float(hud_h[k]) * sy; m[12] = x; m[13] = y;
                     gfx::set_model(m);
-                    gfx::set_tint(0.85f, 0.8f, 0.6f, 0.95f);
+                    gfx::set_texture(hud_tex[k]);
+                    gfx::draw(quad);
+                    x += float(hud_w[k] + 2) * sx;
+                }
+                if (pa->armed && hud_tex[B_SWORD] != gfx::INVALID_TEXTURE) {
+                    const float side = 40.0f;
+                    m[0] = side * sx; m[5] = side * sy; m[12] = x + 8.0f * sx; m[13] = y;
+                    gfx::set_model(m);
+                    gfx::set_texture(hud_tex[B_SWORD]);
                     gfx::draw(quad);
                 }
+                gfx::set_texture(gfx::INVALID_TEXTURE);
                 gfx::set_tint(1.0f, 1.0f, 1.0f, 1.0f);
                 gfx::set_model(model);
             }
