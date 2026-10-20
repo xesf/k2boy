@@ -3411,6 +3411,25 @@ bool clip_grip(actor_inst& a, const assets::skl_file& s, uint32_t t, float* out)
     return true;
 }
 
+// Where joint `j` is in a clip's pose at time t, in the actor's own frame,
+// with the root held at its bind position the way the clip is played.
+bool clip_joint(actor_inst& a, const assets::skl_file& s, uint32_t t, size_t j, float* out) {
+    if (j >= a.joint_local_cur.size()) return false;
+    std::vector<k2::engine::transform> keep = a.joint_local_cur;
+    for (size_t i = 0; i < a.joint_local_cur.size(); ++i) {
+        if (i >= s.joints.size() || !s.joints[i].present) { a.joint_local_cur[i] = a.joint_local_bind[i]; continue; }
+        float pos[3], q[4];
+        assets::skl_sample(s.joints[i].path, t, true, pos, q);
+        if (i == 0) for (int k = 0; k < 3; ++k) pos[k] = a.joint_local_bind[0].translate[k];
+        transform_from_pos_quat(pos, q, a.joint_local_cur[i]);
+    }
+    pose_actor(a);
+    for (int k = 0; k < 3; ++k) out[k] = a.cur[j].translate[k];
+    a.joint_local_cur = keep;
+    pose_actor(a);
+    return true;
+}
+
 // --- crates -------------------------------------------------------------------
 //
 // The Prince's crate states, StStartCrateGrab -> StIdleCrate -> StStartCrateMove
@@ -3745,6 +3764,22 @@ bool jump_update(jump_ctl& jc, actor_inst& a, const k2::engine::collision_world&
     jc.vel[1] += jump_tuning::GRAVITY * dt;
     const float before[2] = { pos[0], pos[2] };
     move_horizontal(w, pos, jc.vel[0] * dt, jc.vel[2] * dt);
+    {
+        // Over something higher than where he took off (a crate's top), he
+        // may only come down on it if he fits there - 1.8 of headroom.
+        // Otherwise the move over it is undone and he drops back beside it.
+        const float o[3] = { pos[0], pos[1] + 0.05f, pos[2] };
+        const float down[3] = { 0.0f, -1.0f, 0.0f }, up[3] = { 0.0f, 1.0f, 0.0f };
+        k2::engine::pick_hit h, ch;
+        if (w.pick(o, down, 8.0f, true, h) && h.point[1] > jc.origin[1] + 0.4f) {
+            const float co[3] = { h.point[0], h.point[1] + 0.05f, h.point[2] };
+            if (w.pick(co, up, 1.8f, false, ch)) {
+                pos[0] = before[0];
+                pos[2] = before[1];
+                jc.vel[0] = jc.vel[2] = 0.0f;
+            }
+        }
+    }
     if (std::fabs(pos[0] - before[0]) < std::fabs(jc.vel[0] * dt) * 0.5f) jc.vel[0] = 0.0f;
     if (std::fabs(pos[2] - before[1]) < std::fabs(jc.vel[2] * dt) * 0.5f) jc.vel[2] = 0.0f;
     const float dy = jc.vel[1] * dt;
@@ -3831,6 +3866,20 @@ bool find_ledge(const k2::engine::collision_world& w, const float* pos, float ya
         const float up[3] = { 0.0f, 1.0f, 0.0f };
         k2::engine::pick_hit sh;
         out.can_stand = !w.pick(so, up, 1.9f, false, sh);
+        // And room for his body there: no wall just past the edge at knee
+        // or chest height (a crate pushed against a wall), and a floor
+        // under the spot he ends on.
+        for (int hi = 0; hi < 2 && out.can_stand; ++hi) {
+            const float bo[3] = { out.edge[0], top + (hi ? 1.2f : 0.4f), out.edge[2] };
+            k2::engine::pick_hit bh;
+            if (w.pick(bo, ff, 0.35f + 0.3f, false, bh)) out.can_stand = false;
+        }
+        if (out.can_stand) {
+            const float go[3] = { so[0], top + 0.3f, so[2] };
+            k2::engine::pick_hit gh;
+            if (!w.pick(go, down, 0.5f, true, gh) || gh.normal[1] < move_tuning::FLOOR_MIN_NY)
+                out.can_stand = false;
+        }
         return true;
     }
     return false;
@@ -3842,11 +3891,12 @@ struct hang_ctl {
     int       clip;
     double    t0;
     float     from[3], to[3];
+    float     corr[3];      // CLIMB / PULL_UP: drift spread over the clip so it ends at `to`
     float     grip[3];      // grip point in the Prince's frame (x left, y up, z fwd)
     bool      have_grip;
 
     hang_ctl() : state(NONE), clip(-1), t0(0), have_grip(false) {
-        for (int k = 0; k < 3; ++k) from[k] = to[k] = grip[k] = 0.0f;
+        for (int k = 0; k < 3; ++k) from[k] = to[k] = corr[k] = grip[k] = 0.0f;
     }
 };
 
@@ -3882,6 +3932,29 @@ double hang_len(const actor_inst& a, int c) {
     return (c >= 0 && a.loco_ok[size_t(c)]) ? clip_length_ms(a.loco[size_t(c)]) / 1000.0 : 0.5;
 }
 
+// A hop or pull-up raises the body in the pose (the Prime joint), by the
+// clip's own amount, not the ledge's. Where the clip's last frame would put
+// the body is compared with standing at `to` in the base pose; the
+// difference is spread over the clip, so the body meets the top as the clip
+// ends and the switch to the base pose does not jump. Call once hc.from,
+// hc.to and hc.clip are set.
+void hang_begin_rise(hang_ctl& hc, actor_inst& a) {
+    for (int k = 0; k < 3; ++k) hc.corr[k] = hc.to[k] - hc.from[k];
+    if (hc.clip < 0 || !a.loco_ok[size_t(hc.clip)] || !a.loco_ok[LOCO_BASE]) return;
+    const assets::skl_file& s = a.loco[size_t(hc.clip)];
+    const uint32_t len = clip_length_ms(s);
+    float pe[3], pb[3], d[3];
+    if (!clip_joint(a, s, len, 1, pe) || !clip_joint(a, a.loco[LOCO_BASE], 0, 1, pb)) return;
+    root_delta(s, len, hc.ledge.facing, d);
+    const float c = std::cos(hc.ledge.facing), sn = std::sin(hc.ledge.facing);
+    const float ox = pb[0] - pe[0], oz = pb[2] - pe[2];
+    // set_yaw: model x -> (c, 0, -s), model z -> (s, 0, c)
+    const float end[3] = { hc.to[0] + c * ox + sn * oz, hc.to[1] + pb[1] - pe[1], hc.to[2] - sn * ox + c * oz };
+    hc.corr[0] = end[0] - (hc.from[0] + d[0]);
+    hc.corr[1] = end[1] - hc.from[1];
+    hc.corr[2] = end[2] - (hc.from[2] + d[2]);
+}
+
 // From standing: climb a low ledge (HopUpOnto*). True when it started.
 bool hang_try_climb(hang_ctl& hc, actor_inst& a, const k2::engine::collision_world& w,
                     const float* pos, float& yaw, double now) {
@@ -3910,6 +3983,7 @@ bool hang_try_climb(hang_ctl& hc, actor_inst& a, const k2::engine::collision_wor
     hc.to[2] = l.edge[2] + ff[2] * 0.35f;
     hc.state = hang_ctl::CLIMB;
     hang_play(hc, a, c, now, true);
+    hang_begin_rise(hc, a);
     std::printf("ledge: climb %.2f (%s)\n", dh, k_loco_names[c]);
     return true;
 }
@@ -4035,6 +4109,13 @@ bool hang_try_grab(hang_ctl& hc, actor_inst& a, const k2::engine::collision_worl
     ledge_hit l;
     // Hands reach about grip[1] above the feet; take ledges near that height.
     if (!find_ledge(w, pos, yaw, hc.grip[1] - 0.6f, hc.grip[1] + 0.35f, l)) return false;
+    // Too low to hang from: his feet would go through the floor under him.
+    {
+        const float o[3] = { pos[0], pos[1] + 0.05f, pos[2] };
+        const float down[3] = { 0.0f, -1.0f, 0.0f };
+        k2::engine::pick_hit h;
+        if (w.pick(o, down, 3.0f, true, h) && l.top - hc.grip[1] < h.point[1] + 0.3f) return false;
+    }
     hc.ledge = l;
     for (int k = 0; k < 3; ++k) hc.from[k] = pos[k];
     hc.state = hang_ctl::GRAB;
@@ -4058,19 +4139,20 @@ bool hang_update(hang_ctl& hc, actor_inst& a, const k2::engine::collision_world&
     case hang_ctl::CLIMB:
     case hang_ctl::PULL_UP: {
         // The clip does the climbing: its Prime joint rises the 0.75 .. 1.93
-        // of the hop (or pull-up), so the body stays at its starting height
-        // and only follows the root's travel forward. When the clip ends the
-        // rise moves into the position - standing on the top - as the pose
-        // returns to base.
+        // of the hop (or pull-up), so the body follows the root's travel
+        // forward plus hc.corr, the gap between the clip's rise and the
+        // ledge's (hang_begin_rise). When the clip ends he stands at `to`
+        // as the pose returns to base.
         float d[3];
         const assets::skl_file& sk = a.loco[size_t(hc.clip)];
         root_delta(sk, uint32_t(std::min(len, el) * 1000.0), hc.ledge.facing, d);
-        pos[0] = float(hc.from[0]) + d[0];
-        pos[1] = float(hc.from[1]);
-        pos[2] = float(hc.from[2]) + d[2];
+        const float f = float(u);
+        pos[0] = hc.from[0] + d[0] + hc.corr[0] * f;
+        pos[1] = hc.from[1] + hc.corr[1] * f;
+        pos[2] = hc.from[2] + d[2] + hc.corr[2] * f;
         yaw = hc.ledge.facing;
         if (u >= 1.0) {
-            pos[1] = float(hc.to[1]);
+            for (int k = 0; k < 3; ++k) pos[k] = hc.to[k];
             hc.state = hang_ctl::NONE;
             set_clip(a, LOCO_BASE);
             return false;
@@ -4111,6 +4193,7 @@ bool hang_update(hang_ctl& hc, actor_inst& a, const k2::engine::collision_world&
                 hc.to[2] = hc.ledge.edge[2] + ff[2] * 0.35f;
                 hc.state = hang_ctl::PULL_UP;
                 hang_play(hc, a, LEDGE_PULL_UP, now, true);
+                hang_begin_rise(hc, a);
             } else {
                 hc.state = hang_ctl::PULL_FAIL;
                 hang_play(hc, a, LEDGE_PULL_FAIL, now, true);
@@ -6539,10 +6622,24 @@ int main(int argc, char** argv) {
             }
 
             // Chase camera: behind and above, looking slightly down at him.
+            // Climbing and hanging move the body in the pose, not the root
+            // (a hop rises in the clip and the root follows when it ends), so
+            // the camera follows the body: the root plus how far the Prime
+            // joint is above where it is standing in the base pose. Without
+            // it the camera sank to the root under the ledge and its arm,
+            // cast from inside the ledge, pulled it up to his legs.
             const k2::engine::transform& w = player->node->world();
-            cam.pos[0] = w.translate[0] - std::sin(cam.yaw) * follow_dist;
-            cam.pos[1] = w.translate[1] + follow_height;
-            cam.pos[2] = w.translate[2] + std::cos(cam.yaw) * follow_dist;
+            static float prime_base = -1e30f;
+            if (prime_base < -1e29f) {
+                float pb[3];
+                prime_base = (player->loco_ok[LOCO_BASE] && clip_joint(*player, player->loco[LOCO_BASE], 0, 1, pb))
+                             ? pb[1] : 0.0f;
+            }
+            const float lift = player->cur.size() > 1 ? player->cur[1].translate[1] - prime_base : 0.0f;
+            const float body[3] = { w.translate[0], w.translate[1] + std::max(-2.0f, std::min(2.5f, lift)), w.translate[2] };
+            cam.pos[0] = body[0] - std::sin(cam.yaw) * follow_dist;
+            cam.pos[1] = body[1] + follow_height;
+            cam.pos[2] = body[2] + std::cos(cam.yaw) * follow_dist;
             // Keep the camera on the Prince's side of any wall: cast the arm
             // from his head and stop short of the first surface it meets. A
             // stand-in until CameraLogic / camera.dat are reversed. Under a low
@@ -6553,12 +6650,12 @@ int main(int argc, char** argv) {
                 const int32_t held = (crates.state != crate_ctl::NONE && crates.crate)
                                      ? crates.crate->coll_node() : -1;
                 if (held >= 0) sc.coll.set_node_enabled(held, false);
-                const float head[3] = { w.translate[0], w.translate[1] + 1.5f, w.translate[2] };
+                const float head[3] = { body[0], body[1] + 1.5f, body[2] };
                 const float heights[3] = { follow_height, 1.5f, 0.9f };
                 float best_pos[3] = { cam.pos[0], cam.pos[1], cam.pos[2] };
                 float best_len = -1.0f;
                 for (int hi = 0; hi < 3; ++hi) {
-                    const float target[3] = { cam.pos[0], w.translate[1] + heights[hi], cam.pos[2] };
+                    const float target[3] = { cam.pos[0], body[1] + heights[hi], cam.pos[2] };
                     const float arm[3] = { target[0] - head[0], target[1] - head[1], target[2] - head[2] };
                     const float len = std::sqrt(arm[0]*arm[0] + arm[1]*arm[1] + arm[2]*arm[2]);
                     if (len < 1e-4f) continue;
