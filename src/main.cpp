@@ -1973,7 +1973,7 @@ public:
 
     mode_t mode;
     float  pos[3];      // TRIPOD: where; FOLLOW: offset from the Prince
-    float  look[3];     // TRIPOD: at what; FOLLOW: direction
+    float  look[3];     // TRIPOD: at what; FOLLOW: what it looks at, also from the Prince
 
 private:
     // One "( ... )" group from `at`: "@Node" or "x,y,z". A node that is a
@@ -6589,7 +6589,7 @@ int main(int argc, char** argv) {
                 } else {
                     for (int k = 0; k < 3; ++k) {
                         cam.pos[k] = w.translate[k] + camera_msgs.pos[k];
-                        at[k] = cam.pos[k] + camera_msgs.look[k];
+                        at[k] = w.translate[k] + camera_msgs.look[k];
                     }
                 }
                 const float d[3] = { at[0] - cam.pos[0], at[1] - cam.pos[1], at[2] - cam.pos[2] };
