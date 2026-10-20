@@ -793,6 +793,11 @@ struct scene {
         pickup_def() : actor(-1) {}
     };
     std::vector<pickup_def> pickups;
+    // Water traps' outlines: the surface mesh's triangles in xz (both
+    // windings), the region Water__Update (0x48C601) tests the Prince
+    // against - not the trap's box.
+    struct water_area { size_t trap; std::vector<float> tris; float mn[2], mx[2]; };
+    std::vector<water_area> waters;
     // Trap actors' skills, loaded on first use: "actor/skill" lower-case.
     std::map<std::string, assets::skl_file*> trap_skills;
     // Hand-held weapons (Geometry/Utils/WEAPONS.K2A, OtherWeapons.K2A), by
@@ -1459,6 +1464,7 @@ void scene_reset(scene& sc) {
     sc.script.clear();
     for (size_t i = 0; i < sc.traps.size(); ++i) delete sc.traps[i];
     sc.traps.clear();
+    sc.waters.clear();
     g_effect_traps.clear();
     sc.areas.clear();
     sc.plates.clear();
@@ -2393,6 +2399,19 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
                     st->actor = (n.trap.argv.size() > 1 && !n.trap.argv[1].empty())
                                 ? n.trap.argv[1] : std::string("TRAP_Door");
                 t = st;
+            }
+            if (n.trap.name == "Water") {
+                scene::water_area wa;
+                wa.trap = sc.traps.size();
+                wa.mn[0] = wa.mn[1] = 1e30f; wa.mx[0] = wa.mx[1] = -1e30f;
+                for (size_t q = 0; q + 2 < ib.size(); q += 3)
+                    for (int c = 0; c < 3; ++c) {
+                        const assets::k2a_vertex& v = vb[ib[q + size_t(c)]];
+                        wa.tris.push_back(v.x); wa.tris.push_back(v.z);
+                        wa.mn[0] = std::min(wa.mn[0], v.x); wa.mx[0] = std::max(wa.mx[0], v.x);
+                        wa.mn[1] = std::min(wa.mn[1], v.z); wa.mx[1] = std::max(wa.mx[1], v.z);
+                    }
+                sc.waters.push_back(wa);
             }
             sc.traps.push_back(t);
             // A spawn trap's messages are its actor's (EnemyStart__ctor knows
@@ -3887,16 +3906,20 @@ bool hang_try_climb(hang_ctl& hc, actor_inst& a, const k2::engine::collision_wor
 
 // --- swimming -----------------------------------------------------------------
 //
-// Water is a Water trap: a flat sheet at the surface (its box has no height)
-// over the area it covers; below it is water. The Prince swims once his feet
-// are more than SWIM_ENTER under the surface (StStartSwimming, 0x4B8A7B):
+// Water is a Water trap: a flat sheet at the surface over the outline of its
+// mesh; below it is water. The Prince swims once his feet are more than
+// SWIM_ENTER under the surface (StStartSwimming, 0x4B8A7B):
 // on the surface (SwimOnSurface_G / SwimAmbientOnSurface_G) or, after a dive
 // (StStartSubmerging, 0x4B8FB0, SwimAmbientDive_G), under it
 // (SwimUnderWater_G / SwimAmbientUnderWater_G) on one bottle of air.
 // Depths, speeds and the air time are ours; the K2SwimActivity that holds
 // the original's is not traced.
 namespace swim_tuning {
-const float  SWIM_ENTER = 1.0f;     // feet this far under the surface: swim
+// Prince__DeepEnoughToSwim (0x4D0D98): a joint (the pelvis, our reading)
+// at least 1.8 - 1.0 + 0.05 = 0.85 under the surface; with the pelvis 1.03
+// above the feet, water about 1.9 deep. Shallower water - the basins under
+// the spouts and showers - is walked through.
+const float  SWIM_ENTER = 0.85f + 1.03f;
 const float  FLOAT      = 1.3f;     // feet under the surface while on it
 const float  SPEED      = 1.6f;     // m/s when the clip carries no travel
 const float  VSPEED     = 1.6f;     // m/s up or down, under water
@@ -3913,12 +3936,25 @@ struct swim_ctl {
 // feet whose area holds p.
 bool water_surface(scene& sc, const float* p, float& surf) {
     bool found = false;
-    for (size_t i = 0; i < sc.traps.size(); ++i) {
-        const scene_trap* t = dynamic_cast<const scene_trap*>(sc.traps[i]);
-        if (!t || t->type != "Water") continue;
+    for (size_t w = 0; w < sc.waters.size(); ++w) {
+        const scene::water_area& wa = sc.waters[w];
+        const scene_trap* t = dynamic_cast<const scene_trap*>(sc.traps[wa.trap]);
+        if (!t) continue;
         const float* o = t->offset();
-        if (p[0] < t->box[0] + o[0] || p[0] > t->box[3] + o[0] ||
-            p[2] < t->box[2] + o[2] || p[2] > t->box[5] + o[2]) continue;
+        const float x = p[0] - o[0], z = p[2] - o[2];
+        if (x < wa.mn[0] || x > wa.mx[0] || z < wa.mn[1] || z > wa.mx[1]) continue;
+        bool inside = false;
+        for (size_t i = 0; i + 5 < wa.tris.size() && !inside; i += 6) {
+            const float* tr = &wa.tris[i];
+            float sgn[3];
+            for (int e = 0; e < 3; ++e) {
+                const float ax = tr[e * 2], az = tr[e * 2 + 1];
+                const float bx = tr[((e + 1) % 3) * 2], bz = tr[((e + 1) % 3) * 2 + 1];
+                sgn[e] = (bx - ax) * (z - az) - (bz - az) * (x - ax);
+            }
+            inside = (sgn[0] >= 0 && sgn[1] >= 0 && sgn[2] >= 0) || (sgn[0] <= 0 && sgn[1] <= 0 && sgn[2] <= 0);
+        }
+        if (!inside) continue;
         const float y = t->box[4] + o[1];
         if (y < p[1] - 0.05f) continue;
         if (!found || y > surf) surf = y;
