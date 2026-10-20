@@ -1937,6 +1937,10 @@ public:
         m_positional = false;
         if (argv.size() > 1) k2::engine::parse_trap_bool(argv[1], use_radius);
         if (argv.size() > 2) k2::engine::parse_trap_bool(argv[2], m_positional);
+        // Ambiences that use their trap's radius (RiverAudio, TortureAmbients,
+        // SolitarySinger, Showeraudio) are heard around the trap, not
+        // everywhere: placed at it.
+        if (use_radius) m_positional = true;
         m_sound = argv.size() > 3 ? argv[3] : std::string();
         for (int k = 0; k < 3; ++k) m_pos[k] = (bbox[k] + bbox[k + 3]) * 0.5f;
         const float dx = bbox[3] - bbox[0], dz = bbox[5] - bbox[2];
@@ -1965,7 +1969,10 @@ public:
         if (trap_object::handle(msg, sender)) return true;
         if (msg.find(':') != std::string::npos || msg.find(',') != std::string::npos) return false;
         if (g_mixer && m_voice) g_mixer->stop(m_voice);
-        m_voice = play_sound(msg, m_positional ? m_pos : 0, m_radius, true);
+        // A sound named by a script plays once, here (the floor plate's
+        // "ShowerAud01,L01showerrun001"); looping it kept the shower
+        // running everywhere for the rest of the level.
+        m_voice = play_sound(msg, m_pos, m_radius, false);
         return m_voice != 0 || !g_mixer;
     }
 
