@@ -44,9 +44,17 @@ public:
 
     void clear();
 
-    // World-space triangles: xyz triples and index triples.
+    // World-space triangles: xyz triples and index triples. `node` is a
+    // handle from add_node, or -1 for geometry that never changes.
     void add_mesh(const float* xyz, size_t stride_floats, size_t vertex_count,
-                  const uint16_t* indices, size_t index_count);
+                  const uint16_t* indices, size_t index_count, int32_t node = -1);
+
+    // A trap's geometry, which scripts can switch off ("collide:F") or move
+    // ("move,..."). Its triangles stay out of the grid and are tested with the
+    // node's current offset.
+    int32_t add_node();
+    void set_node_enabled(int32_t node, bool enabled);
+    void set_node_offset(int32_t node, const float offset[3]);
 
     // Buckets triangles into a uniform XZ grid. Call after the last add_mesh.
     void build();
@@ -65,7 +73,12 @@ private:
     void cell_range(float mnx, float mnz, float mxx, float mxz,
                     int32_t& x0, int32_t& z0, int32_t& x1, int32_t& z1) const;
 
+    struct node_state { bool enabled; float offset[3]; };
+
     std::vector<float>                  m_tris;     // 9 floats per triangle
+    std::vector<int32_t>                m_tri_node; // per triangle, -1 for static
+    std::vector<uint32_t>               m_dynamic;  // triangles with a node
+    std::vector<node_state>             m_nodes;
     float                               m_cell;
     float                               m_min[2];
     int32_t                             m_nx, m_nz;

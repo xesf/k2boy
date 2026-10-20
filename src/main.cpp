@@ -16,12 +16,14 @@
 #include "engine/module.h"
 #include "engine/collision.h"
 #include "engine/trap.h"
+#include "engine/script.h"
 
 #include <cstdio>
 #include <cstring>
 #include <cmath>
 #include <algorithm>
 #include <vector>
+#include <map>
 #include <string>
 
 using namespace k2;
@@ -618,6 +620,8 @@ struct draw_item {
     int             joint;          // index into actor_inst::joint_*; -1 if unbound
     float           center[3];      // world centroid, for back-to-front sorting
     float           tint[3];        // filled by assign_trap_colors once the scene is loaded
+    bool            hidden;         // a trap made invisible (argv[0] or "visible:F")
+    float           offset[3];      // a trap moved by script ("move,...")
 };
 
 // A spawned actor's drawable form: where it is, and which items are its body.
@@ -677,6 +681,10 @@ struct scene {
     // Static room triangles, for the pick primitive (0x512183). Actor bodies
     // and trigger volumes are not in it.
     k2::engine::collision_world coll;
+    // The trap message system: every trap node in the loaded rooms, by name.
+    k2::engine::script_world               script;
+    std::vector<k2::engine::trap_object*>  traps;   // owned
+    std::vector<k2::engine::area_trap*>    areas;   // also in `traps`
     float mn[3];
     float mx[3];
     bool  empty;
@@ -947,6 +955,16 @@ void pose_actor(actor_inst& a) {
     }
 }
 
+// Room geometry is world-space; a trap moved by script draws at its offset.
+void set_item_model(const draw_item& di) {
+    float m[16];
+    mat4_identity(m);
+    m[12] = di.offset[0];
+    m[13] = di.offset[1];
+    m[14] = di.offset[2];
+    gfx::set_model(m);
+}
+
 void transform_from_pos_quat(const float* pos, const float* q, k2::engine::transform& t) {
     const float w = q[0], x = q[1], y = q[2], z = q[3];
     t.rotate[0]=1-2*(y*y+z*z); t.rotate[1]=  2*(x*y-w*z); t.rotate[2]=  2*(x*z+w*y);
@@ -1147,12 +1165,91 @@ void scene_reset(scene& sc) {
     sc.root->name = "LevelRoot";
     sc.spawn_points.clear();
     sc.coll.clear();
+    sc.script.clear();
+    for (size_t i = 0; i < sc.traps.size(); ++i) delete sc.traps[i];
+    sc.traps.clear();
+    sc.areas.clear();
     sc.empty = true;
     sc.mn[0] = sc.mn[1] = sc.mn[2] =  1e30f;
     sc.mx[0] = sc.mx[1] = sc.mx[2] = -1e30f;
 }
 
 // Parses one .K2A and appends its meshes to `sc`, growing the bounds.
+// A trap node in a room. The base handles reset / state / enable / visible /
+// collide (0x4552B7); this adds what those mean for drawing and collision, and
+// the "move" message Force, Mover and Generic traps understand (0x4722E7).
+class scene_trap : public k2::engine::trap_object {
+public:
+    scene_trap(k2::engine::script_world& w, const std::string& name,
+               const k2::engine::trap_header& h, scene& sc, int item, int32_t coll_node)
+        : trap_object(w, name, h), m_sc(sc), m_item(item), m_node(coll_node), m_moving(false) {
+        m_base[0] = m_base[1] = m_base[2] = 0.0f;
+    }
+
+    void set_visible(bool b) {
+        trap_object::set_visible(b);
+        if (m_item >= 0) m_sc.items[size_t(m_item)].hidden = !b;
+    }
+    void set_collideable(bool b) {
+        trap_object::set_collideable(b);
+        m_sc.coll.set_node_enabled(m_node, b);
+    }
+    bool handle(const std::string& msg, k2::engine::script_target* sender) {
+        if (msg.size() > 5 && (msg.compare(0, 5, "move,") == 0 || msg.compare(0, 5, "Move,") == 0)) {
+            k2::engine::translate_motion m;
+            if (!m.parse(msg.substr(5))) return false;
+            m.begin(m_world.now());
+            m_motion = m;
+            m_moving = true;
+            return true;
+        }
+        return trap_object::handle(msg, sender);
+    }
+
+    void update(double now) {
+        if (!m_moving) return;
+        const double f = m_motion.fraction(now);
+        float off[3];
+        for (int k = 0; k < 3; ++k) off[k] = m_base[k] + float(m_motion.dir[k] * f);
+        apply(off);
+        if (m_motion.done(now)) {
+            for (int k = 0; k < 3; ++k) m_base[k] = off[k];
+            m_moving = false;
+        }
+    }
+
+private:
+    void apply(const float* off) {
+        if (m_item >= 0)
+            for (int k = 0; k < 3; ++k) m_sc.items[size_t(m_item)].offset[k] = off[k];
+        m_sc.coll.set_node_offset(m_node, off);
+    }
+
+    scene&                        m_sc;
+    int                           m_item;
+    int32_t                       m_node;
+    bool                          m_moving;
+    float                         m_base[3];
+    k2::engine::translate_motion  m_motion;
+};
+
+// "prince": the messages the Prince takes from scripts. Only snooze (no input
+// for N seconds) is acted on; skills and weapons need the PrinceObject.
+class prince_target : public k2::engine::script_target {
+public:
+    explicit prince_target(k2::engine::script_world& w)
+        : script_target("prince"), m_world(w), snooze_until(0.0) {}
+    bool receive(const std::string& msg, k2::engine::script_target*) {
+        if (msg.compare(0, 7, "snooze:") == 0) {
+            snooze_until = m_world.now() + std::atof(msg.c_str() + 7);
+            return true;
+        }
+        return false;
+    }
+    k2::engine::script_world& m_world;
+    double snooze_until;
+};
+
 bool append_scene(const char* path, scene& sc, bool collide = true) {
     size_t size = 0;
     uint8_t* data = plat::fs_read_basename(path, size);
@@ -1242,7 +1339,9 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
         // must still be drawn normally. The pure trigger volumes are the ones
         // with no material at all; those are what rendered as black boxes,
         // because they fall through to their (black) vertex colours.
-        it.is_trap   = is_volume || hidden;
+        it.is_trap   = is_volume;
+        it.hidden    = hidden;
+        it.offset[0] = it.offset[1] = it.offset[2] = 0.0f;
         it.trap_type = -1;
         it.owner     = -1;
         it.joint     = -1;
@@ -1267,9 +1366,32 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
         if (!n.has_trap)                 solid = !it.transparent;
         else if (n.trap.name == "Generic") solid = hdr.collideable;
         else                             solid = hdr.collideable && !is_volume;
-        if (collide && solid)
+        // Trap geometry gets its own collision node, so scripts can switch it
+        // on and off and move it; it is added even when it starts non-solid.
+        int32_t node = -1;
+        if (collide && n.has_trap && !is_volume) {
+            node = sc.coll.add_node();
+            sc.coll.set_node_enabled(node, solid);
+        }
+        if (collide && (solid || node >= 0))
             sc.coll.add_mesh(&vb[0].x, sizeof(assets::k2a_vertex) / sizeof(float),
-                             vb.size(), &ib[0], ib.size());
+                             vb.size(), &ib[0], ib.size(), node);
+
+        // Every trap node becomes a script target under its node name.
+        if (collide && n.has_trap) {
+            k2::engine::trap_object* t;
+            if (n.trap.name == "Area") {
+                k2::engine::area_trap* a = new k2::engine::area_trap(
+                    sc.script, n.name, hdr, n.trap.argv, n.trap.bbox);
+                sc.areas.push_back(a);
+                t = a;
+            } else {
+                t = new scene_trap(sc.script, n.name, hdr, sc,
+                                   int(sc.items.size()) - 1, node);
+            }
+            sc.traps.push_back(t);
+            sc.script.add(t);
+        }
     }
     if (collide) sc.coll.build();
 
@@ -2119,6 +2241,9 @@ int main(int argc, char** argv) {
     bool autorun  = false;
     bool noanim   = false;
     bool noclip   = false;
+    bool noscript = false;
+    bool trapmsg  = false;
+    float fixed_dt = 0.0f;
     bool noskin = false;
     const char* pose_arg = 0;   // "Joint:degrees" - proves a joint drives its part        // draw parts at the actor transform, unbound
     bool skeletons_only = false;      // headless: hold forward, to test movement
@@ -2157,6 +2282,9 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--autorun") == 0) autowalk = autorun = true;
         else if (std::strcmp(argv[i], "--noanim") == 0) noanim = true;
         else if (std::strcmp(argv[i], "--noclip") == 0) noclip = true;
+        else if (std::strcmp(argv[i], "--noscript") == 0) noscript = true;
+        else if (std::strcmp(argv[i], "--trapmsg") == 0) trapmsg = true;
+        else if (std::strcmp(argv[i], "--fixeddt") == 0 && i + 1 < argc) fixed_dt = float(std::atof(argv[++i]));
         else if (std::strcmp(argv[i], "--noskin") == 0) noskin = true;
         else if (std::strcmp(argv[i], "--pose") == 0 && i + 1 < argc) pose_arg = argv[++i];
         else if (std::strcmp(argv[i], "--skeletons") == 0) skeletons_only = true;
@@ -2433,6 +2561,14 @@ int main(int argc, char** argv) {
                 std::printf("  no ground under the Prince within reach (spawn y %.3f)\n", p[1]);
         }
     }
+    // Scripts run on game time, which starts at zero with the level.
+    prince_target prince_msgs(sc.script);
+    sc.script.add(&prince_msgs);
+    sc.script.trace = trapmsg;
+    double game_time = 0.0;
+    std::printf("scripts: %zu traps, %zu areas%s\n", sc.traps.size(), sc.areas.size(),
+                noscript ? " (disabled by --noscript)" : "");
+
     bool   looking   = false;
     double last_time = plat::time_seconds();
 
@@ -2543,9 +2679,29 @@ int main(int argc, char** argv) {
         float dt = float(now - last_time);
         last_time = now;
         if (dt > 0.1f) dt = 0.1f;          // don't lurch after a stall
+        if (fixed_dt > 0.0f) dt = fixed_dt; // headless runs: game time per frame
 
         float fwd[3], right[3];
         camera_basis(cam, fwd, right);
+
+        // Trap scripts: delays come due, Areas test the Prince, movers move.
+        // Only the Prince is tested against Areas; the original tests every
+        // character, but enemies do not move yet.
+        game_time += dt;
+        if (!noscript) {
+            sc.script.update(game_time);
+            const float* pp = 0;
+            for (size_t i = 0; i < sc.actors.size(); ++i)
+                if (!sc.actors[i].is_enemy) { pp = sc.actors[i].node->local.translate; break; }
+            const bool action = follow_mode && down[plat::KEY_SPACE];
+            for (size_t i = 0; i < sc.areas.size(); ++i)
+                sc.areas[i]->update(game_time, pp && sc.areas[i]->contains(pp), action);
+            for (size_t i = 0; i < sc.traps.size(); ++i) {
+                scene_trap* st = dynamic_cast<scene_trap*>(sc.traps[i]);
+                if (st) st->update(game_time);
+            }
+        }
+        const bool snoozed = !noscript && game_time < prince_msgs.snooze_until;
 
         // Two control modes. Follow mode drives the Prince and puts the camera
         // behind him, which is what the game does; free-fly drives the camera
@@ -2558,10 +2714,12 @@ int main(int argc, char** argv) {
         }
 
         float mv[3] = {0.0f, 0.0f, 0.0f};
+        if (!(player && snoozed)) {
         if (down[plat::KEY_W] || autowalk) for (int a = 0; a < 3; ++a) mv[a] += fwd[a];
         if (down[plat::KEY_S]) for (int a = 0; a < 3; ++a) mv[a] -= fwd[a];
         if (down[plat::KEY_D]) for (int a = 0; a < 3; ++a) mv[a] += right[a];
         if (down[plat::KEY_A]) for (int a = 0; a < 3; ++a) mv[a] -= right[a];
+        }
 
         if (player) {
             // Movement is horizontal: the Prince walks, he does not fly. There
@@ -2708,10 +2866,12 @@ int main(int argc, char** argv) {
             // not deciding visibility and something else is.
             const size_t i = rev_draw ? sc.items.size() - 1 - n : n;
             if (sc.items[i].transparent || sc.items[i].is_trap) continue;
-            if (sc.items[i].owner >= 0) continue;
+            if (sc.items[i].owner >= 0 || sc.items[i].hidden) continue;
+            set_item_model(sc.items[i]);
             gfx::set_texture(sc.items[i].tex);
             gfx::draw(sc.items[i].mesh);
         }
+        gfx::set_model(model);
 
         // Actors: same material rules as room geometry, but each is drawn under
         // its own transform, which is what the room meshes never need. Stands in
@@ -2769,7 +2929,7 @@ int main(int argc, char** argv) {
             order.clear();
             for (size_t i = 0; i < sc.items.size(); ++i) {
                 const draw_item& di = sc.items[i];
-                if (!di.transparent || di.is_trap || di.owner >= 0) continue;
+                if (!di.transparent || di.is_trap || di.owner >= 0 || di.hidden) continue;
                 const float dx = di.center[0] - cam.pos[0];
                 const float dy = di.center[1] - cam.pos[1];
                 const float dz = di.center[2] - cam.pos[2];
@@ -2778,9 +2938,11 @@ int main(int argc, char** argv) {
             std::sort(order.begin(), order.end());
             for (size_t k = order.size(); k-- > 0; ) {
                 const draw_item& di = sc.items[order[k].second];
+                set_item_model(di);
                 gfx::set_texture(di.tex);
                 gfx::draw(di.mesh);
             }
+            gfx::set_model(model);
         }
 
         // Trigger volumes last: coloured wireframe, one colour per trap type.
@@ -2833,6 +2995,12 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (!sc.script.unhandled().empty()) {
+        std::printf("scripts: messages not acted on (target,verb -> count)\n");
+        for (std::map<std::string, int>::const_iterator it = sc.script.unhandled().begin();
+             it != sc.script.unhandled().end(); ++it)
+            std::printf("  %-48s %d\n", it->first.c_str(), it->second);
+    }
     gfx::shutdown();
     plat::shutdown();
     return 0;

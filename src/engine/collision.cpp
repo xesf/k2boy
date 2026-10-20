@@ -10,18 +10,39 @@ namespace engine {
 
 void collision_world::clear() {
     m_tris.clear();
+    m_tri_node.clear();
+    m_dynamic.clear();
+    m_nodes.clear();
     m_grid.clear();
     m_built = false;
 }
 
+int32_t collision_world::add_node() {
+    node_state n;
+    n.enabled = true;
+    n.offset[0] = n.offset[1] = n.offset[2] = 0.0f;
+    m_nodes.push_back(n);
+    return int32_t(m_nodes.size() - 1);
+}
+
+void collision_world::set_node_enabled(int32_t node, bool enabled) {
+    if (node >= 0 && size_t(node) < m_nodes.size()) m_nodes[size_t(node)].enabled = enabled;
+}
+
+void collision_world::set_node_offset(int32_t node, const float offset[3]) {
+    if (node < 0 || size_t(node) >= m_nodes.size()) return;
+    for (int k = 0; k < 3; ++k) m_nodes[size_t(node)].offset[k] = offset[k];
+}
+
 void collision_world::add_mesh(const float* xyz, size_t stride, size_t vcount,
-                               const uint16_t* idx, size_t icount) {
+                               const uint16_t* idx, size_t icount, int32_t node) {
     for (size_t i = 0; i + 2 < icount; i += 3) {
         const uint16_t a = idx[i], b = idx[i + 1], c = idx[i + 2];
         if (a >= vcount || b >= vcount || c >= vcount) continue;
         const float* v[3] = { xyz + a * stride, xyz + b * stride, xyz + c * stride };
         for (int k = 0; k < 3; ++k)
             for (int j = 0; j < 3; ++j) m_tris.push_back(v[k][j]);
+        m_tri_node.push_back(node);
     }
     m_built = false;
 }
@@ -56,8 +77,10 @@ void collision_world::build() {
     m_nx = int32_t((mx[0] - mn[0]) / m_cell) + 1;
     m_nz = int32_t((mx[1] - mn[1]) / m_cell) + 1;
     m_grid.resize(size_t(m_nx) * size_t(m_nz));
+    m_dynamic.clear();
 
     for (size_t t = 0; t < n; ++t) {
+        if (m_tri_node[t] >= 0) { m_dynamic.push_back(uint32_t(t)); continue; }
         const float* p = &m_tris[t * 9];
         float tmn[2] = { p[0], p[2] }, tmx[2] = { p[0], p[2] };
         for (int k = 1; k < 3; ++k) {
@@ -128,6 +151,19 @@ bool collision_world::pick(const float o[3], const float d[3], float max_t,
                 }
             }
         }
+    // Trap geometry: brute force, each triangle shifted by its node's offset,
+    // which is the same as casting the ray from origin - offset.
+    for (size_t i = 0; i < m_dynamic.size(); ++i) {
+        const uint32_t t = m_dynamic[i];
+        const node_state& ns = m_nodes[size_t(m_tri_node[t])];
+        if (!ns.enabled) continue;
+        const float lo[3] = { o[0] - ns.offset[0], o[1] - ns.offset[1], o[2] - ns.offset[2] };
+        float tt;
+        if (ray_triangle(t, lo, d, max_t, front_only, tt) && tt < best) {
+            best = tt;
+            best_tri = int32_t(t);
+        }
+    }
     if (best_tri < 0) return false;
 
     // Face normal from the triangle's vertices, oriented toward the ray origin.

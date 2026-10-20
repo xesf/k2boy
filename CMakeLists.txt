@@ -35,6 +35,7 @@ set(K2_SOURCES
     src/engine/module_table.cpp
     src/engine/collision.cpp
     src/engine/trap.cpp
+    src/engine/script.cpp
 )
 
 if(APPLE)
