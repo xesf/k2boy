@@ -90,7 +90,7 @@ void verify_data() {
         "Geometry/Rooms/Cistern/cistern.lvl",
     };
 
-    std::printf("VFS indexed %zu files\n", plat::fs_file_count());
+    std::printf("VFS mounted (%zu files indexed so far)\n", plat::fs_file_count());
     for (size_t i = 0; i < sizeof(probes) / sizeof(probes[0]); ++i) {
         char real[4096];
         const bool ok = plat::fs_resolve(probes[i], real, sizeof(real));
@@ -960,6 +960,11 @@ gfx::texture_id load_image_texture(const std::string& path, bool chroma, bool& h
         if (img.rgba[i] != 255) { e.has_alpha = true; break; }
     g_texture_cache[key] = e;
     g_texture_bytes += img.rgba.size();
+    if (std::getenv("K2_TEXLIST")) {
+        char real[1024] = "";
+        plat::fs_resolve_basename(path.c_str(), real, sizeof(real));
+        std::printf("tex %s %dx%d %s\n", key.c_str(), img.width, img.height, real);
+    }
     if (pre != g_decoded_images.end()) g_decoded_images.erase(pre);   // uploaded: the CPU copy can go
     return e.tex;
 }
@@ -1392,6 +1397,17 @@ std::string actor_dir_for(const std::string& act_name) {
     for (size_t i = 0; i < base.size(); ++i)
         if (base[i] >= 'A' && base[i] <= 'Z') base[i] = char(base[i] - 'A' + 'a');
 
+    // They live at Actors/<name>/<name>.act or Geometry/Enemies/<name>/:
+    // tried first, so a level does not need the whole install indexed.
+    {
+        const std::string stem = base.size() > 4 ? base.substr(0, base.size() - 4) : base;
+        static const char* roots[] = { "actors/", "geometry/enemies/", 0 };
+        for (int r = 0; roots[r]; ++r) {
+            const std::string dir = std::string(roots[r]) + stem + "/";
+            char real[1024];
+            if (plat::fs_probe((dir + base).c_str(), real, sizeof(real))) return dir;
+        }
+    }
     std::vector<std::string> acts;
     plat::fs_list_paths_by_extension(".act", acts);
     for (size_t i = 0; i < acts.size(); ++i) {
@@ -2303,8 +2319,8 @@ std::map<std::string, assets::k2a_file> g_parsed_k2a;
 
 bool read_k2a(const char* path, assets::k2a_file& f) {
     size_t size = 0;
-    uint8_t* data = plat::fs_read_basename(path, size);
-    if (!data) data = plat::fs_read(path, size);
+    uint8_t* data = std::strchr(path, '/') || std::strchr(path, '\\') ? plat::fs_read(path, size) : 0;
+    if (!data) data = plat::fs_read_basename(path, size);
     if (!data) return false;
     std::string err;
     const bool ok = assets::k2a_parse(data, size, f, &err);
@@ -2869,11 +2885,18 @@ bool ground_under(const k2::engine::collision_world& w, const float* p, float& y
 int spawn_prop(scene& sc, const assets::k2a_trap& t, const std::string& who,
                const std::string& script_name) {
     static std::vector<std::string> k2as;
-    if (k2as.empty()) plat::fs_list_paths_by_extension(".k2a", k2as);
     const std::string dir = actor_dir_for(who + ".act");
     if (dir.empty()) { std::printf("  prop %s: no actor %s\n", t.node.c_str(), who.c_str()); return -1; }
     std::string geo;
-    for (size_t k = 0; k < k2as.size(); ++k)
+    {
+        // <dir>/<who>.k2a, the usual case, without listing the install.
+        std::string lw = who;
+        for (size_t i = 0; i < lw.size(); ++i) lw[i] = char(std::tolower(static_cast<unsigned char>(lw[i])));
+        char real[1024];
+        if (plat::fs_probe((dir + lw + ".k2a").c_str(), real, sizeof(real))) geo = dir + lw + ".k2a";
+    }
+    if (geo.empty() && k2as.empty()) plat::fs_list_paths_by_extension(".k2a", k2as);
+    for (size_t k = 0; geo.empty() && k < k2as.size(); ++k)
         if (k2as[k].size() > dir.size() && k2as[k].compare(0, dir.size(), dir) == 0 &&
             k2as[k].find('/', dir.size()) == std::string::npos) { geo = k2as[k]; break; }
     if (geo.empty()) { std::printf("  prop %s: %s has no .k2a\n", t.node.c_str(), who.c_str()); return -1; }

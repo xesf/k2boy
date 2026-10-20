@@ -208,6 +208,10 @@ bool fs_mount(const char* root_path);
 // Writes a native absolute path into `out`. False if no such file.
 bool fs_resolve(const char* path, char* out, size_t out_size);
 
+// As fs_resolve, but a miss is only a miss: it never sets off indexing the
+// whole install. For guesses at where a file might be.
+bool fs_probe(const char* path, char* out, size_t out_size);
+
 // Reads a whole file. Caller frees with fs_free. Null on failure.
 // The buffer is NUL-terminated past size_out, which the many text formats use.
 uint8_t* fs_read(const char* path, size_t& size_out);

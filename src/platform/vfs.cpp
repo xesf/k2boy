@@ -157,6 +157,116 @@ void index_dir(const std::string& abs, const std::string& rel) {
 
 } // namespace
 
+// --- on-demand lookups -------------------------------------------------------------
+//
+// The full index costs a walk of every directory in the install - seconds
+// on a memory card. Until something needs it, paths are opened directly
+// (the Vita's and the Mac's file systems ignore case, so the data's own
+// mixed-case names resolve as written), and a name alone is looked for in
+// the directories recent lookups touched, listing each of those once. The
+// full walk happens only on a miss, or for a listing; its result is cached.
+
+namespace {
+
+bool g_indexed = false;
+// The file system ignores case (the Vita's, the Mac's by default): then a
+// full path that does not open as written is simply not there, and needs
+// no index to say so.
+bool g_case_blind = false;
+
+// Lookups come from the loading workers too: one at a time. A platform
+// semaphore, as the Vita's workers are not pthreads.
+sema g_lock = 0;
+struct vfs_guard {
+    vfs_guard() { if (!g_lock) g_lock = sema_create(1); sema_wait(g_lock); }
+    ~vfs_guard() { sema_signal(g_lock, 1); }
+};
+
+struct dir_listing {
+    std::string abs;
+    bool listed;
+    std::unordered_map<std::string, std::string> names;     // lower case -> as on disk
+    dir_listing() : listed(false) {}
+};
+std::unordered_map<std::string, dir_listing> g_dirs;        // by lower-case relative dir
+std::vector<std::string> g_recent;                           // most recent first
+
+std::string lower(std::string s) {
+    for (size_t i = 0; i < s.size(); ++i) if (s[i] >= 'A' && s[i] <= 'Z') s[i] = char(s[i] - 'A' + 'a');
+    return s;
+}
+
+// Separators fixed, case kept.
+std::string as_written(const char* path) {
+    std::string out;
+    bool prev = false;
+    for (const char* p = path; *p; ++p) {
+        char c = *p == '\\' ? '/' : *p;
+        if (c == '/') { if (prev) continue; prev = true; } else prev = false;
+        out.push_back(c);
+    }
+    while (!out.empty() && out[0] == '/') out.erase(0, 1);
+    if (out.compare(0, 2, "./") == 0) out.erase(0, 2);
+    return out;
+}
+
+void note_dir(const std::string& rel_dir) {
+    const std::string key = lower(rel_dir);
+    dir_listing& d = g_dirs[key];
+    if (d.abs.empty()) d.abs = rel_dir.empty() ? g_root : g_root + "/" + rel_dir;
+    std::vector<std::string>::iterator it = std::find(g_recent.begin(), g_recent.end(), key);
+    if (it != g_recent.end()) g_recent.erase(it);
+    g_recent.insert(g_recent.begin(), key);
+    if (g_recent.size() > 24) g_recent.pop_back();
+    // The install's top level (the font, GameText.txt) stays searchable.
+    if (key != "" && std::find(g_recent.begin(), g_recent.end(), std::string()) == g_recent.end())
+        g_recent.push_back(std::string());
+}
+
+bool find_in_dir(dir_listing& d, const std::string& lname, std::string& out) {
+    if (!d.listed) {
+        d.listed = true;
+        if (DIR* dd = ::opendir(d.abs.c_str())) {
+            while (struct dirent* e = ::readdir(dd)) d.names.emplace(lower(e->d_name), e->d_name);
+            ::closedir(dd);
+        }
+    }
+    std::unordered_map<std::string, std::string>::const_iterator it = d.names.find(lname);
+    if (it == d.names.end()) return false;
+    out = d.abs + "/" + it->second;
+    return true;
+}
+
+// An actor's images sit in its Textures folder (Actors/rat/Textures/rat.bmp).
+bool find_in_textures(const std::string& dir_key, const std::string& lname, std::string& out) {
+    dir_listing& d = g_dirs[dir_key];
+    std::string sub;
+    if (!find_in_dir(d, "textures", sub)) return false;
+    const std::string key = dir_key.empty() ? std::string("textures") : dir_key + "/textures";
+    dir_listing& t = g_dirs[key];
+    if (t.abs.empty()) t.abs = sub;
+    return find_in_dir(t, lname, out);
+}
+
+void ensure_index(const char* why) {
+    if (g_indexed) return;
+    g_indexed = true;
+    std::printf("vfs: indexing the install (%s)\n", why);
+    g_index.clear();
+    g_by_name.clear();
+    g_order.clear();
+    index_dir(g_root, std::string());
+    if (!g_index.empty()) save_index_cache(user_dir() + "/vfs-index.txt",
+                                           "k2boy vfs 1 " + g_root + " " + root_signature(g_root));
+}
+
+bool regular_file(const std::string& abs) {
+    struct stat st;
+    return ::stat(abs.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+}
+
+} // namespace
+
 bool fs_mount(const char* root_path) {
     if (!root_path || !*root_path) return false;
 
@@ -170,23 +280,71 @@ bool fs_mount(const char* root_path) {
     g_index.clear();
     g_by_name.clear();
     g_order.clear();
+    g_dirs.clear();
+    g_recent.clear();
+    note_dir(std::string());
     const std::string cache = user_dir() + "/vfs-index.txt";
     const std::string header = "k2boy vfs 1 " + g_root + " " + root_signature(g_root);
-    if (load_index_cache(cache, header)) return true;
-    g_index.clear();
-    g_by_name.clear();
-    g_order.clear();
-    index_dir(g_root, std::string());
-    if (!g_index.empty()) save_index_cache(cache, header);
-    return !g_index.empty();
+    g_indexed = load_index_cache(cache, header);
+    // A name at the top with its case flipped: if it still opens, case does not matter here.
+    g_case_blind = false;
+    if (DIR* d = ::opendir(g_root.c_str())) {
+        while (struct dirent* e = ::readdir(d)) {
+            std::string n = e->d_name, f = n;
+            bool letters = false;
+            for (size_t i = 0; i < f.size(); ++i) {
+                if (f[i] >= 'a' && f[i] <= 'z') { f[i] = char(f[i] - 'a' + 'A'); letters = true; }
+                else if (f[i] >= 'A' && f[i] <= 'Z') { f[i] = char(f[i] - 'A' + 'a'); letters = true; }
+            }
+            if (!letters || n == "." || n == "..") continue;
+            struct stat a, b;
+            g_case_blind = ::stat((g_root + "/" + f).c_str(), &b) == 0 && ::stat((g_root + "/" + n).c_str(), &a) == 0;
+            break;
+        }
+        ::closedir(d);
+    }
+    if (!g_indexed) { g_index.clear(); g_by_name.clear(); g_order.clear(); }
+    return true;
+}
+
+namespace {
+bool resolve_direct(const char* path, char* out, size_t out_size) {
+    const std::string rel = as_written(path);
+    const std::string abs = g_root + "/" + rel;
+    if (!regular_file(abs) || abs.size() + 1 > out_size) return false;
+    const size_t slash = rel.find_last_of('/');
+    note_dir(slash == std::string::npos ? std::string() : rel.substr(0, slash));
+    std::memcpy(out, abs.c_str(), abs.size() + 1);
+    return true;
+}
+} // namespace
+
+bool fs_probe(const char* path, char* out, size_t out_size) {
+    if (!path || !out || out_size == 0) return false;
+    {
+        vfs_guard guard;
+        if (!g_indexed) return resolve_direct(path, out, out_size);
+    }
+    return fs_resolve(path, out, out_size);
 }
 
 bool fs_resolve(const char* path, char* out, size_t out_size) {
     if (!path || !out || out_size == 0) return false;
+    vfs_guard guard;
+    if (!g_indexed) {
+        if (resolve_direct(path, out, out_size)) return true;
+        if (g_case_blind) return false;
+        ensure_index(path);
+    }
 
     std::unordered_map<std::string, std::string>::const_iterator it =
         g_index.find(normalise(path));
     if (it == g_index.end()) return false;
+    {
+        const std::string rel = it->second.size() > g_root.size() + 1 ? it->second.substr(g_root.size() + 1) : std::string();
+        const size_t slash = rel.find_last_of('/');
+        note_dir(slash == std::string::npos ? std::string() : rel.substr(0, slash));
+    }
 
     if (it->second.size() + 1 > out_size) return false;
     std::memcpy(out, it->second.c_str(), it->second.size() + 1);
@@ -195,6 +353,7 @@ bool fs_resolve(const char* path, char* out, size_t out_size) {
 
 bool fs_resolve_basename(const char* name, char* out, size_t out_size) {
     if (!name || !out || out_size == 0) return false;
+    vfs_guard guard;
 
     // Take everything after the last separator, either kind.
     const char* base = name;
@@ -204,6 +363,22 @@ bool fs_resolve_basename(const char* name, char* out, size_t out_size) {
     std::string key(base);
     for (size_t i = 0; i < key.size(); ++i)
         if (key[i] >= 'A' && key[i] <= 'Z') key[i] = char(key[i] - 'A' + 'a');
+
+    // The directories just used first, indexed or not: a room's textures
+    // are beside it, and many names exist in several levels' folders
+    // (prison's grate.bmp is not Palace4's), which a whole-install lookup
+    // would pick between at random.
+    {
+        std::string found;
+        for (size_t i = 0; i < g_recent.size(); ++i)
+            if (find_in_dir(g_dirs[g_recent[i]], key, found) ||
+                find_in_textures(g_recent[i], key, found)) {
+                if (found.size() + 1 > out_size) return false;
+                std::memcpy(out, found.c_str(), found.size() + 1);
+                return true;
+            }
+        if (!g_indexed) ensure_index(name);
+    }
 
     std::unordered_map<std::string, std::string>::const_iterator it = g_by_name.find(key);
     if (it == g_by_name.end()) return false;
@@ -254,6 +429,8 @@ void fs_free(uint8_t* data) {
 void fs_list_by_extension(const char* ext, std::vector<std::string>& out) {
     out.clear();
     if (!ext || !*ext) return;
+    vfs_guard guard;
+    ensure_index(ext);
 
     std::string suffix(ext);
     for (size_t i = 0; i < suffix.size(); ++i)
@@ -271,6 +448,8 @@ void fs_list_by_extension(const char* ext, std::vector<std::string>& out) {
 void fs_list_paths_by_extension(const char* ext, std::vector<std::string>& out) {
     out.clear();
     if (!ext || !*ext) return;
+    vfs_guard guard;
+    ensure_index(ext);
 
     std::string suffix(ext);
     for (size_t i = 0; i < suffix.size(); ++i)
