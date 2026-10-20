@@ -5557,6 +5557,7 @@ int main(int argc, char** argv) {
     const bool fe_ok = use_menu && frontend.init([](const std::string& n) { return play_movie(n); });
     if (use_menu && !menu_in_game_only) {
         k2::engine::mixer fe_mixer(44100);
+        fe_mixer.set_volume(frontend.prefs().sound_volume);
         bool fe_audio = false;
         if (!mute) {
             g_mixer = &fe_mixer;
@@ -5799,6 +5800,7 @@ int main(int argc, char** argv) {
     // Scripts run on game time, which starts at zero with the level.
     // Sound: one mixer, the camera as listener. Headless shots stay silent.
     k2::engine::mixer game_mixer(44100);
+    if (fe_ok) game_mixer.set_volume(frontend.prefs().sound_volume);
     audio_target audio_msgs;
     sc.script.add(&audio_msgs);
     if (!shot_path && !mute) {
@@ -6032,6 +6034,7 @@ int main(int argc, char** argv) {
                     const ui::result r = frontend.game_menu(cur, ld);
                     for (int k = 0; k < plat::KEY_COUNT; ++k) down[k] = false;
                     classic = frontend.prefs().classic;
+                    game_mixer.set_volume(frontend.prefs().sound_volume);
                     if (r == ui::R_RESUME || r == ui::R_NONE) break;
                     if (r == ui::R_QUIT || r == ui::R_CLOSED) { running = false; break; }
                     std::vector<std::string> extra;
