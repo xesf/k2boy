@@ -23,6 +23,7 @@
 #include "assets/nif.h"
 #include "gfx/ttf.h"
 #include "media/mov.h"
+#include "media/svq1.h"
 
 #include <cstdio>
 #include <cstring>
@@ -5110,7 +5111,10 @@ int main(int argc, char** argv) {
     bool noanim   = false;
     bool noclip   = false;
     bool nif_check = false;
-    bool mov_info = false;       // list every movie's tracks and codecs
+    bool mov_info = false;
+    const char* mov_frame_file = 0;   // --movframe MOVIE N OUT.bmp: decode frames 0..N, save N
+    int mov_frame_index = 0;
+    const char* mov_frame_out = 0;       // list every movie's tracks and codecs
     const char* text_test = 0;   // render a string in Tsunami.ttf to a .bmp      // parse every .nif in the install and report
     bool noscript = false;
     bool autopush = false;
@@ -5167,6 +5171,9 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--noscript") == 0) noscript = true;
         else if (std::strcmp(argv[i], "--nifcheck") == 0) nif_check = true;
         else if (std::strcmp(argv[i], "--movinfo") == 0) mov_info = true;
+        else if (std::strcmp(argv[i], "--movframe") == 0 && i + 3 < argc) {
+            mov_frame_file = argv[++i]; mov_frame_index = std::atoi(argv[++i]); mov_frame_out = argv[++i];
+        }
         else if (std::strcmp(argv[i], "--texttest") == 0 && i + 1 < argc) text_test = argv[++i];
         else if (std::strcmp(argv[i], "--autopush") == 0) autopush = true;
         else if (std::strcmp(argv[i], "--autojump") == 0) autojump = true;
@@ -5249,6 +5256,28 @@ int main(int argc, char** argv) {
         }
         write_bmp(text_test, w, h, &img[0]);
         std::printf("text: wrote %s\n", text_test);
+        return 0;
+    }
+    if (mov_frame_file) {
+        media::xf_mov mv;
+        std::memset(&mv, 0, sizeof(mv));
+        if (media::xf_mov_open(&mv, mov_frame_file) != 0) { std::printf("movframe: cannot open\n"); return 1; }
+        media::xf_mov_track* vt = media::xf_mov_find(&mv, media::XF_TRACK_VIDEO);
+        if (!vt) { std::printf("movframe: no video\n"); return 1; }
+        media::svq1_decoder dec(vt->width, vt->height);
+        std::vector<uint8_t> buf;
+        int good = 0;
+        for (int f = 0; f <= mov_frame_index && uint32_t(f) < vt->sample_count; ++f) {
+            buf.resize(vt->sample_size[f]);
+            media::xf_mov_read_sample(&mv, vt, uint32_t(f), buf.empty() ? 0 : &buf[0]);
+            const bool okf = dec.decode(buf.empty() ? 0 : &buf[0], buf.size());
+            good += okf;
+            if (!okf && std::getenv("K2_MOVDBG")) std::printf("  frame %d failed (%zu bytes, first %02x %02x %02x %02x)\n", f, buf.size(),
+                buf.size() > 3 ? buf[0] : 0, buf.size() > 3 ? buf[1] : 0, buf.size() > 3 ? buf[2] : 0, buf.size() > 3 ? buf[3] : 0);
+        }
+        std::printf("movframe: %d of %d frames decoded\n", good, mov_frame_index + 1);
+        if (dec.rgba()) write_bmp(mov_frame_out, dec.width(), dec.height(), dec.rgba());
+        media::xf_mov_close(&mv);
         return 0;
     }
     if (mov_info) {
