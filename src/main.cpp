@@ -24,6 +24,7 @@
 #include "gfx/ttf.h"
 #include "media/mov.h"
 #include "media/svq1.h"
+#include "media/qdm2.h"
 
 #include <cstdio>
 #include <cstring>
@@ -5112,6 +5113,7 @@ int main(int argc, char** argv) {
     bool noclip   = false;
     bool nif_check = false;
     bool mov_info = false;
+    const char* mov_audio = 0;        // --movaudio MOVIE: decode its whole sound track, report
     const char* mov_frame_file = 0;   // --movframe MOVIE N OUT.bmp: decode frames 0..N, save N
     int mov_frame_index = 0;
     const char* mov_frame_out = 0;       // list every movie's tracks and codecs
@@ -5171,6 +5173,7 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--noscript") == 0) noscript = true;
         else if (std::strcmp(argv[i], "--nifcheck") == 0) nif_check = true;
         else if (std::strcmp(argv[i], "--movinfo") == 0) mov_info = true;
+        else if (std::strcmp(argv[i], "--movaudio") == 0 && i + 1 < argc) mov_audio = argv[++i];
         else if (std::strcmp(argv[i], "--movframe") == 0 && i + 3 < argc) {
             mov_frame_file = argv[++i]; mov_frame_index = std::atoi(argv[++i]); mov_frame_out = argv[++i];
         }
@@ -5277,6 +5280,39 @@ int main(int argc, char** argv) {
         }
         std::printf("movframe: %d of %d frames decoded\n", good, mov_frame_index + 1);
         if (dec.rgba()) write_bmp(mov_frame_out, dec.width(), dec.height(), dec.rgba());
+        media::xf_mov_close(&mv);
+        return 0;
+    }
+    if (mov_audio) {
+        media::xf_mov mv;
+        std::memset(&mv, 0, sizeof(mv));
+        if (media::xf_mov_open(&mv, mov_audio) != 0) return 1;
+        media::xf_mov_track* at = media::xf_mov_find(&mv, media::XF_TRACK_AUDIO);
+        if (!at) return 1;
+        char cc[5];
+        std::printf("audio %s %u Hz %uch, %u chunks, spp %u bpp %u bpf %u\n", media::xf_fourcc_str(at->codec, cc),
+                    at->sample_rate, at->channels, at->chunk_count, at->samples_per_packet, at->bytes_per_packet,
+                    at->bytes_per_frame);
+        // Extra data from the 'frma' atom on (the QDM2 header).
+        size_t ex = 0;
+        for (size_t k = 4; k + 4 <= at->desc_size; ++k)
+            if (std::memcmp(at->desc + k, "frma", 4) == 0) { ex = k - 4; break; }
+        media::qdm2_decoder q(at->desc + ex, at->desc_size - ex);
+        std::vector<int16_t> pcm;
+        std::vector<uint8_t> chunk;
+        for (uint32_t c = 0; c < at->chunk_count; ++c) {
+            const uint32_t n = at->chunk_samples[c];
+            const uint32_t bytes = at->samples_per_packet ? n / at->samples_per_packet * at->bytes_per_frame
+                                                          : n * at->channels * 2;
+            chunk.resize(bytes);
+            if (bytes) media::xf_read_at(mv.file, at->chunk_offset[c], &chunk[0], bytes);
+            if (at->codec == 0x51444D32 /* QDM2 */) q.decode(bytes ? &chunk[0] : 0, bytes, pcm);
+        }
+        double sum = 0;
+        for (size_t k = 0; k < pcm.size(); ++k) sum += double(pcm[k]) * pcm[k];
+        std::printf("audio: %zu samples (%.1f s), rms %.0f\n", pcm.size(),
+                    at->channels ? double(pcm.size()) / at->channels / at->sample_rate : 0.0,
+                    pcm.empty() ? 0.0 : std::sqrt(sum / double(pcm.size())));
         media::xf_mov_close(&mv);
         return 0;
     }
