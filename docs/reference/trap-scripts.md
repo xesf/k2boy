@@ -82,6 +82,35 @@ exactly two `:`-fields is considered.
 "A character" is any object whose `+0x128` is zero, which covers the Prince and enemies but not
 traps. A disabled Area does nothing.
 
+## Trigger volumes (`0x47517A`, `0x4753D3`)
+
+Areas and pressure plates do not test a box. The volume is the footprint of the trap mesh's
+**up-facing** triangles (`0x47526C` keeps faces whose normal has y > 0), extruded over the
+mesh's height:
+
+- the point's y must lie in the mesh's y range, exactly (`0x47536F`)
+- its xz must fall inside any kept face (`0x47553B`, margin 0)
+
+## PressurePlate (`0x483925`, states `0x483DD2` … `0x483F04`)
+
+| argv | field | meaning |
+|---|---|---|
+| 1 | | actor whose `On` / `Off` skills animate the plate (default `TRAP_PressurePlate`, 33 ms each) |
+| 2 | `+0x168` | on message |
+| 3 | `+0x190` | release delay in seconds. Negative means it stays down for good |
+| 4 | `+0x178` | off message |
+
+The plate is a small state machine. Its update calls through a function pointer at `+0x160`:
+
+```
+Idle --(a character on it)--> play On --(On ends)--> run on message
+     --> Held (delay >= 0) | stuck (delay < 0)
+Held --(nobody on it)--> wait `delay` --(stepped on again: back to Held)
+     --> play Off --(Off ends)--> run off message --> Idle
+```
+
+A disabled plate feels nothing (`0x483D53`).
+
 ## `move` (Force, Mover; TranslateMotion)
 
 ```
@@ -103,10 +132,11 @@ otherwise       s = D − v/Td · (T−t)²/2
 
 ## Status of the port
 
-Working: the grammar, state blocks, every base message, `delay`, Area, TranslateMotion on any
+Working: the grammar, state blocks, every base message, `delay`, Area, PressurePlate, the
+trigger-volume test, TranslateMotion on any
 trap with geometry, and `prince,snooze`. `--trapmsg` prints each delivery in the original's
 debug format, `TRAP MSG [<sender> to <target>]: <msg>`, and the exit summary lists what nothing
 acted on.
 
-Not yet: camera messages, `SkillAt`, audio, Door/Mover/PressurePlate/Action/Crate behaviour,
+Not yet: camera messages, `SkillAt`, audio, Door/Mover/Action behaviour, the plate's own animation,
 Rotate, Oscillate and the other motion types, and testing enemies against Areas.

@@ -86,6 +86,23 @@ protected:
     bool          m_collideable;    // +0x15A
 };
 
+// The volume Areas and pressure plates test characters against
+// (0x47517A build, 0x4753D3 test). Not a box: the footprint of the trap
+// mesh's up-facing triangles (0x47526C keeps faces whose normal has y > 0),
+// extruded over the mesh's height. A point is inside when its y lies within
+// the mesh's y range (0x47536F, exact) and its xz falls in any kept face
+// (0x47553B with a margin of 0, which is what both traps pass).
+class trap_volume {
+public:
+    void build(const float* xyz, size_t stride, size_t vcount,
+               const uint16_t* idx, size_t icount);
+    bool contains(const float* p) const;
+    bool empty() const { return m_tris.empty(); }
+private:
+    std::vector<float> m_tris;      // xz of kept faces, 6 floats each
+    float              m_min[3], m_max[3];
+};
+
 // An Area: a trigger volume. Port of 0x4640EC (argv) and 0x4643AD (update).
 //
 //   argv1  enter message         +0x18C
@@ -97,22 +114,53 @@ protected:
 class area_trap : public trap_object {
 public:
     area_trap(script_world& w, const std::string& name, const trap_header& h,
-              const std::vector<std::string>& argv, const float bbox[6]);
+              const std::vector<std::string>& argv, const trap_volume& volume);
 
     // `inside` is whether any character is in the volume this frame;
     // `action` is that character's action input (flag 0x8000000).
     void update(double now, bool inside, bool action);
 
-    bool contains(const float* p) const;
+    bool contains(const float* p) const { return m_volume.contains(p); }
 
 private:
     std::string m_enter, m_exit, m_action, m_repeat;
     double      m_exit_delay, m_interval;
-    float       m_box[6];
+    trap_volume m_volume;
     bool        m_inside;           // +0x160
     bool        m_acted;            // +0x161
     double      m_next_repeat;      // +0x1D8
     double      m_exit_time;        // +0x1E8
+};
+
+// A PressurePlate (0x483925 argv, states 0x483DD2 .. 0x483F04):
+//
+//   argv1  actor whose "On" / "Off" skills animate the plate (TRAP_PressurePlate)
+//   argv2  on message     +0x168
+//   argv3  delay, seconds +0x190    negative: stays down for good
+//   argv4  off message    +0x178
+//
+// Idle -> (a character on it) play On -> when On ends run the on message ->
+// Held -> (nobody on it) wait `delay` -> play Off -> when Off ends run the off
+// message -> Idle. Stepping back on while waiting returns to Held.
+class pressure_plate : public trap_object {
+public:
+    pressure_plate(script_world& w, const std::string& name, const trap_header& h,
+                   const std::vector<std::string>& argv, const trap_volume& volume,
+                   double on_seconds, double off_seconds);
+
+    void update(double now, bool pressed);
+    bool contains(const float* p) const { return m_volume.contains(p); }
+    bool down() const { return m_down; }
+
+private:
+    enum state_t { IDLE, PRESS_WAIT, HELD, RELEASE, OFF_WAIT, STUCK };
+    std::string m_on, m_off;
+    double      m_delay;            // +0x190
+    double      m_on_len, m_off_len;
+    trap_volume m_volume;
+    state_t     m_st;
+    bool        m_down;             // +0x188
+    double      m_t;                // skill start, or release time (+0x198)
 };
 
 // Registry, delivery and the delay queue.

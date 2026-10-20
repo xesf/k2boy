@@ -77,7 +77,7 @@ void trap_object::execute(const std::string& script) {
 // --- area_trap ----------------------------------------------------------------
 
 area_trap::area_trap(script_world& w, const std::string& name, const trap_header& h,
-                     const std::vector<std::string>& argv, const float bbox[6])
+                     const std::vector<std::string>& argv, const trap_volume& volume)
     : trap_object(w, name, h), m_exit_delay(0), m_interval(-1.0), m_inside(false),
       m_acted(false), m_next_repeat(0), m_exit_time(0) {
     const std::string none;
@@ -88,13 +88,89 @@ area_trap::area_trap(script_world& w, const std::string& name, const trap_header
     m_repeat     = argv.size() > 5 ? argv[5] : none;
     // An empty repeat message means no repeat: interval -1 (dbl_744588).
     m_interval   = m_repeat.empty() ? -1.0 : (argv.size() > 6 ? to_double(argv[6]) : 0.0);
-    for (int i = 0; i < 6; ++i) m_box[i] = bbox[i];
+    m_volume     = volume;
 }
 
-bool area_trap::contains(const float* p) const {
-    return p[0] >= m_box[0] && p[0] <= m_box[3] &&
-           p[1] >= m_box[1] && p[1] <= m_box[4] &&
-           p[2] >= m_box[2] && p[2] <= m_box[5];
+// --- trap_volume ----------------------------------------------------------------
+
+void trap_volume::build(const float* xyz, size_t stride, size_t vcount,
+                        const uint16_t* idx, size_t icount) {
+    m_tris.clear();
+    for (int k = 0; k < 3; ++k) { m_min[k] = 1e30f; m_max[k] = -1e30f; }
+    for (size_t v = 0; v < vcount; ++v)
+        for (int k = 0; k < 3; ++k) {
+            const float c = xyz[v * stride + size_t(k)];
+            if (c < m_min[k]) m_min[k] = c;
+            if (c > m_max[k]) m_max[k] = c;
+        }
+    for (size_t i = 0; i + 2 < icount; i += 3) {
+        const float* a = xyz + size_t(idx[i]) * stride;
+        const float* b = xyz + size_t(idx[i + 1]) * stride;
+        const float* c = xyz + size_t(idx[i + 2]) * stride;
+        // y of (b - a) x (c - a): keep up-facing faces only.
+        const float ny = (b[2] - a[2]) * (c[0] - a[0]) - (b[0] - a[0]) * (c[2] - a[2]);
+        if (ny <= 0.0f) continue;
+        const float t[6] = { a[0], a[2], b[0], b[2], c[0], c[2] };
+        m_tris.insert(m_tris.end(), t, t + 6);
+    }
+}
+
+bool trap_volume::contains(const float* p) const {
+    if (p[1] < m_min[1] || p[1] > m_max[1]) return false;
+    if (p[0] < m_min[0] || p[0] > m_max[0] || p[2] < m_min[2] || p[2] > m_max[2]) return false;
+    for (size_t i = 0; i + 5 < m_tris.size(); i += 6) {
+        const float* t = &m_tris[i];
+        // Same side of all three edges, either winding.
+        float s[3];
+        for (int e = 0; e < 3; ++e) {
+            const float ax = t[e * 2], az = t[e * 2 + 1];
+            const float bx = t[((e + 1) % 3) * 2], bz = t[((e + 1) % 3) * 2 + 1];
+            s[e] = (bx - ax) * (p[2] - az) - (bz - az) * (p[0] - ax);
+        }
+        if ((s[0] >= 0 && s[1] >= 0 && s[2] >= 0) || (s[0] <= 0 && s[1] <= 0 && s[2] <= 0))
+            return true;
+    }
+    return false;
+}
+
+// --- pressure_plate ---------------------------------------------------------------
+
+pressure_plate::pressure_plate(script_world& w, const std::string& name, const trap_header& h,
+                               const std::vector<std::string>& argv, const trap_volume& volume,
+                               double on_seconds, double off_seconds)
+    : trap_object(w, name, h), m_delay(0), m_on_len(on_seconds), m_off_len(off_seconds),
+      m_volume(volume), m_st(IDLE), m_down(false), m_t(0) {
+    m_on    = argv.size() > 2 ? argv[2] : std::string();
+    m_delay = argv.size() > 3 ? to_double(argv[3]) : 0.0;
+    m_off   = argv.size() > 4 ? argv[4] : std::string();
+}
+
+void pressure_plate::update(double now, bool pressed) {
+    // 0x483D53: a disabled plate feels nothing.
+    if (!m_enabled) pressed = false;
+    switch (m_st) {
+    case IDLE:                                      // 0x483DD2 -> 0x483DEC
+        if (pressed) { m_down = true; m_t = now; m_st = PRESS_WAIT; }
+        break;
+    case PRESS_WAIT:                                // 0x483E1E
+        if (now - m_t >= m_on_len) {
+            execute(m_on);
+            m_st = m_delay >= 0.0 ? HELD : STUCK;
+        }
+        break;
+    case HELD:                                      // 0x483E62
+        if (!pressed) { m_t = now + m_delay; m_st = RELEASE; }
+        break;
+    case RELEASE:                                   // 0x483E8E
+        if (pressed) { m_t = 0.0; m_st = HELD; }
+        else if (now > m_t) { m_down = false; m_t = now; m_st = OFF_WAIT; }
+        break;
+    case OFF_WAIT:                                  // 0x483ED2 -> 0x483F04
+        if (now - m_t >= m_off_len) { execute(m_off); m_st = IDLE; }
+        break;
+    case STUCK:                                     // state pointer 0
+        break;
+    }
 }
 
 void area_trap::update(double now, bool inside, bool action) {

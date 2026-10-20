@@ -692,6 +692,7 @@ struct scene {
     k2::engine::script_world               script;
     std::vector<k2::engine::trap_object*>  traps;   // owned
     std::vector<k2::engine::area_trap*>    areas;   // also in `traps`
+    std::vector<k2::engine::pressure_plate*> plates; // also in `traps`
     float mn[3];
     float mx[3];
     bool  empty;
@@ -1176,6 +1177,7 @@ void scene_reset(scene& sc) {
     for (size_t i = 0; i < sc.traps.size(); ++i) delete sc.traps[i];
     sc.traps.clear();
     sc.areas.clear();
+    sc.plates.clear();
     sc.empty = true;
     sc.mn[0] = sc.mn[1] = sc.mn[2] =  1e30f;
     sc.mx[0] = sc.mx[1] = sc.mx[2] = -1e30f;
@@ -1270,6 +1272,21 @@ public:
     k2::engine::script_world& m_world;
     double snooze_until;
 };
+
+// Length of an actor's skill in seconds, e.g. TRAP_PressurePlate's "On";
+// 0 when it cannot be read.
+double actor_skill_seconds(const std::string& actor, const char* skill) {
+    std::string path = "actors/" + actor + "/skills/" + skill + ".skl";
+    for (size_t i = 0; i < path.size(); ++i)
+        if (path[i] >= 'A' && path[i] <= 'Z') path[i] = char(path[i] - 'A' + 'a');
+    size_t size = 0;
+    uint8_t* d = plat::fs_read(path.c_str(), size);
+    if (!d) return 0.0;
+    assets::skl_file sk;
+    const bool ok = assets::skl_parse(d, size, sk);
+    plat::fs_free(d);
+    return ok ? double(sk.duration_ms) / 1000.0 : 0.0;
+}
 
 bool append_scene(const char* path, scene& sc, bool collide = true) {
     size_t size = 0;
@@ -1401,11 +1418,22 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
         // Every trap node becomes a script target under its node name.
         if (collide && n.has_trap) {
             k2::engine::trap_object* t;
+            k2::engine::trap_volume vol;
+            vol.build(&vb[0].x, sizeof(assets::k2a_vertex) / sizeof(float), vb.size(),
+                      &ib[0], ib.size());
             if (n.trap.name == "Area") {
                 k2::engine::area_trap* a = new k2::engine::area_trap(
-                    sc.script, n.name, hdr, n.trap.argv, n.trap.bbox);
+                    sc.script, n.name, hdr, n.trap.argv, vol);
                 sc.areas.push_back(a);
                 t = a;
+            } else if (n.trap.name == "PressurePlate") {
+                const std::string actor = (n.trap.argv.size() > 1 && !n.trap.argv[1].empty())
+                                          ? n.trap.argv[1] : std::string("TRAP_PressurePlate");
+                k2::engine::pressure_plate* pp = new k2::engine::pressure_plate(
+                    sc.script, n.name, hdr, n.trap.argv, vol,
+                    actor_skill_seconds(actor, "On"), actor_skill_seconds(actor, "Off"));
+                sc.plates.push_back(pp);
+                t = pp;
             } else {
                 t = new scene_trap(sc.script, n.name, hdr, sc,
                                    int(sc.items.size()) - 1, node, n.trap.name, n.trap.bbox);
@@ -2779,7 +2807,8 @@ int main(int argc, char** argv) {
     sc.script.trace = trapmsg;
     double game_time = 0.0;
     crate_ctl crates;
-    std::printf("scripts: %zu traps, %zu areas%s\n", sc.traps.size(), sc.areas.size(),
+    std::printf("scripts: %zu traps, %zu areas, %zu plates%s\n", sc.traps.size(),
+                sc.areas.size(), sc.plates.size(),
                 noscript ? " (disabled by --noscript)" : "");
 
     bool   looking   = false;
@@ -2909,6 +2938,8 @@ int main(int argc, char** argv) {
             const bool action = follow_mode && down[plat::KEY_SPACE];
             for (size_t i = 0; i < sc.areas.size(); ++i)
                 sc.areas[i]->update(game_time, pp && sc.areas[i]->contains(pp), action);
+            for (size_t i = 0; i < sc.plates.size(); ++i)
+                sc.plates[i]->update(game_time, pp && sc.plates[i]->contains(pp));
             for (size_t i = 0; i < sc.traps.size(); ++i) {
                 scene_trap* st = dynamic_cast<scene_trap*>(sc.traps[i]);
                 if (st) st->update(game_time);
