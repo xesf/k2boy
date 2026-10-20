@@ -3953,12 +3953,25 @@ const int   BOTTLE        = 12;
 const int   PRINCE_BOTTLES = 3;     // what the Prince starts the game with
 // Guards' bottles by skill (argv1 "skill,weapon,bottles"), word_7C5820.
 const int   SKILL_BOTTLES[11] = { 2, 3, 3, 4, 5, 5, 6, 7, 8, 10, 10 };
-const float GUARD_BLOCK   = 0.35f;  // chance a guard blocks the Prince
 const double RESPAWN_TIME = 3.5;
 }
 
 enum attack_dir { DIR_LEFT = 0, DIR_CENTER, DIR_RIGHT };
 const char* const k_dir_names[3] = { "Left", "Center", "Right" };
+
+// fight.ini "Skill Level <n> <what>", for a guard's skill.
+double skill_param(const k2::engine::fight_params& fp, int skill, const char* what, double fallback) {
+    char key[64];
+    std::snprintf(key, sizeof(key), "Skill Level %d %s", std::max(1, std::min(10, skill)), what);
+    return fp.fight(key, fallback);
+}
+
+double frand() { return double(std::rand() % 10000) / 10000.0; }
+
+// Sword damage by direction ("Sword Left Attack Damage" = 14, ...).
+int sword_damage(const k2::engine::fight_params& fp, int dir) {
+    return int(fp.fight(std::string("Sword ") + k_dir_names[dir] + " Attack Damage", 12.0));
+}
 
 struct pending_hit {
     bool   active;
@@ -3986,6 +3999,12 @@ struct enemy_ai {
     std::string start_skill;
     bool        start_loops;
     bool        waiting;
+    // fight.ini "Skill Level N ..." (1..10), and his answer to the Prince's
+    // swing in flight: rolled from Blocks / Wrong Blocks / Did Nothings /
+    // Late Attacks when the swing starts, acted on after his block delay.
+    int         skill;
+    enum react_t { R_NONE, R_BLOCK, R_WRONG, R_LATE } react;
+    double      react_at;
 };
 
 struct combat_state {
@@ -4047,6 +4066,9 @@ void combat_init(combat_state& cs, scene& sc, const k2::engine::fight_params& fp
         e.hurt_set = "_L1";
         e.start_loops = false;
         e.waiting = false;
+        e.skill = 1;
+        e.react = enemy_ai::R_NONE;
+        e.react_at = 0.0;
         // EnemyStart argv: body, "difficulty,weapon,health", waypoints, ...
         for (size_t t = 0; t < sc.spawn_points.size(); ++t) {
             const assets::k2a_trap& sp = sc.spawn_points[t];
@@ -4057,6 +4079,7 @@ void combat_init(combat_state& cs, scene& sc, const k2::engine::fight_params& fp
                 const std::string& a1 = sp.argv[1];
                 int skill = std::atoi(a1.c_str());
                 if (skill < 0 || skill > 10) skill = 4;
+                e.skill = std::max(1, skill);
                 int bottles = combat_tuning::SKILL_BOTTLES[skill];
                 size_t c1 = a1.find(',');
                 size_t c2 = c1 == std::string::npos ? c1 : a1.find(',', c1 + 1);
@@ -4113,7 +4136,8 @@ void prince_damage(combat_state& cs, scene& sc, actor_inst& p, int dmg, int dir,
         return;
     }
     play_once(sc, p, std::string("CombatBeingInjured") + k_dir_names[dir] + "_L2", now, actor_yaw(p), false);
-    cs.prince_busy_until = now + skill_seconds(sc, p, std::string("CombatBeingInjured") + k_dir_names[dir] + "_L2");
+    cs.prince_busy_until = now + std::max(skill_seconds(sc, p, std::string("CombatBeingInjured") + k_dir_names[dir] + "_L2"),
+                                          cs.params->fight("Sword Recover From Being Injured", 0.267));
 }
 
 void enemy_damage(combat_state& cs, scene& sc, enemy_ai& e, int dmg, int dir, double now) {
@@ -4193,7 +4217,7 @@ void enemy_update(combat_state& cs, scene& sc, enemy_ai& e, actor_inst& prince,
                 e.busy_until = now + std::max(skill_seconds(sc, a, rec),
                     fp.fight(std::string("Sword Blocked ") + k_dir_names[e.hit.dir] + " Attack Recover", 0.37));
             } else {
-                prince_damage(cs, sc, prince, combat_tuning::HIT_DAMAGE, e.hit.dir, now);
+                prince_damage(cs, sc, prince, sword_damage(fp, e.hit.dir), e.hit.dir, now);
             }
         }
     }
@@ -4249,7 +4273,12 @@ void enemy_update(combat_state& cs, scene& sc, enemy_ai& e, actor_inst& prince,
         if (d > combat_tuning::FIGHT_DIST * 1.6f) { e.state = enemy_ai::CHARGE; break; }
         a.node->local.set_yaw(std::atan2(dx, dz));
         a.stance = find_actor_skill(sc, a, "CombatAtReady" + e.set);
-        if (now >= e.next_attack) {
+        if (e.react == enemy_ai::R_LATE && now >= e.react_at) { e.react = enemy_ai::R_NONE; e.next_attack = now; }
+        // Blocking or flinching wrong: show it when his delay is up.
+        if ((e.react == enemy_ai::R_BLOCK || e.react == enemy_ai::R_WRONG) && now >= e.react_at && !a.scripted)
+            a.stance = find_actor_skill(sc, a, std::string("CombatBlocking") +
+                k_dir_names[e.react == enemy_ai::R_BLOCK ? cs.prince_hit.dir : (cs.prince_hit.dir + 1) % 3] + e.set);
+        if (now >= e.next_attack && e.react != enemy_ai::R_BLOCK) {
             const int dir = std::rand() % 3;
             const std::string atk = std::string("CombatAttack") + k_dir_names[dir] + e.set;
             if (play_once(sc, a, atk, now, actor_yaw(a), false)) {
@@ -4259,7 +4288,12 @@ void enemy_update(combat_state& cs, scene& sc, enemy_ai& e, actor_inst& prince,
                                + fp.fight("Unblocked Attack", 0.0667);
                 e.busy_until = now + skill_seconds(sc, a, atk);
             }
-            e.next_attack = now + 1.4 + double(std::rand() % 1000) / 1000.0 * 1.2;
+            // Aggression is his pause between attacks, by skill; now and
+            // then he goes again at once (Double Attack Percentage).
+            const double aggr = skill_param(fp, e.skill, "Aggression", 2.0);
+            e.next_attack = now + aggr * (0.75 + 0.5 * frand());
+            if (frand() * 100.0 < skill_param(fp, e.skill, "Double Attack Percentage", 10.0))
+                e.next_attack = e.busy_until;
         }
         break;
     }
@@ -4287,18 +4321,59 @@ void prince_hit_resolve(combat_state& cs, scene& sc, actor_inst& p, double now) 
         best = &e;
         best_d = d;
     }
+    const k2::engine::fight_params& fp = *cs.params;
+    // Everyone's answer to this swing is spent, whoever it lands on.
+    enemy_ai::react_t react = best ? best->react : enemy_ai::R_NONE;
+    const bool react_ready = best && now >= best->react_at;
+    for (size_t i = 0; i < cs.enemies.size(); ++i)
+        if (cs.enemies[i].react != enemy_ai::R_LATE) cs.enemies[i].react = enemy_ai::R_NONE;
     if (!best) return;
     actor_inst& a = sc.actors[size_t(best->actor)];
-    const bool can_block = (best->state == enemy_ai::FIGHT) && !a.scripted && now >= best->busy_until;
-    if (can_block && float(std::rand() % 1000) / 1000.0f < combat_tuning::GUARD_BLOCK) {
+    const int dir = cs.prince_hit.dir;
+    if (react == enemy_ai::R_BLOCK && react_ready && !a.scripted) {
+        // Blocked: the Prince recoils for his Blocked .. Recover; the guard
+        // may counter once Computer Recover From Block has passed.
         play_sound("gblswordclank", a.node->local.translate, 14.0f, false);
-        play_once(sc, a, std::string("CombatBlock") + k_dir_names[cs.prince_hit.dir] + best->set,
-                  now, actor_yaw(a), false);
-        best->busy_until = now + 0.5;
+        play_once(sc, a, std::string("CombatBlock") + k_dir_names[dir] + best->set, now, actor_yaw(a), false);
+        play_once(sc, p, std::string("CombatBlocked") + k_dir_names[dir] + "_G2", now, actor_yaw(p), false);
+        best->busy_until = now + fp.fight("Recover From Block", 0.0667);
+        cs.prince_busy_until = std::max(cs.prince_busy_until,
+            now + fp.fight(std::string("Sword Blocked ") + k_dir_names[dir] + " Attack Recover", 0.367));
+        if (frand() * 100.0 < skill_param(fp, best->skill, "Counterattacks", 5.0))
+            best->next_attack = now + fp.fight("Computer Recover From Block", 0.367);
         return;
     }
-    const int dmg = combat_tuning::HIT_DAMAGE + (potion_state::on(g_potions.strength_until, now) ? int(g_potions.strength) : 0);
-    enemy_damage(cs, sc, *best, dmg, cs.prince_hit.dir, now);
+    const int dmg = sword_damage(fp, dir) +
+                    (potion_state::on(g_potions.strength_until, now) ? int(g_potions.strength) : 0);
+    enemy_damage(cs, sc, *best, dmg, dir, now);
+    cs.prince_busy_until = std::max(cs.prince_busy_until, now + fp.fight("Sword Recover From Injuring", 0.2));
+}
+
+// The Prince has started a swing at `dir`: the guard it is aimed at decides
+// now how he will answer, from his skill's percentages, and how soon.
+void enemy_react(combat_state& cs, scene& sc, const float* pp, float yaw, double now) {
+    const k2::engine::fight_params& fp = *cs.params;
+    for (size_t i = 0; i < cs.enemies.size(); ++i) {
+        enemy_ai& e = cs.enemies[i];
+        const actor_inst& a = sc.actors[size_t(e.actor)];
+        if (e.state != enemy_ai::FIGHT || a.hidden) continue;
+        const float* q = a.node->local.translate;
+        const float dx = q[0] - pp[0], dz = q[2] - pp[2];
+        if (dx * dx + dz * dz > combat_tuning::REACH * combat_tuning::REACH * 1.5f) continue;
+        if (angle_diff(std::atan2(dx, dz), yaw) > 1.2f) continue;
+        const double w[4] = { skill_param(fp, e.skill, "Blocks", 12), skill_param(fp, e.skill, "Wrong Blocks", 12),
+                              skill_param(fp, e.skill, "Did Nothings", 65), skill_param(fp, e.skill, "Late Attacks", 11) };
+        double r = frand() * (w[0] + w[1] + w[2] + w[3]);
+        int pick = 0;
+        while (pick < 3 && r >= w[pick]) { r -= w[pick]; ++pick; }
+        const double lo = fp.fight("AI Min Block Delay", 0.15), hi = fp.fight("AI Max Block Delay", 0.433);
+        e.react_at = now + lo + (hi - lo) * frand();
+        // Too slow to raise the sword before it lands: it lands.
+        const bool in_time = e.react_at <= cs.prince_hit.at && now >= e.busy_until && !a.scripted;
+        e.react = pick == 0 ? (in_time ? enemy_ai::R_BLOCK : enemy_ai::R_NONE)
+                : pick == 1 ? enemy_ai::R_WRONG
+                : pick == 3 ? enemy_ai::R_LATE : enemy_ai::R_NONE;
+    }
 }
 
 // The guard nearest the Prince within `range`, or -1.
@@ -4895,6 +4970,8 @@ int main(int argc, char** argv) {
     jump_ctl  jumps;
     hang_ctl  ledges;
     swim_ctl  swim;
+    int       prince_last_dir = -1;
+    double    prince_last_attack = -10.0;
     double    drown_tick = 0.0;
     bool      draw_was_down = false, atk_was_down = false;
     bool      jump_was_down = false;
@@ -5270,6 +5347,14 @@ int main(int argc, char** argv) {
                         combat.prince_hit.at = game_time + fight_tuning.fight(
                             std::string("Sword ") + k_dir_names[dir] + " Attack Begin", 0.3);
                         combat.prince_busy_until = game_time + skill_seconds(sc, *player, atk);
+                        // The same direction again, quickly, is slower to come
+                        // round (Same Direction Attack Penalty).
+                        if (dir == prince_last_dir &&
+                            game_time - prince_last_attack < fight_tuning.fight("Max Fast Attack Time", 1.5))
+                            combat.prince_hit.at += fight_tuning.fight("Same Direction Attack Penalty", 0.4);
+                        prince_last_dir = dir;
+                        prince_last_attack = game_time;
+                        enemy_react(combat, sc, lt.translate, player_yaw, game_time);
                     }
                 }
                 player->stance = find_actor_skill(sc, *player,
