@@ -699,6 +699,10 @@ struct actor_inst {
     int                               hand_joint;
     float                             hand_off[3];
     bool                              weapon_shown;
+    // World objects in his hand ("Item:name,on,R", 0x46DC51): items drawn
+    // at the hand, about their own centre, while carried.
+    std::vector<size_t>               carried;
+    int                               carry_joint;
     std::vector<std::string>          ambient;
     float                             home[3];
     float                             home_yaw;
@@ -707,7 +711,7 @@ struct actor_inst {
                    skinned(false), clip(-1), clip_ms(0.0), clip_once(false), scripted(0), scripted_start(0),
                    scripted_yaw(0), remove_after(false), hidden(false), stance(0),
                    hold_last(false), posed_hold(false), health(100), max_health(100), armed(false),
-                   is_fixture(false), start_flag(false), hand_joint(-1), weapon_shown(false), home_yaw(0) {
+                   is_fixture(false), start_flag(false), hand_joint(-1), weapon_shown(false), carry_joint(-1), home_yaw(0) {
         hand_off[0] = hand_off[1] = hand_off[2] = 0.0f;
         scripted_origin[0] = scripted_origin[1] = scripted_origin[2] = 0.0f;
         home[0] = home[1] = home[2] = 0.0f;
@@ -1656,6 +1660,7 @@ public:
         if (msg.compare(0, 8, "SkillAt:") == 0 || msg.compare(0, 8, "skillat:") == 0)
             return skill_at(msg.substr(8));
         actor_inst& a = m_sc.actors[m_actor];
+        if (msg.size() > 5 && equals_nocase(msg.substr(0, 5), "item:")) return item(a, msg.substr(5));
         if (a.is_enemy) {
             // EnemyStart's table (0x46CB7C): Start sets flag 0x1000; Remove
             // takes him out of the level.
@@ -1679,6 +1684,83 @@ public:
     double snooze_until;
 
 private:
+    // "Item:<object>,<on|off>[,L|R]": take a world object into a hand, or put
+    // it down where the hand is.
+    bool item(actor_inst& a, const std::string& args) {
+        std::vector<std::string> f;
+        size_t st = 0;
+        for (;;) {
+            const size_t c = args.find(',', st);
+            f.push_back(args.substr(st, c == std::string::npos ? std::string::npos : c - st));
+            if (c == std::string::npos) break;
+            st = c + 1;
+        }
+        const bool on = f.size() < 2 || equals_nocase(f[1], "on");
+        const char* hand = f.size() > 2 && !f[2].empty() && (f[2][0] == 'L' || f[2][0] == 'l') ? "LHand" : "RHand";
+        if (on) {
+            a.carried.clear();
+            for (size_t i = 0; i < m_sc.items.size(); ++i)
+                if (m_sc.items[i].owner < 0 && equals_nocase(m_sc.item_names[i], f[0].c_str())) {
+                    a.carried.push_back(i);
+                    m_sc.items[i].hidden = true;
+                }
+            a.carry_joint = -1;
+            for (size_t j = 0; j < a.joint_names.size(); ++j)
+                if (a.joint_names[j] == hand) { a.carry_joint = int(j); break; }
+            if (a.carried.empty()) find_item_mesh(f[0], a.carried);
+            if (a.carried.empty()) std::printf("Item: can't find item %s\n", f[0].c_str());
+            return true;
+        }
+        // Down where the hand holds it: the mesh moved from its centre to there.
+        if (a.carry_joint >= 0) {
+            k2::engine::transform hw;
+            k2::engine::transform_compose(a.node->world(), a.cur[size_t(a.carry_joint)], hw);
+            for (size_t k = 0; k < a.carried.size(); ++k) {
+                draw_item& di = m_sc.items[a.carried[k]];
+                mat4_identity(di.model);
+                for (int c = 0; c < 3; ++c) di.model[12 + c] = hw.translate[c] - di.center[c];
+                di.has_model = true;
+                di.hidden = false;
+            }
+        }
+        a.carried.clear();
+        return true;
+    }
+
+    // An item not in the world (the bracelet): its mesh is a node of that
+    // name in some .k2a (Rooms/prisonfix/bracelet.k2a). Loaded on first use,
+    // kept out of the world passes.
+    void find_item_mesh(const std::string& name, std::vector<size_t>& out) {
+        std::map<std::string, std::vector<size_t> >::const_iterator hit = m_sc.weapons.find("item:" + name);
+        if (hit != m_sc.weapons.end()) { out = hit->second; return; }
+        struct remember {
+            scene& sc; const std::string key; std::vector<size_t>& v;
+            ~remember() { sc.weapons[key] = v; }
+        } keep = { m_sc, "item:" + name, out };
+        std::vector<std::string> k2as;
+        plat::fs_list_paths_by_extension(".k2a", k2as);
+        std::string needle = "*NODE_NAME \"" + name + "\"";
+        for (size_t i = 0; i < k2as.size() && out.empty(); ++i) {
+            if (k2as[i].find("rooms/") != std::string::npos &&
+                k2as[i].find("prison") != std::string::npos &&
+                k2as[i].find("bracelet") == std::string::npos) continue;   // the big rooms: skip
+            size_t size = 0;
+            uint8_t* d = plat::fs_read(k2as[i].c_str(), size);
+            if (!d) continue;
+            const bool has = std::string(reinterpret_cast<const char*>(d), size).find(needle) != std::string::npos;
+            plat::fs_free(d);
+            if (!has) continue;
+            const size_t before = m_sc.items.size();
+            const float mn[3] = { m_sc.mn[0], m_sc.mn[1], m_sc.mn[2] }, mx[3] = { m_sc.mx[0], m_sc.mx[1], m_sc.mx[2] };
+            append_scene(k2as[i].c_str(), m_sc, false);
+            for (int k = 0; k < 3; ++k) { m_sc.mn[k] = mn[k]; m_sc.mx[k] = mx[k]; }
+            for (size_t k = before; k < m_sc.items.size(); ++k) {
+                m_sc.items[k].hidden = true;
+                if (equals_nocase(m_sc.item_names[k], name.c_str())) out.push_back(k);
+            }
+        }
+    }
+
     bool skill_at(const std::string& args) {
         actor_inst& a = m_sc.actors[m_actor];
         std::vector<std::string> f;
@@ -5786,6 +5868,24 @@ int main(int argc, char** argv) {
                     }
                     gfx::set_texture(di.tex);
                     gfx::draw(di.mesh);
+                }
+                // Carried objects: about their own centre, at the hand.
+                if (!ai.carried.empty() && ai.carry_joint >= 0) {
+                    k2::engine::transform hw;
+                    k2::engine::transform_compose(aw, ai.cur[size_t(ai.carry_joint)], hw);
+                    for (size_t k = 0; k < ai.carried.size(); ++k) {
+                        const draw_item& cd = sc.items[ai.carried[k]];
+                        k2::engine::transform t = hw, back, tt;
+                        for (int q = 0; q < 9; ++q) back.rotate[q] = (q % 4 == 0) ? 1.0f : 0.0f;
+                        for (int q = 0; q < 3; ++q) back.translate[q] = -cd.center[q];
+                        back.scale = 1.0f;
+                        k2::engine::transform_compose(t, back, tt);
+                        float cm[16];
+                        tt.to_matrix(cm);
+                        gfx::set_model(cm);
+                        gfx::set_texture(cd.tex);
+                        gfx::draw(cd.mesh);
+                    }
                 }
                 // The weapon, in the hand: actor * hand joint * grip offset.
                 if (ai.weapon_shown && ai.hand_joint >= 0 && ai.skinned) {
