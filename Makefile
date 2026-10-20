@@ -18,7 +18,11 @@
 #              hold: then forward pushes, back pulls).
 #     Ledges   jump facing a low ledge to climb it; jump under a high one to
 #              catch it, then forward pulls up, back drops, left/right shimmy.
-#     Also     F free-fly camera, T trigger volumes, Esc quit. Cutscenes take
+#     Combat   E picks up (the sword is in prison4); R / pad Y draws or sheathes,
+#              F / pad B attacks (left / right / centre by the stick), G / pad LB
+#              blocks. The bar top left is health; a fallen Prince returns
+#              to the level start.
+#     Also     V free-fly camera, T trigger volumes, Esc quit. Cutscenes take
 #              all control until they end. A gamepad (Xbox / PlayStation / MFi)
 #              is picked up when connected.
 #

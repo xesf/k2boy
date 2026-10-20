@@ -18,6 +18,7 @@
 #include "engine/trap.h"
 #include "engine/script.h"
 #include "engine/mixer.h"
+#include "engine/fight.h"
 #include "assets/sfx.h"
 
 #include <cstdio>
@@ -26,6 +27,7 @@
 #include <algorithm>
 #include <vector>
 #include <map>
+#include <array>
 #include <string>
 
 using namespace k2;
@@ -679,10 +681,18 @@ struct actor_inst {
     float                             scripted_yaw;
     bool                              remove_after;   // "...,REMOVE"
     bool                              hidden;
+    // Combat: a looping stance clip that replaces the locomotion set while
+    // set (CombatAtReady_G*), and whether a one-shot keeps its last frame.
+    const assets::skl_file*           stance;
+    bool                              hold_last;
+    bool                              posed_hold;     // holding that frame now
+    int                               health, max_health;
+    bool                              armed;          // the Prince has his sword
 
     actor_inst() : node(0), is_enemy(false), first_item(0), item_count(0),
                    skinned(false), clip(-1), clip_ms(0.0), clip_once(false), scripted(0), scripted_start(0),
-                   scripted_yaw(0), remove_after(false), hidden(false) {
+                   scripted_yaw(0), remove_after(false), hidden(false), stance(0),
+                   hold_last(false), posed_hold(false), health(100), max_health(100), armed(false) {
         scripted_origin[0] = scripted_origin[1] = scripted_origin[2] = 0.0f;
     }
 };
@@ -749,6 +759,9 @@ struct scene {
     // Engine space. Target cameras also carry where they look.
     struct named_point { float pos[3]; bool has_target; float target[3]; float yaw; };
     std::map<std::string, named_point> points;
+    // Pickup traps: position (bbox centre) and argv, for the Prince to collect.
+    struct pickup_def { std::string name; std::vector<std::string> argv; float pos[3]; };
+    std::vector<pickup_def> pickups;
     // Trap actors' skills, loaded on first use: "actor/skill" lower-case.
     std::map<std::string, assets::skl_file*> trap_skills;
     float mn[3];
@@ -1167,8 +1180,9 @@ void set_clip(actor_inst& a, int clip) {
 // own transform, as 0x63BA81 does. The root's translation is the clip's root
 // motion; the caller moves the actor node instead, so it is held at bind here.
 void animate_actor(actor_inst& a, float dt) {
-    if (!a.skinned || a.clip < 0) return;
-    const assets::skl_file& s = a.loco[size_t(a.clip)];
+    if (!a.skinned || a.posed_hold) return;
+    if (a.clip < 0 && !a.stance) return;
+    const assets::skl_file& s = a.stance ? *a.stance : a.loco[size_t(a.clip)];
     const uint32_t len = clip_length_ms(s);
     const double before = a.clip_ms;
     a.clip_ms += double(dt) * 1000.0;
@@ -1323,6 +1337,7 @@ void scene_reset(scene& sc) {
     sc.root->name = "LevelRoot";
     sc.spawn_points.clear();
     sc.points.clear();
+    sc.pickups.clear();
     sc.coll.clear();
     sc.script.clear();
     for (size_t i = 0; i < sc.traps.size(); ++i) delete sc.traps[i];
@@ -1625,9 +1640,47 @@ bool update_scripted(actor_inst& a, double now) {
     if (done) {
         a.scripted = 0;
         if (a.remove_after) a.hidden = true;
+        if (a.hold_last) { a.posed_hold = true; return true; }
         set_clip(a, LOCO_BASE);
         a.clip_ms = 0.0;
     }
+    return true;
+}
+
+// One of an actor's skills by name ("CombatAttackLeft_G1"), from its own
+// Skills folder, cached in the scene. Null when it has no such skill.
+const assets::skl_file* find_actor_skill(scene& sc, const actor_inst& a, const std::string& name) {
+    if (a.skill_dir.empty() || name.empty()) return 0;
+    std::string path = a.skill_dir + "skills/" + name + ".skl";
+    for (size_t i = 0; i < path.size(); ++i)
+        if (path[i] >= 'A' && path[i] <= 'Z') path[i] = char(path[i] - 'A' + 'a');
+    std::map<std::string, assets::skl_file*>::iterator it = sc.trap_skills.find(path);
+    if (it != sc.trap_skills.end()) return it->second;
+    size_t size = 0;
+    uint8_t* d = plat::fs_read(path.c_str(), size);
+    assets::skl_file* sk = 0;
+    if (d) {
+        sk = new assets::skl_file();
+        if (!assets::skl_parse(d, size, *sk) || sk->chunk_tag != "SklS") { delete sk; sk = 0; }
+        plat::fs_free(d);
+    }
+    sc.trap_skills[path] = sk;
+    return sk;
+}
+
+// Plays a skill once where the actor stands, facing `yaw`, root motion
+// included. `hold` keeps the last frame afterwards (death).
+bool play_once(scene& sc, actor_inst& a, const std::string& name, double now, float yaw, bool hold) {
+    const assets::skl_file* sk = find_actor_skill(sc, a, name);
+    if (!sk) return false;
+    for (int k = 0; k < 3; ++k) a.scripted_origin[k] = a.node->local.translate[k];
+    a.scripted_yaw = yaw;
+    a.scripted = sk;
+    a.scripted_start = now;
+    a.clip_ms = 0.0;
+    a.hold_last = hold;
+    a.posed_hold = false;
+    a.remove_after = false;
     return true;
 }
 
@@ -1881,6 +1934,13 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
         if (n.trap.name == "PrinceStart" || n.trap.name == "EnemyStart") {
             sc.spawn_points.push_back(n.trap);
             sc.spawn_points.back().node = n.name;
+        }
+        if (n.trap.name == "Pickup" && collide) {
+            scene::pickup_def pd;
+            pd.name = n.name;
+            pd.argv = n.trap.argv;
+            for (int k = 0; k < 3; ++k) pd.pos[k] = (n.trap.bbox[k] + n.trap.bbox[k + 3]) * 0.5f;
+            sc.pickups.push_back(pd);
         }
     }
 
@@ -3484,6 +3544,330 @@ bool hang_update(hang_ctl& hc, actor_inst& a, const k2::engine::collision_world&
     }
 }
 
+// --- combat -------------------------------------------------------------------
+//
+// From the data: fight.ini's attack-begin times (when a swing can still be
+// blocked, then lands), recover times and the unblocked-attack window;
+// enemy.dat's distances (watch 10, charge 5, give up 8 from home, vanish 20)
+// and peripheral vision (30 degrees); the clip sets (Prince _G2 with the
+// sword, guards _G1). Not in the shipped files and so ours: health (100),
+// damage per hit (12, and enemy.dat's 15 for a running swing is unused),
+// attack cadence, guard block chance. The original's CharacterStateTable /
+// EnemyAIObject logic is not traced.
+namespace combat_tuning {
+const float REACH         = 2.2f;   // a swing connects within this
+const float FIGHT_DIST    = 1.6f;   // guards stop and fight here
+const int   HIT_DAMAGE    = 12;
+const float GUARD_BLOCK   = 0.35f;  // chance a guard blocks the Prince
+const double RESPAWN_TIME = 3.5;
+}
+
+enum attack_dir { DIR_LEFT = 0, DIR_CENTER, DIR_RIGHT };
+const char* const k_dir_names[3] = { "Left", "Center", "Right" };
+
+struct pending_hit {
+    bool   active;
+    double at;              // when it lands
+    int    dir;
+    int    attacker;        // actor index; -1 the Prince
+};
+
+struct enemy_ai {
+    enum state_t { PATROL, CHARGE, FIGHT, RECOVER, DEAD } state;
+    int    actor;
+    float  home[3];
+    std::vector<std::array<float, 3> > way;
+    size_t wp;
+    double next_attack;
+    double busy_until;
+    pending_hit hit;
+    std::string set;        // clip suffix: "_G1"
+    std::string hurt_set;   // "_L1"
+};
+
+struct combat_state {
+    std::vector<enemy_ai> enemies;
+    const k2::engine::fight_params* params;
+    bool                  prince_drawn;
+    bool                  prince_blocking;
+    pending_hit           prince_hit;
+    double                prince_busy_until;
+    double                dead_since;     // < 0 while alive
+    float                 spawn[3];
+    float                 spawn_yaw;
+};
+
+float yaw_toward(const float* from, const float* to) {
+    return std::atan2(to[0] - from[0], to[2] - from[2]);
+}
+
+float actor_yaw(const actor_inst& a) {
+    return std::atan2(a.node->local.rotate[2], a.node->local.rotate[8]);
+}
+
+float angle_diff(float a, float b) {
+    float d = std::fmod(a - b + 3.14159265f, 6.2831853f);
+    if (d < 0) d += 6.2831853f;
+    return std::fabs(d - 3.14159265f);
+}
+
+double skill_seconds(scene& sc, const actor_inst& a, const std::string& name) {
+    const assets::skl_file* sk = find_actor_skill(sc, a, name);
+    return sk ? clip_length_ms(*sk) / 1000.0 : 0.5;
+}
+
+void combat_init(combat_state& cs, scene& sc, const k2::engine::fight_params& fp) {
+    cs.params = &fp;
+    cs.prince_drawn = cs.prince_blocking = false;
+    cs.prince_hit.active = false;
+    cs.prince_busy_until = 0.0;
+    cs.dead_since = -1.0;
+    cs.enemies.clear();
+    for (size_t i = 0; i < sc.actors.size(); ++i) {
+        actor_inst& a = sc.actors[i];
+        if (!a.is_enemy) {
+            for (int k = 0; k < 3; ++k) cs.spawn[k] = a.node->local.translate[k];
+            cs.spawn_yaw = actor_yaw(a);
+            continue;
+        }
+        if (!a.skinned) continue;
+        enemy_ai e;
+        e.state = enemy_ai::PATROL;
+        e.actor = int(i);
+        for (int k = 0; k < 3; ++k) e.home[k] = a.node->local.translate[k];
+        e.wp = 0;
+        e.next_attack = e.busy_until = 0.0;
+        e.hit.active = false;
+        e.set = "_G1";
+        e.hurt_set = "_L1";
+        // EnemyStart argv: body, "difficulty,weapon,health", waypoints, ...
+        for (size_t t = 0; t < sc.spawn_points.size(); ++t) {
+            const assets::k2a_trap& sp = sc.spawn_points[t];
+            if (sp.node != a.script_name) continue;
+            if (sp.argv.size() > 1) a.max_health = a.health = 50 + 25 * std::atoi(sp.argv[1].c_str());
+            if (sp.argv.size() > 2) {
+                std::string list = sp.argv[2];
+                size_t st = 0;
+                while (st < list.size()) {
+                    size_t c = list.find(',', st);
+                    std::string nm = list.substr(st, c == std::string::npos ? std::string::npos : c - st);
+                    for (size_t q = 0; q < nm.size(); ++q)
+                        if (nm[q] >= 'A' && nm[q] <= 'Z') nm[q] = char(nm[q] - 'A' + 'a');
+                    std::map<std::string, scene::named_point>::const_iterator it = sc.points.find(nm);
+                    if (it != sc.points.end()) {
+                        std::array<float, 3> w = {{ it->second.pos[0], it->second.pos[1], it->second.pos[2] }};
+                        e.way.push_back(w);
+                    }
+                    if (c == std::string::npos) break;
+                    st = c + 1;
+                }
+            }
+        }
+        cs.enemies.push_back(e);
+    }
+}
+
+void prince_damage(combat_state& cs, scene& sc, actor_inst& p, int dmg, int dir, double now) {
+    if (cs.dead_since >= 0.0) return;
+    p.health -= dmg;
+    play_sound("GBLpfiteinjur", p.node->local.translate, 14.0f, false);
+    if (p.health <= 0) {
+        p.health = 0;
+        cs.dead_since = now;
+        p.stance = 0;
+        if (!play_once(sc, p, p.armed ? "CombatDeathGeneric_G2" : "DeathGeneric_G", now, actor_yaw(p), true))
+            play_once(sc, p, "CombatDeathGeneric_G1", now, actor_yaw(p), true);
+        std::printf("combat: the Prince falls\n");
+        return;
+    }
+    play_once(sc, p, std::string("CombatBeingInjured") + k_dir_names[dir] + "_L2", now, actor_yaw(p), false);
+    cs.prince_busy_until = now + skill_seconds(sc, p, std::string("CombatBeingInjured") + k_dir_names[dir] + "_L2");
+}
+
+void enemy_damage(combat_state& cs, scene& sc, enemy_ai& e, int dmg, int dir, double now) {
+    actor_inst& a = sc.actors[size_t(e.actor)];
+    a.health -= dmg;
+    play_sound("gblswordswish", a.node->local.translate, 14.0f, false);
+    if (a.health <= 0) {
+        e.state = enemy_ai::DEAD;
+        a.stance = 0;
+        play_once(sc, a, "CombatDying" + e.set, now, actor_yaw(a), true);
+        std::printf("combat: %s is defeated\n", a.script_name.c_str());
+        return;
+    }
+    const std::string hurt = std::string("CombatBeingInjured") + k_dir_names[dir] + e.hurt_set;
+    play_once(sc, a, hurt, now, actor_yaw(a), false);
+    e.busy_until = now + skill_seconds(sc, a, hurt);
+    e.hit.active = false;
+}
+
+// Moves an actor toward `to` at its walk or run clip's speed, on the floor.
+void steer(scene& sc, actor_inst& a, const float* to, bool run, float dt) {
+    const int clip = run ? LOCO_RUN : LOCO_WALK;
+    a.stance = 0;
+    set_clip(a, clip);
+    float* p = a.node->local.translate;
+    const float dx = to[0] - p[0], dz = to[2] - p[2];
+    const float d = std::sqrt(dx * dx + dz * dz);
+    if (d < 1e-4f) return;
+    float speed = run ? 4.5f : 1.6f;
+    if (a.loco_ok.size() > size_t(clip) && a.loco_ok[size_t(clip)]) {
+        const float cs = clip_speed(a.loco[size_t(clip)]);
+        if (cs > 0.0f) speed = cs;
+    }
+    const float step = std::min(d, speed * dt);
+    move_horizontal(sc.coll, p, dx / d * step, dz / d * step);
+    a.node->local.set_yaw(std::atan2(dx, dz));
+}
+
+void enemy_update(combat_state& cs, scene& sc, enemy_ai& e, actor_inst& prince,
+                  bool prince_available, double now, float dt) {
+    actor_inst& a = sc.actors[size_t(e.actor)];
+    if (e.state == enemy_ai::DEAD || a.hidden) return;
+    const k2::engine::fight_params& fp = *cs.params;
+    float* p = a.node->local.translate;
+    const float* pp = prince.node->local.translate;
+    const float dx = pp[0] - p[0], dz = pp[2] - p[2];
+    const float d = std::sqrt(dx * dx + dz * dz);
+    const bool same_floor = std::fabs(pp[1] - p[1]) < 1.5f;
+
+    // A swing in flight lands at its time, blocked or not.
+    if (e.hit.active && now >= e.hit.at) {
+        e.hit.active = false;
+        const bool in_front = angle_diff(yaw_toward(p, pp), actor_yaw(a)) < 1.2f;
+        if (prince_available && same_floor && d <= combat_tuning::REACH && in_front) {
+            if (cs.prince_blocking) {
+                play_sound("gblswordclank", p, 14.0f, false);
+                const std::string rec = std::string("CombatBlocked") + k_dir_names[e.hit.dir] + e.set;
+                play_once(sc, a, rec, now, actor_yaw(a), false);
+                e.busy_until = now + std::max(skill_seconds(sc, a, rec),
+                    fp.fight(std::string("Sword Blocked ") + k_dir_names[e.hit.dir] + " Attack Recover", 0.37));
+            } else {
+                prince_damage(cs, sc, prince, combat_tuning::HIT_DAMAGE, e.hit.dir, now);
+            }
+        }
+    }
+    if (a.scripted || now < e.busy_until) return;     // a clip owns the body
+
+    // Stay on the floor.
+    float gy;
+    if (ground_under(sc.coll, p, gy)) p[1] = gy;
+
+    const float watch  = float(fp.enemy("distFarFromEnemy", 10.0));
+    const float charge = float(fp.enemy("distApproachEnemy", 5.0));
+    const float periph = float(fp.enemy("peripheral", 30.0)) * 3.14159265f / 180.0f;
+    const bool  sees = prince_available && same_floor && d < watch &&
+                       (d < charge || angle_diff(yaw_toward(p, pp), actor_yaw(a)) < periph);
+
+    switch (e.state) {
+    case enemy_ai::PATROL:
+        if (sees) {
+            e.state = enemy_ai::CHARGE;
+            play_sound("PG1dlg", p, 20.0f, false);
+            std::printf("combat: %s sees the Prince (%.1f away)\n", a.script_name.c_str(), d);
+            break;
+        }
+        if (!e.way.empty()) {
+            const std::array<float, 3>& w = e.way[e.wp % e.way.size()];
+            const float wx = w[0] - p[0], wz = w[2] - p[2];
+            if (wx * wx + wz * wz < 0.25f) e.wp = (e.wp + 1) % e.way.size();
+            else steer(sc, a, &w[0], false, dt);
+        } else {
+            const float hx = e.home[0] - p[0], hz = e.home[2] - p[2];
+            if (hx * hx + hz * hz > 0.25f) steer(sc, a, e.home, false, dt);
+            else { a.stance = 0; set_clip(a, LOCO_BASE); }
+        }
+        break;
+    case enemy_ai::CHARGE:
+        if (!prince_available || d > watch * 1.5f) { e.state = enemy_ai::PATROL; break; }
+        if (d <= combat_tuning::FIGHT_DIST) {
+            e.state = enemy_ai::FIGHT;
+            e.next_attack = now + 0.6;
+            break;
+        }
+        steer(sc, a, pp, true, dt);
+        break;
+    case enemy_ai::FIGHT:
+    case enemy_ai::RECOVER: {
+        if (!prince_available) { e.state = enemy_ai::PATROL; a.stance = 0; break; }
+        if (d > combat_tuning::FIGHT_DIST * 1.6f) { e.state = enemy_ai::CHARGE; break; }
+        a.node->local.set_yaw(std::atan2(dx, dz));
+        a.stance = find_actor_skill(sc, a, "CombatAtReady" + e.set);
+        if (now >= e.next_attack) {
+            const int dir = std::rand() % 3;
+            const std::string atk = std::string("CombatAttack") + k_dir_names[dir] + e.set;
+            if (play_once(sc, a, atk, now, actor_yaw(a), false)) {
+                e.hit.active = true;
+                e.hit.dir = dir;
+                e.hit.at = now + fp.fight(std::string("Sword ") + k_dir_names[dir] + " Attack Begin", 0.3)
+                               + fp.fight("Unblocked Attack", 0.0667);
+                e.busy_until = now + skill_seconds(sc, a, atk);
+            }
+            e.next_attack = now + 1.4 + double(std::rand() % 1000) / 1000.0 * 1.2;
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+// The Prince's swing lands: the nearest guard in reach and in front takes it,
+// or blocks.
+void prince_hit_resolve(combat_state& cs, scene& sc, actor_inst& p, double now) {
+    if (!cs.prince_hit.active || now < cs.prince_hit.at) return;
+    cs.prince_hit.active = false;
+    const float* pp = p.node->local.translate;
+    enemy_ai* best = 0;
+    float best_d = combat_tuning::REACH;
+    for (size_t i = 0; i < cs.enemies.size(); ++i) {
+        enemy_ai& e = cs.enemies[i];
+        if (e.state == enemy_ai::DEAD) continue;
+        const float* q = sc.actors[size_t(e.actor)].node->local.translate;
+        const float dx = q[0] - pp[0], dz = q[2] - pp[2];
+        const float d = std::sqrt(dx * dx + dz * dz);
+        if (d > best_d || std::fabs(q[1] - pp[1]) > 1.5f) continue;
+        if (angle_diff(std::atan2(dx, dz), actor_yaw(p)) > 1.2f) continue;
+        best = &e;
+        best_d = d;
+    }
+    if (!best) return;
+    actor_inst& a = sc.actors[size_t(best->actor)];
+    const bool can_block = (best->state == enemy_ai::FIGHT) && !a.scripted && now >= best->busy_until;
+    if (can_block && float(std::rand() % 1000) / 1000.0f < combat_tuning::GUARD_BLOCK) {
+        play_sound("gblswordclank", a.node->local.translate, 14.0f, false);
+        play_once(sc, a, std::string("CombatBlock") + k_dir_names[cs.prince_hit.dir] + best->set,
+                  now, actor_yaw(a), false);
+        best->busy_until = now + 0.5;
+        return;
+    }
+    enemy_damage(cs, sc, *best, 25, cs.prince_hit.dir, now);
+}
+
+// The guard nearest the Prince within `range`, or -1.
+int nearest_enemy(const combat_state& cs, const scene& sc, const float* pp, float range) {
+    int best = -1;
+    float bd = range;
+    for (size_t i = 0; i < cs.enemies.size(); ++i) {
+        if (cs.enemies[i].state == enemy_ai::DEAD) continue;
+        const float* q = sc.actors[size_t(cs.enemies[i].actor)].node->local.translate;
+        const float d = std::sqrt((q[0]-pp[0])*(q[0]-pp[0]) + (q[2]-pp[2])*(q[2]-pp[2]));
+        if (d < bd && std::fabs(q[1] - pp[1]) < 1.5f) { bd = d; best = int(i); }
+    }
+    return best;
+}
+
+// --- pickups ------------------------------------------------------------------
+//
+// Traps.txt: Pickups argv1 ActorName, argv2 ItemName, argv3 code (a script),
+// then optional reach / grasp / use animations. In the data a health potion is
+// argv1 "1" and argv2 an amount ("24"); the Prince's sword is argv1
+// "PrinceSword01", argv2 "weapon", argv3 the script that follows. E picks up.
+struct pickup {
+    std::string name, actor, item, code;
+    float       pos[3];
+    bool        taken;
+};
 // The game module, as the original structures it: `gameModule` owns a level and
 // is entered through the module manager rather than being loaded inline.
 //
@@ -3559,9 +3943,11 @@ int main(int argc, char** argv) {
     bool autojump = false;
     bool classic  = false;
     bool mute     = false;
+    bool start_armed = false;
     bool sounds_only = false;
     bool find_ledges = false;
-    std::vector<std::pair<std::string, double> > holds;   // --hold KEYS@T
+    struct key_hold { std::string keys; double from, to; };
+    std::vector<key_hold> holds;                           // --hold KEYS@T0[-T1]
     std::vector<std::string> send_args;
     const char* place_arg = 0;
     bool trapmsg  = false;
@@ -3609,12 +3995,17 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--autojump") == 0) autojump = true;
         else if (std::strcmp(argv[i], "--findledges") == 0) find_ledges = true;
         else if (std::strcmp(argv[i], "--mute") == 0) mute = true;
+        else if (std::strcmp(argv[i], "--armed") == 0) start_armed = true;
         else if (std::strcmp(argv[i], "--sounds") == 0) sounds_only = true;
         else if (std::strcmp(argv[i], "--hold") == 0 && i + 1 < argc) {
             const std::string h = argv[++i];
             const size_t at = h.find('@');
-            holds.push_back(std::make_pair(h.substr(0, at),
-                            at == std::string::npos ? 0.0 : std::atof(h.c_str() + at + 1)));
+            key_hold kh;
+            kh.keys = h.substr(0, at);
+            kh.from = at == std::string::npos ? 0.0 : std::atof(h.c_str() + at + 1);
+            const size_t dash = at == std::string::npos ? std::string::npos : h.find('-', at + 1);
+            kh.to = dash == std::string::npos ? 1e30 : std::atof(h.c_str() + dash + 1);
+            holds.push_back(kh);
         }
         else if (std::strcmp(argv[i], "--controls") == 0 && i + 1 < argc)
             classic = std::strcmp(argv[++i], "classic") == 0;
@@ -3964,6 +4355,25 @@ int main(int argc, char** argv) {
         if (!sc.actors[i].is_enemy) prince_ptr = t;
     }
     actor_target* const prince_msgs = prince_ptr;  // 0 when no Prince was spawned
+
+    // Combat tuning from the install, then the guards.
+    k2::engine::fight_params fight_tuning;
+    {
+        size_t sz = 0;
+        uint8_t* d = plat::fs_read_basename("fight.ini", sz);
+        if (d) { fight_tuning.parse_fight_ini(reinterpret_cast<const char*>(d), sz); plat::fs_free(d); }
+        d = plat::fs_read_basename("enemy.dat", sz);
+        if (d) { fight_tuning.parse_enemy_dat(reinterpret_cast<const char*>(d), sz); plat::fs_free(d); }
+    }
+    combat_state combat;
+    combat_init(combat, sc, fight_tuning);
+    if (start_armed)
+        for (size_t i = 0; i < sc.actors.size(); ++i)
+            if (!sc.actors[i].is_enemy) sc.actors[i].armed = true;
+    std::vector<bool> pickup_taken(sc.pickups.size(), false);
+    std::printf("combat: %zu fight.ini values, %zu enemy.dat values, %zu guards, %zu pickups\n",
+                fight_tuning.fight_count(), fight_tuning.enemy_count(), combat.enemies.size(),
+                sc.pickups.size());
     camera_target camera_msgs(sc);
     sc.script.add(&camera_msgs);
     // While a script holds the Prince (snooze) the player has no control at
@@ -3976,6 +4386,7 @@ int main(int argc, char** argv) {
     crate_ctl crates;
     jump_ctl  jumps;
     hang_ctl  ledges;
+    bool      draw_was_down = false, atk_was_down = false;
     bool      jump_was_down = false;
     std::printf("scripts: %zu traps, %zu areas, %zu plates%s\n", sc.traps.size(),
                 sc.areas.size(), sc.plates.size(),
@@ -4036,7 +4447,7 @@ int main(int argc, char** argv) {
                 case plat::EVENT_KEY_DOWN:
                     if (e.k == plat::KEY_ESCAPE) running = false;
                     if (e.k == plat::KEY_R) frame_scene(cam, sc);
-                    if (e.k == plat::KEY_F && !input_locked) {
+                    if (e.k == plat::KEY_V && !input_locked) {
                         follow_mode = !follow_mode;
                         std::printf("camera: %s\n", follow_mode ? "follow" : "free-fly");
                         std::fflush(stdout);
@@ -4119,6 +4530,52 @@ int main(int argc, char** argv) {
             for (size_t i = 0; i < sc.actors.size(); ++i)
                 if (update_scripted(sc.actors[i], game_time) && !sc.actors[i].is_enemy)
                     player_yaw = sc.actors[i].scripted_yaw;
+
+            // Combat: guards, swings landing, and a fallen Prince coming back.
+            actor_inst* prince_a = 0;
+            for (size_t i = 0; i < sc.actors.size(); ++i)
+                if (!sc.actors[i].is_enemy) { prince_a = &sc.actors[i]; break; }
+            if (prince_a) {
+                const bool snoozing = game_time < (prince_msgs ? prince_msgs->snooze_until : 0.0);
+                const bool available = !snoozing && combat.dead_since < 0.0;
+                for (size_t i = 0; i < combat.enemies.size(); ++i)
+                    enemy_update(combat, sc, combat.enemies[i], *prince_a, available, game_time, dt);
+                prince_hit_resolve(combat, sc, *prince_a, game_time);
+                // Falling out of the world is a death too.
+                if (combat.dead_since < 0.0 && prince_a->node->local.translate[1] < sc.mn[1] - 15.0f) {
+                    prince_a->health = 0;
+                    combat.dead_since = game_time;
+                    std::printf("combat: the Prince fell out of the world\n");
+                }
+                if (combat.dead_since >= 0.0 &&
+                    game_time - combat.dead_since > combat_tuning::RESPAWN_TIME) {
+                    // Back to the level's start, whole; guards return home.
+                    k2::engine::transform& plt = prince_a->node->local;
+                    for (int k = 0; k < 3; ++k) plt.translate[k] = combat.spawn[k];
+                    player_yaw = combat.spawn_yaw;
+                    prince_a->health = prince_a->max_health;
+                    prince_a->scripted = 0;
+                    prince_a->posed_hold = false;
+                    prince_a->stance = 0;
+                    set_clip(*prince_a, LOCO_BASE);
+                    combat.dead_since = -1.0;
+                    combat.prince_drawn = false;
+                    combat.prince_busy_until = 0.0;
+                    jumps.state = jump_ctl::NONE;
+                    ledges.state = hang_ctl::NONE;
+                    crates.state = crate_ctl::NONE;
+                    for (size_t i = 0; i < combat.enemies.size(); ++i) {
+                        enemy_ai& e = combat.enemies[i];
+                        if (e.state == enemy_ai::DEAD) continue;
+                        e.state = enemy_ai::PATROL;
+                        e.hit.active = false;
+                        actor_inst& ea = sc.actors[size_t(e.actor)];
+                        for (int k = 0; k < 3; ++k) ea.node->local.translate[k] = e.home[k];
+                        ea.stance = 0;
+                    }
+                    std::printf("combat: the Prince returns\n");
+                }
+            }
             for (size_t i = 0; i < sc.traps.size(); ++i) {
                 scene_trap* st = dynamic_cast<scene_trap*>(sc.traps[i]);
                 if (st) st->update(game_time);
@@ -4139,12 +4596,21 @@ int main(int argc, char** argv) {
 
         // --hold KEYS@T: headless input. Letters, or ' ' for Space, held from
         // game time T on.
-        for (size_t i = 0; i < holds.size(); ++i) {
-            if (game_time < holds[i].second) continue;
-            for (size_t c = 0; c < holds[i].first.size(); ++c) {
-                const char ch = holds[i].first[c];
-                if (ch >= 'A' && ch <= 'Z') down[plat::KEY_A + (ch - 'A')] = true;
-                if (ch == '_') down[plat::KEY_SPACE] = true;
+        if (!holds.empty()) {
+            // A key is down while any of its ranges covers now.
+            for (size_t i = 0; i < holds.size(); ++i)
+                for (size_t c = 0; c < holds[i].keys.size(); ++c) {
+                    const char ch = holds[i].keys[c];
+                    if (ch >= 'A' && ch <= 'Z') down[plat::KEY_A + (ch - 'A')] = false;
+                    if (ch == '_') down[plat::KEY_SPACE] = false;
+                }
+            for (size_t i = 0; i < holds.size(); ++i) {
+                if (game_time < holds[i].from || game_time >= holds[i].to) continue;
+                for (size_t c = 0; c < holds[i].keys.size(); ++c) {
+                    const char ch = holds[i].keys[c];
+                    if (ch >= 'A' && ch <= 'Z') down[plat::KEY_A + (ch - 'A')] = true;
+                    if (ch == '_') down[plat::KEY_SPACE] = true;
+                }
             }
         }
 
@@ -4236,11 +4702,79 @@ int main(int argc, char** argv) {
                                            (pad.connected && pad.button[plat::PAD_X]));
             const bool push = !snoozed && (local[2] > 0.5f || autopush);
             const bool pull = !snoozed && local[2] < -0.5f;
-            const bool scripted_now = player->scripted != 0;
+            const bool scripted_now = player->scripted != 0 || combat.dead_since >= 0.0 ||
+                                      game_time < combat.prince_busy_until;
             const bool jump_key = !snoozed && (down[plat::KEY_SPACE] || autojump ||
                                                (pad.connected && pad.button[plat::PAD_A]));
-            const bool jump_pressed = jump_key && !jump_was_down;
+            const bool jump_pressed_raw = jump_key && !jump_was_down;
             jump_was_down = jump_key;
+
+            // --- combat input: R / pad Y draw or sheathe, F / pad B attack,
+            // G / pad LB block (held). Only with the sword.
+            const bool dead = combat.dead_since >= 0.0;
+            const bool draw_key = !snoozed && (down[plat::KEY_R] || (pad.connected && pad.button[plat::PAD_Y]));
+            const bool atk_key  = !snoozed && (down[plat::KEY_F] || (pad.connected && pad.button[plat::PAD_B]));
+            const bool blk_key  = !snoozed && (down[plat::KEY_G] || (pad.connected && pad.button[plat::PAD_LSHOULDER]));
+            const bool draw_pressed = draw_key && !draw_was_down;
+            const bool atk_pressed  = atk_key && !atk_was_down;
+            draw_was_down = draw_key;
+            atk_was_down = atk_key;
+            const bool free_body = !dead && !player->scripted && game_time >= combat.prince_busy_until &&
+                                   jumps.state == jump_ctl::NONE && ledges.state == hang_ctl::NONE &&
+                                   crates.state == crate_ctl::NONE;
+            if (draw_pressed && player->armed && free_body) {
+                combat.prince_drawn = !combat.prince_drawn;
+                const char* clip = combat.prince_drawn ? "CombatDrawWeaponBack_G2" : "CombatStoreWeaponBack_G2";
+                play_once(sc, *player, clip, game_time, player_yaw, false);
+                combat.prince_busy_until = game_time + skill_seconds(sc, *player, clip);
+                if (!combat.prince_drawn) player->stance = 0;
+            }
+            combat.prince_blocking = combat.prince_drawn && blk_key && free_body;
+            if (combat.prince_drawn && free_body) {
+                // Face the nearest guard; stand ready, or block.
+                const int ne = nearest_enemy(combat, sc, lt.translate, 6.0f);
+                if (ne >= 0) player_yaw = yaw_toward(lt.translate,
+                                                     sc.actors[size_t(combat.enemies[size_t(ne)].actor)].node->local.translate);
+                if (atk_pressed) {
+                    const int dir = local[0] > 0.4f ? DIR_LEFT : local[0] < -0.4f ? DIR_RIGHT : DIR_CENTER;
+                    const std::string atk = std::string("CombatAttack") + k_dir_names[dir] + "_G2";
+                    if (play_once(sc, *player, atk, game_time, player_yaw, false)) {
+                        combat.prince_hit.active = true;
+                        combat.prince_hit.dir = dir;
+                        combat.prince_hit.at = game_time + fight_tuning.fight(
+                            std::string("Sword ") + k_dir_names[dir] + " Attack Begin", 0.3);
+                        combat.prince_busy_until = game_time + skill_seconds(sc, *player, atk);
+                    }
+                }
+                player->stance = find_actor_skill(sc, *player,
+                    combat.prince_blocking ? "CombatBlockingCenter_G2" : "CombatAtReady_G2");
+            }
+            // E near a pickup collects it.
+            if (act && !dead) {
+                for (size_t i = 0; i < sc.pickups.size(); ++i) {
+                    if (pickup_taken[i]) continue;
+                    const scene::pickup_def& pk = sc.pickups[i];
+                    const float dx = pk.pos[0] - lt.translate[0], dz = pk.pos[2] - lt.translate[2];
+                    if (dx * dx + dz * dz > 1.6f * 1.6f || std::fabs(pk.pos[1] - lt.translate[1]) > 2.0f) continue;
+                    pickup_taken[i] = true;
+                    const std::string a1 = pk.argv.size() > 1 ? pk.argv[1] : "";
+                    const std::string a2 = pk.argv.size() > 2 ? pk.argv[2] : "";
+                    if (a2 == "weapon") {
+                        player->armed = true;
+                        std::printf("pickup: %s - the Prince has a sword (R draws it)\n", pk.name.c_str());
+                    } else if (a1 == "1") {
+                        player->health = std::min(player->max_health, player->health + std::atoi(a2.c_str()));
+                        std::printf("pickup: %s - health %d\n", pk.name.c_str(), player->health);
+                    } else {
+                        std::printf("pickup: %s (%s) - not used yet\n", pk.name.c_str(), a1.c_str());
+                    }
+                    if (pk.argv.size() > 3 && !pk.argv[3].empty()) sc.script.execute(pk.argv[3], 0);
+                    play_sound("PRNpickup", lt.translate, 10.0f, false);
+                    break;
+                }
+            }
+            // While the sword is drawn, jump is not a jump.
+            const bool jump_pressed = jump_pressed_raw && !combat.prince_drawn && !dead;
 
             // Ledges first: hanging and climbing own the body.
             bool dropped = false;
@@ -4292,6 +4826,7 @@ int main(int argc, char** argv) {
             } else if (in_crate) {
                 crate_input(crates, sc, *player, lt.translate, player_yaw, game_time, act, push, pull);
             } else if (ml > 1e-6f) {
+                player->stance = 0;
                 // Walk_L or Running_L, moved at the speed its own root motion
                 // covers, so the feet do not slide. Classic's back step plays
                 // WalkBackwards_L1 and keeps his facing.
@@ -4321,7 +4856,8 @@ int main(int argc, char** argv) {
                 // atan2(x, z), hence the difference of two angles.
                 if (!classic)
                     player_yaw = std::atan2(mv[0], mv[2]) - std::atan2(fwd_model[0], fwd_model[2]);
-            } else {
+            } else if (!combat.prince_drawn) {
+                player->stance = 0;
                 set_clip(*player, LOCO_BASE);
             }
             // Stand on the floor, step up small ledges, fall off edges.
@@ -4612,6 +5148,59 @@ int main(int argc, char** argv) {
             gfx::set_tint(1.0f, 1.0f, 1.0f, 1.0f);
         }
 
+        // HUD: the Prince's health, top left. A unit quad in clip space.
+        {
+            actor_inst* pa = 0;
+            for (size_t i = 0; i < sc.actors.size(); ++i)
+                if (!sc.actors[i].is_enemy) { pa = &sc.actors[i]; break; }
+            if (pa && follow_mode && !input_locked) {
+                static gfx::mesh_id quad = 0;
+                if (!quad) {
+                    gfx::vertex v[4];
+                    std::memset(v, 0, sizeof(v));
+                    const float xy[4][2] = { {0,0}, {1,0}, {1,1}, {0,1} };
+                    for (int k = 0; k < 4; ++k) {
+                        v[k].x = xy[k][0]; v[k].y = xy[k][1]; v[k].z = 0.0f;
+                        v[k].nz = 1.0f; v[k].r = v[k].g = v[k].b = v[k].a = 255;
+                    }
+                    const uint16_t ix[6] = { 0, 1, 2, 0, 2, 3 };
+                    quad = gfx::create_mesh(v, 4, ix, 6);
+                }
+                float ident[16];
+                mat4_identity(ident);
+                gfx::set_view_projection(ident, ident);
+                gfx::render_state hs;
+                hs.blend = gfx::BLEND_ALPHA;
+                hs.depth = gfx::DEPTH_NONE;
+                hs.alpha_test = false;
+                hs.vertex_color = false;
+                hs.wireframe = false;
+                hs.fog = false;
+                gfx::set_render_state(hs);
+                gfx::set_texture(gfx::INVALID_TEXTURE);
+                const float frac = pa->max_health > 0 ? float(pa->health) / float(pa->max_health) : 0.0f;
+                const float x0 = -0.95f, y0 = 0.88f, w0 = 0.5f, h0 = 0.04f;
+                float m[16];
+                mat4_identity(m);
+                m[0] = w0 + 0.01f; m[5] = h0 + 0.01f; m[12] = x0 - 0.005f; m[13] = y0 - 0.005f;
+                gfx::set_model(m);
+                gfx::set_tint(0.05f, 0.03f, 0.02f, 0.75f);
+                gfx::draw(quad);
+                m[0] = w0 * frac; m[5] = h0; m[12] = x0; m[13] = y0;
+                gfx::set_model(m);
+                gfx::set_tint(0.75f, 0.08f, 0.05f, 0.95f);
+                if (frac > 0.0f) gfx::draw(quad);
+                if (pa->armed) {                        // a small mark for the sword
+                    m[0] = 0.02f; m[5] = h0; m[12] = x0 + w0 + 0.02f; m[13] = y0;
+                    gfx::set_model(m);
+                    gfx::set_tint(0.85f, 0.8f, 0.6f, 0.95f);
+                    gfx::draw(quad);
+                }
+                gfx::set_tint(1.0f, 1.0f, 1.0f, 1.0f);
+                gfx::set_model(model);
+            }
+        }
+
         gfx::end_frame();
 
         plat::swap_buffers();
@@ -4625,11 +5214,19 @@ int main(int argc, char** argv) {
                 for (size_t a = 0; a < sc.actors.size(); ++a) {
                     if (sc.actors[a].is_enemy) continue;
                     const k2::engine::transform& tw = sc.actors[a].node->world();
-                    std::printf("player at (%.2f, %.2f, %.2f) yaw %.2f  camera (%.2f, %.2f, %.2f)\n",
+                    std::printf("player at (%.2f, %.2f, %.2f) yaw %.2f  camera (%.2f, %.2f, %.2f)  health %d\n",
                                 tw.translate[0], tw.translate[1], tw.translate[2],
                                 std::atan2(tw.rotate[2], tw.rotate[8]),
-                                cam.pos[0], cam.pos[1], cam.pos[2]);
+                                cam.pos[0], cam.pos[1], cam.pos[2], sc.actors[a].health);
                     break;
+                }
+                for (size_t i = 0; i < combat.enemies.size(); ++i) {
+                    const enemy_ai& e = combat.enemies[i];
+                    const actor_inst& ea = sc.actors[size_t(e.actor)];
+                    std::printf("guard %-20s state %d at (%.2f, %.2f, %.2f) health %d%s\n",
+                                ea.script_name.c_str(), int(e.state), ea.node->local.translate[0],
+                                ea.node->local.translate[1], ea.node->local.translate[2], ea.health,
+                                ea.scripted ? " (in a clip)" : "");
                 }
                 if (write_bmp(shot_path, w, h, &px[0]))
                     std::printf("wrote %s (%dx%d)\n", shot_path, w, h);

@@ -38,6 +38,7 @@ set(K2_SOURCES
     src/engine/trap.cpp
     src/engine/script.cpp
     src/engine/mixer.cpp
+    src/engine/fight.cpp
 )
 
 if(APPLE)

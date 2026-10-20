@@ -65,6 +65,7 @@ form (`geometry\rooms\prisonfix\prison3.k2a`) because that is what the binary co
   - [`trap-scripts.md`](reference/trap-scripts.md) — the message language that drives level progression
   - [`crates.md`](reference/crates.md) — push and pull: the step, the floor probe, the clips
   - [`jumps.md`](reference/jumps.md) — jump states, the tuning block and its defaults
+  - [`combat.md`](reference/combat.md) — combat: what comes from the game, what is ours
   - [`trap-factory.md`](reference/trap-factory.md) — the 33 trap registry keys + registration mechanism
   - [`script-api.md`](reference/script-api.md) — the Piccolo scripting API: 29 classes, 250 methods
   - [`vm-isa.md`](reference/vm-isa.md) — the Piccolo VM: interpreter, machine model, 89-opcode map
