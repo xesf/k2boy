@@ -656,8 +656,22 @@ struct actor_inst {
     int                               clip;
     double                            clip_ms;
 
+    // Scripts address an actor by the node that spawned it ("prince" for the
+    // Prince); "SkillAt:" plays one of its skills once, at a placeholder.
+    std::string                       script_name;
+    std::string                       skill_dir;      // VFS dir of its .act
+    const assets::skl_file*           scripted;       // playing, or 0
+    double                            scripted_start;
+    float                             scripted_origin[3];
+    float                             scripted_yaw;
+    bool                              remove_after;   // "...,REMOVE"
+    bool                              hidden;
+
     actor_inst() : node(0), is_enemy(false), first_item(0), item_count(0),
-                   skinned(false), clip(-1), clip_ms(0.0) {}
+                   skinned(false), clip(-1), clip_ms(0.0), scripted(0), scripted_start(0),
+                   scripted_yaw(0), remove_after(false), hidden(false) {
+        scripted_origin[0] = scripted_origin[1] = scripted_origin[2] = 0.0f;
+    }
 };
 
 // The original's locomotion set, in the order of its name table at 0x749C30:
@@ -695,6 +709,11 @@ struct scene {
     std::vector<k2::engine::trap_object*>  traps;   // owned
     std::vector<k2::engine::area_trap*>    areas;   // also in `traps`
     std::vector<k2::engine::pressure_plate*> plates; // also in `traps`
+    // Every room node's position, by lower-case name, for scripts that name
+    // places: "camera,tripod,(@IntroNISCam01)", "SkillAt:...,IntroNISPH".
+    // Engine space. Target cameras also carry where they look.
+    struct named_point { float pos[3]; bool has_target; float target[3]; float yaw; };
+    std::map<std::string, named_point> points;
     // Trap actors' skills, loaded on first use: "actor/skill" lower-case.
     std::map<std::string, assets::skl_file*> trap_skills;
     float mn[3];
@@ -1081,6 +1100,7 @@ void load_loco_clips(const std::string& act_name, actor_inst& a) {
     a.loco.assign(LOCO_COUNT, assets::skl_file());
     a.loco_ok.assign(LOCO_COUNT, false);
     const std::string dir = actor_dir_for(act_name);
+    a.skill_dir = dir;
     if (dir.empty()) return;
     for (int c = 0; c < LOCO_COUNT; ++c) {
         const std::string path = dir + "skills/" + k_loco_names[c] + ".skl";
@@ -1177,6 +1197,7 @@ void scene_reset(scene& sc) {
     sc.root = new k2::engine::level_group();
     sc.root->name = "LevelRoot";
     sc.spawn_points.clear();
+    sc.points.clear();
     sc.coll.clear();
     sc.script.clear();
     for (size_t i = 0; i < sc.traps.size(); ++i) delete sc.traps[i];
@@ -1335,21 +1356,214 @@ private:
     double                        m_skill_start;
 };
 
-// "prince": the messages the Prince takes from scripts. Only snooze (no input
-// for N seconds) is acted on; skills and weapons need the PrinceObject.
-class prince_target : public k2::engine::script_target {
+// An actor as a script target, under the name of the node that spawned it
+// ("prince" for the Prince). Understood:
+//   snooze:t                         no player input for t seconds (the Prince)
+//   SkillAt:skill[,placeholder[,REMOVE]]
+//                                    play one of its skills once; with a
+//                                    placeholder, from that node's position
+//                                    and facing; REMOVE hides it afterwards
+class actor_target : public k2::engine::script_target {
 public:
-    explicit prince_target(k2::engine::script_world& w)
-        : script_target("prince"), m_world(w), snooze_until(0.0) {}
+    actor_target(k2::engine::script_world& w, scene& sc, size_t actor)
+        : script_target(sc.actors[actor].script_name), snooze_until(0.0), m_world(w), m_sc(sc),
+          m_actor(actor) {}
+
     bool receive(const std::string& msg, k2::engine::script_target*) {
         if (msg.compare(0, 7, "snooze:") == 0) {
             snooze_until = m_world.now() + std::atof(msg.c_str() + 7);
             return true;
         }
+        if (msg.compare(0, 8, "SkillAt:") == 0 || msg.compare(0, 8, "skillat:") == 0)
+            return skill_at(msg.substr(8));
         return false;
     }
-    k2::engine::script_world& m_world;
+
     double snooze_until;
+
+private:
+    bool skill_at(const std::string& args) {
+        actor_inst& a = m_sc.actors[m_actor];
+        std::vector<std::string> f;
+        size_t start = 0;
+        for (;;) {
+            const size_t c = args.find(',', start);
+            f.push_back(args.substr(start, c == std::string::npos ? std::string::npos : c - start));
+            if (c == std::string::npos) break;
+            start = c + 1;
+        }
+        if (f.empty() || f[0].empty() || a.skill_dir.empty()) {
+            std::printf("SkillAt: %s has no skills (not skinned?)\n", name().c_str());
+            return false;
+        }
+
+        std::string path = a.skill_dir + "skills/" + f[0] + ".skl";
+        for (size_t i = 0; i < path.size(); ++i)
+            if (path[i] >= 'A' && path[i] <= 'Z') path[i] = char(path[i] - 'A' + 'a');
+        std::map<std::string, assets::skl_file*>::iterator it = m_sc.trap_skills.find(path);
+        assets::skl_file* sk = 0;
+        if (it != m_sc.trap_skills.end()) sk = it->second;
+        else {
+            size_t size = 0;
+            uint8_t* d = plat::fs_read(path.c_str(), size);
+            if (d) {
+                sk = new assets::skl_file();
+                if (!assets::skl_parse(d, size, *sk) || sk->chunk_tag != "SklS") { delete sk; sk = 0; }
+                plat::fs_free(d);
+            }
+            m_sc.trap_skills[path] = sk;
+        }
+        if (!sk) return false;
+
+        k2::engine::transform& lt = a.node->local;
+        for (int k = 0; k < 3; ++k) a.scripted_origin[k] = lt.translate[k];
+        a.scripted_yaw = std::atan2(lt.rotate[2], lt.rotate[8]);
+        if (f.size() > 1 && !f[1].empty()) {
+            std::string key = f[1];
+            for (size_t i = 0; i < key.size(); ++i)
+                if (key[i] >= 'A' && key[i] <= 'Z') key[i] = char(key[i] - 'A' + 'a');
+            std::map<std::string, scene::named_point>::const_iterator p = m_sc.points.find(key);
+            if (p != m_sc.points.end()) {
+                for (int k = 0; k < 3; ++k) a.scripted_origin[k] = p->second.pos[k];
+                a.scripted_yaw = p->second.yaw;
+            }
+        }
+        a.remove_after = f.size() > 2 && (f[2] == "REMOVE" || f[2] == "remove");
+        a.scripted = sk;
+        a.scripted_start = m_world.now();
+        a.hidden = false;
+        return true;
+    }
+
+    k2::engine::script_world& m_world;
+    scene&                    m_sc;
+    size_t                    m_actor;
+};
+
+// One frame of a scripted skill: pose every joint from the clip, held at its
+// last frame, and carry the actor along the clip's root motion (all three
+// axes: being thrown is not a walk). Returns true while it plays.
+bool update_scripted(actor_inst& a, double now) {
+    if (!a.scripted) return false;
+    const assets::skl_file& s = *a.scripted;
+    const uint32_t len = clip_length_ms(s);
+    const double el = (now - a.scripted_start) * 1000.0;
+    const bool done = el >= double(len);
+    const uint32_t t = done ? len : uint32_t(el < 0 ? 0 : el);
+
+    const size_t n = std::min(a.joint_local_cur.size(), s.joints.size());
+    for (size_t j = 0; j < n; ++j) {
+        if (!s.joints[j].present) { a.joint_local_cur[j] = a.joint_local_bind[j]; continue; }
+        float pos[3], q[4];
+        assets::skl_sample(s.joints[j].path, t, s.interpolate != 0, pos, q);
+        if (j == 0)
+            for (int k = 0; k < 3; ++k) pos[k] = a.joint_local_bind[0].translate[k];
+        transform_from_pos_quat(pos, q, a.joint_local_cur[j]);
+    }
+    pose_actor(a);
+
+    float p0[3], pt[3], q[4];
+    p0[0] = p0[1] = p0[2] = pt[0] = pt[1] = pt[2] = 0.0f;
+    if (!s.joints.empty() && s.joints[0].present) {
+        assets::skl_sample(s.joints[0].path, 0, s.interpolate != 0, p0, q);
+        assets::skl_sample(s.joints[0].path, t, s.interpolate != 0, pt, q);
+    }
+    const float dx = pt[0] - p0[0], dy = pt[1] - p0[1], dz = pt[2] - p0[2];
+    const float c = std::cos(a.scripted_yaw), sn = std::sin(a.scripted_yaw);
+    k2::engine::transform& lt = a.node->local;
+    lt.set_yaw(a.scripted_yaw);
+    lt.translate[0] = a.scripted_origin[0] + c * dx + sn * dz;
+    lt.translate[1] = a.scripted_origin[1] + dy;
+    lt.translate[2] = a.scripted_origin[2] - sn * dx + c * dz;
+
+    if (done) {
+        a.scripted = 0;
+        if (a.remove_after) a.hidden = true;
+        set_clip(a, LOCO_BASE);
+        a.clip_ms = 0.0;
+    }
+    return true;
+}
+
+// "camera": CameraLogic's script messages (parser at 0x40855D).
+//
+//   D...                    back to the default (chase) camera: DD, DDX, Default
+//   tripod,(@Node)          fixed at a camera node, looking at its .Target
+//   tripod,(x,y,z)(x,y,z)   fixed at a point, looking at a point (engine space)
+//   follow,(dx,dy,dz)(lx,ly,lz)  ride along at an offset from the Prince, looking
+//                           along a direction (our reading; not traced further)
+//
+// Trailing letters ("X") are flags the original keeps (0x409975, |5); the
+// transition they select is not modelled - every change is a cut.
+class camera_target : public k2::engine::script_target {
+public:
+    enum mode_t { DEFAULT, TRIPOD, FOLLOW };
+
+    explicit camera_target(const scene& sc) : script_target("camera"), mode(DEFAULT), m_sc(sc) {
+        for (int k = 0; k < 3; ++k) pos[k] = look[k] = 0.0f;
+    }
+
+    bool receive(const std::string& msg, k2::engine::script_target*) {
+        if (msg.empty()) return false;
+        if (msg[0] == 'D' || msg[0] == 'd') { mode = DEFAULT; return true; }
+        const size_t comma = msg.find(',');
+        if (comma == std::string::npos) return false;
+        std::string verb = msg.substr(0, comma);
+        for (size_t i = 0; i < verb.size(); ++i)
+            if (verb[i] >= 'A' && verb[i] <= 'Z') verb[i] = char(verb[i] - 'A' + 'a');
+        const std::string args = msg.substr(comma + 1);
+        float a[3], b[3];
+        bool have_b = false;
+        size_t at = 0;
+        if (!paren(args, at, a, &have_b, b)) return false;
+        float b2[3];
+        bool dummy;
+        if (paren(args, at, b2, &dummy, 0)) { for (int k = 0; k < 3; ++k) b[k] = b2[k]; have_b = true; }
+        if (verb.compare(0, 3, "tri") == 0) {
+            if (!have_b) return false;
+            for (int k = 0; k < 3; ++k) { pos[k] = a[k]; look[k] = b[k]; }
+            mode = TRIPOD;
+            return true;
+        }
+        if (verb.compare(0, 3, "fol") == 0) {
+            if (!have_b) return false;
+            for (int k = 0; k < 3; ++k) { pos[k] = a[k]; look[k] = b[k]; }
+            mode = FOLLOW;
+            return true;
+        }
+        return false;
+    }
+
+    mode_t mode;
+    float  pos[3];      // TRIPOD: where; FOLLOW: offset from the Prince
+    float  look[3];     // TRIPOD: at what; FOLLOW: direction
+
+private:
+    // One "( ... )" group from `at`: "@Node" or "x,y,z". A node that is a
+    // target camera also yields its target in `tgt`.
+    bool paren(const std::string& s, size_t& at, float* out, bool* has_tgt, float* tgt) {
+        if (at >= s.size() || s[at] != '(') return false;
+        const size_t close = s.find(')', at);
+        if (close == std::string::npos) return false;
+        const std::string body = s.substr(at + 1, close - at - 1);
+        at = close + 1;
+        if (!body.empty() && body[0] == '@') {
+            std::string key = body.substr(1);
+            for (size_t i = 0; i < key.size(); ++i)
+                if (key[i] >= 'A' && key[i] <= 'Z') key[i] = char(key[i] - 'A' + 'a');
+            std::map<std::string, scene::named_point>::const_iterator it = m_sc.points.find(key);
+            if (it == m_sc.points.end()) return false;
+            for (int k = 0; k < 3; ++k) out[k] = it->second.pos[k];
+            if (it->second.has_target && tgt) {
+                for (int k = 0; k < 3; ++k) tgt[k] = it->second.target[k];
+                *has_tgt = true;
+            }
+            return true;
+        }
+        return std::sscanf(body.c_str(), "%f,%f,%f", &out[0], &out[1], &out[2]) == 3;
+    }
+
+    const scene& m_sc;
 };
 
 // Length of an actor's skill in seconds, e.g. TRAP_PressurePlate's "On";
@@ -1392,8 +1606,34 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
     for (size_t i = 0; i < f.nodes.size(); ++i) {
         const assets::k2a_node& n = f.nodes[i];
         if (!n.has_trap) continue;
-        if (n.trap.name == "PrinceStart" || n.trap.name == "EnemyStart")
+        if (n.trap.name == "PrinceStart" || n.trap.name == "EnemyStart") {
             sc.spawn_points.push_back(n.trap);
+            sc.spawn_points.back().node = n.name;
+        }
+    }
+
+    // Node transforms are in Max's frame (z up); vertices are not. Measured on
+    // IntroAnim: TM_POS (20.34, -1.53, 0) for a volume centred at engine
+    // (20.34, y, 1.53), so engine = (x, z, -y).
+    if (collide) {
+        for (size_t i = 0; i < f.nodes.size(); ++i) {
+            const assets::k2a_node& n = f.nodes[i];
+            std::string key = n.name;
+            for (size_t c = 0; c < key.size(); ++c)
+                if (key[c] >= 'A' && key[c] <= 'Z') key[c] = char(key[c] - 'A' + 'a');
+            scene::named_point np;
+            np.pos[0] = n.pos[0]; np.pos[1] = n.pos[2]; np.pos[2] = -n.pos[1];
+            np.has_target = n.has_target;
+            np.target[0] = n.target_pos[0]; np.target[1] = n.target_pos[2];
+            np.target[2] = -n.target_pos[1];
+            // Facing, for placeholders: a rotation about Max's z is one about
+            // engine y. ASE writes TM_ROTANGLE in the opposite sense to the
+            // axis (the usual ASE quirk), so yaw = -angle * axis.z. Checked on
+            // IntroNISPH: the throw then carries the Prince into the cell.
+            const float az = n.rot_axis[2];
+            np.yaw = (std::fabs(az) > 0.9f) ? (az > 0 ? -n.rot_angle : n.rot_angle) : 0.0f;
+            sc.points[key] = np;
+        }
     }
 
     size_t total_v = 0;
@@ -1524,7 +1764,10 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
                 t = st;
             }
             sc.traps.push_back(t);
-            sc.script.add(t);
+            // A spawn trap's messages are its actor's (EnemyStart__ctor knows
+            // "SkillAt"); the actor answers under this name instead.
+            if (n.trap.name != "EnemyStart" && n.trap.name != "PrinceStart")
+                sc.script.add(t);
         }
     }
     if (collide) sc.coll.build();
@@ -1730,6 +1973,8 @@ void spawn_level_actors(scene& sc, k2::engine::body_table& bodies,
         const int owner = int(sc.actors.size());
         for (size_t k = 0; k < inst.item_count; ++k)
             sc.items[inst.first_item + k].owner = owner;
+        inst.script_name = is_enemy ? t.node : std::string("prince");
+        bind_actor_skeleton(b->master, inst, sc);
         sc.actors.push_back(inst);
 
         sc.root->update_world();
@@ -1775,6 +2020,7 @@ size_t spawn_prince_from_level(const assets::lvl_file& lv, scene& sc,
 
             actor_inst inst;
             inst.name = "Prince";
+            inst.script_name = "prince";
             inst.node = an;
             inst.is_enemy = false;
             inst.first_item = 0;
@@ -2889,8 +3135,22 @@ int main(int argc, char** argv) {
         }
     }
     // Scripts run on game time, which starts at zero with the level.
-    prince_target prince_msgs(sc.script);
-    sc.script.add(&prince_msgs);
+    // Every actor answers to its spawn node's name; the Prince to "prince".
+    std::vector<actor_target*> actor_msgs;
+    actor_target* prince_ptr = 0;
+    for (size_t i = 0; i < sc.actors.size(); ++i) {
+        if (sc.actors[i].script_name.empty()) continue;
+        actor_target* t = new actor_target(sc.script, sc, i);
+        actor_msgs.push_back(t);
+        sc.script.add(t);
+        if (!sc.actors[i].is_enemy) prince_ptr = t;
+    }
+    actor_target* const prince_msgs = prince_ptr;  // 0 when no Prince was spawned
+    camera_target camera_msgs(sc);
+    sc.script.add(&camera_msgs);
+    // While a script holds the Prince (snooze) the player has no control at
+    // all, camera included: that is a cutscene.
+    bool input_locked = false;
     sc.script.trace = trapmsg;
     // --send "target,msg" delivers a message at start, as if a trap sent it.
     for (size_t i = 0; i < send_args.size(); ++i) sc.script.send_item(send_args[i], 0);
@@ -2955,7 +3215,7 @@ int main(int argc, char** argv) {
                 case plat::EVENT_KEY_DOWN:
                     if (e.k == plat::KEY_ESCAPE) running = false;
                     if (e.k == plat::KEY_R) frame_scene(cam, sc);
-                    if (e.k == plat::KEY_F) {
+                    if (e.k == plat::KEY_F && !input_locked) {
                         follow_mode = !follow_mode;
                         std::printf("camera: %s\n", follow_mode ? "follow" : "free-fly");
                         std::fflush(stdout);
@@ -2977,7 +3237,7 @@ int main(int argc, char** argv) {
                     if (e.button == plat::MOUSE_LEFT) looking = false;
                     break;
                 case plat::EVENT_MOUSE_MOVE:
-                    if (looking) {
+                    if (looking && !input_locked) {
                         const float sens = 0.005f;
                         cam.yaw   += float(e.mouse_dx) * sens;
                         cam.pitch += float(e.mouse_dy) * sens;
@@ -3029,12 +3289,17 @@ int main(int argc, char** argv) {
                 sc.areas[i]->update(game_time, pp && sc.areas[i]->contains(pp), action);
             for (size_t i = 0; i < sc.plates.size(); ++i)
                 sc.plates[i]->update(game_time, pp && sc.plates[i]->contains(pp));
+            // Scripted skills ("SkillAt:") drive their actors outright.
+            for (size_t i = 0; i < sc.actors.size(); ++i)
+                if (update_scripted(sc.actors[i], game_time) && !sc.actors[i].is_enemy)
+                    player_yaw = sc.actors[i].scripted_yaw;
             for (size_t i = 0; i < sc.traps.size(); ++i) {
                 scene_trap* st = dynamic_cast<scene_trap*>(sc.traps[i]);
                 if (st) st->update(game_time);
             }
         }
-        const bool snoozed = !noscript && game_time < prince_msgs.snooze_until;
+        const bool snoozed = !noscript && game_time < (prince_msgs ? prince_msgs->snooze_until : 0.0);
+        input_locked = snoozed;
 
         // Two control modes. Follow mode drives the Prince and puts the camera
         // behind him, which is what the game does; free-fly drives the camera
@@ -3066,9 +3331,13 @@ int main(int argc, char** argv) {
             const bool act  = !snoozed && (down[plat::KEY_SPACE] || autopush);
             const bool push = !snoozed && (down[plat::KEY_W] || autopush);
             const bool pull = !snoozed && down[plat::KEY_S];
-            const bool in_crate = update_crate(crates, sc, *player, lt.translate, player_yaw,
+            const bool scripted_now = player->scripted != 0;
+            const bool in_crate = !scripted_now &&
+                                  update_crate(crates, sc, *player, lt.translate, player_yaw,
                                                game_time, act, push, pull);
-            if (in_crate) {
+            if (scripted_now) {
+                // A scripted skill owns the body: no input, no gravity.
+            } else if (in_crate) {
                 crate_input(crates, sc, *player, lt.translate, player_yaw, game_time, act, push, pull);
             } else if (ml > 1e-6f) {
                 // Walk_L or Running_L, moved at the speed its own root motion
@@ -3101,7 +3370,7 @@ int main(int argc, char** argv) {
                 set_clip(*player, LOCO_BASE);
             }
             // Stand on the floor, step up small ledges, fall off edges.
-            if (!noclip) {
+            if (!noclip && !scripted_now) {
                 float gy;
                 if (player_vy <= 0.0f && ground_under(sc.coll, lt.translate, gy)) {
                     lt.translate[1] = gy;
@@ -3144,7 +3413,30 @@ int main(int argc, char** argv) {
                     for (int k = 0; k < 3; ++k) cam.pos[k] = head[k] + arm[k] * t;
                 }
             }
-            camera_basis(cam, fwd, right);
+            // A scripted camera replaces the chase camera. The chase camera's
+            // own yaw and pitch are left alone, so "camera,DD" returns to it.
+            if (!noscript && camera_msgs.mode != camera_target::DEFAULT) {
+                float at[3];
+                if (camera_msgs.mode == camera_target::TRIPOD) {
+                    for (int k = 0; k < 3; ++k) { cam.pos[k] = camera_msgs.pos[k]; at[k] = camera_msgs.look[k]; }
+                } else {
+                    for (int k = 0; k < 3; ++k) {
+                        cam.pos[k] = w.translate[k] + camera_msgs.pos[k];
+                        at[k] = cam.pos[k] + camera_msgs.look[k];
+                    }
+                }
+                const float d[3] = { at[0] - cam.pos[0], at[1] - cam.pos[1], at[2] - cam.pos[2] };
+                const float dl = std::sqrt(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
+                if (dl > 1e-5f) {
+                    // camera_basis: forward = (cos p sin y, sin p, -cos p cos y)
+                    fwd[0] = d[0] / dl; fwd[1] = d[1] / dl; fwd[2] = d[2] / dl;
+                    right[0] = -fwd[2]; right[1] = 0.0f; right[2] = fwd[0];
+                    const float rl = std::sqrt(right[0]*right[0] + right[2]*right[2]);
+                    if (rl > 1e-5f) { right[0] /= rl; right[2] /= rl; }
+                }
+            } else {
+                camera_basis(cam, fwd, right);
+            }
         } else {
             if (down[plat::KEY_E] || down[plat::KEY_SPACE]) mv[1] += 1.0f;
             if (down[plat::KEY_Q]) mv[1] -= 1.0f;
@@ -3161,7 +3453,8 @@ int main(int argc, char** argv) {
         // BasePose_L. --pose and --noanim hold the pose instead, so the bind
         // pose and a single posed joint can still be checked.
         if (!pose_arg && !noanim)
-            for (size_t i = 0; i < sc.actors.size(); ++i) animate_actor(sc.actors[i], dt);
+            for (size_t i = 0; i < sc.actors.size(); ++i)
+                if (!sc.actors[i].scripted) animate_actor(sc.actors[i], dt);
 
         const float at[3] = {cam.pos[0] + fwd[0], cam.pos[1] + fwd[1], cam.pos[2] + fwd[2]};
         const float up[3] = {0.0f, 1.0f, 0.0f};
@@ -3228,6 +3521,7 @@ int main(int argc, char** argv) {
             gfx::set_render_state(rs);
             for (size_t a = 0; a < sc.actors.size(); ++a) {
                 const actor_inst& ai = sc.actors[a];
+                if (ai.hidden) continue;
                 const k2::engine::transform& aw = ai.node->world();
                 float am[16];
                 aw.to_matrix(am);

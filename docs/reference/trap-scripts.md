@@ -68,6 +68,37 @@ exactly two `:`-fields is considered.
 | `camera` | CameraLogic | `tripod,(@Cam)X`, `follow,(...)(...)`, `DD`, `DDX` |
 | `audio` | AudioMessage | a sound name |
 
+## camera (`CameraLogic`, parser `0x40855D`)
+
+| message | effect |
+|---|---|
+| `D…` (`DD`, `DDX`, `Default`) | back to the default chase camera |
+| `tripod,(@Node)` | fixed at a camera node, looking at its `.Target` |
+| `tripod,(x,y,z)(x,y,z)` | fixed at a point, looking at a point (engine space) |
+| `follow,(…)(…)` | rides along with the Prince at an offset (our reading) |
+| `look,…`, `security,…` | not ported |
+
+Camera nodes are `*OBJECT CAMERA` blocks with `CAMERA_TYPE Target`. They have two `NODE_TM`s:
+the camera, then `<name>.Target`. Node transforms are in Max space (z up), so engine =
+`(x, z, −y)`. This was measured on `IntroAnim`, whose `TM_POS` (20.34, −1.53, 0) belongs to a
+volume centred at engine (20.34, y, 1.53). Trailing letters (`X`) are flags (`0x409975`). Their
+transition is not modelled: every change is a cut.
+
+## Actors: `SkillAt` and `snooze`
+
+An actor answers to the name of the `EnemyStart` node that spawned it (`P1_chamber4_floor03`).
+The Prince answers to `prince`. The original routes these through the spawn trap:
+`EnemyStart__ctor` references `"SkillAt"`.
+
+| message | effect |
+|---|---|
+| `snooze:t` | no player input for t seconds. The player has no control during this time, camera included |
+| `SkillAt:skill[,placeholder[,REMOVE]]` | plays one of the actor's skills once. With a placeholder, it starts from that node's position and facing. Root motion carries the actor on all three axes. `REMOVE` hides the actor afterwards |
+
+A placeholder's facing comes from its node rotation. ASE stores `TM_ROTANGLE` with the opposite
+sign to its axis, so yaw = −angle·axis.z. Checked on `IntroNISPH`: with that sign, the throw
+lands the Prince inside the cell (x 20.56); with the other sign he lands outside it (x 16.17).
+
 ## Area (`0x4640EC`, `0x4643AD`)
 
 | argv | field | meaning |
@@ -150,10 +181,10 @@ otherwise       s = D − v/Td · (T−t)²/2
 ## Status of the port
 
 Working: the grammar, state blocks, every base message, `delay`, Area, PressurePlate, the
-trigger-volume test, Door skills, TranslateMotion on any
+trigger-volume test, Door skills, camera tripod/default, actor `SkillAt`, TranslateMotion on any
 trap with geometry, and `prince,snooze`. `--trapmsg` prints each delivery in the original's
 debug format, `TRAP MSG [<sender> to <target>]: <msg>`, and the exit summary lists what nothing
 acted on.
 
-Not yet: camera messages, `SkillAt`, audio, Mover/Action behaviour, Water `raise`, the plate's own animation,
+Not yet: camera `look`/`security` and transitions, audio, Mover/Action behaviour, Water `raise`, the plate's own animation,
 Rotate, Oscillate and the other motion types, and testing enemies against Areas.

@@ -236,6 +236,7 @@ void parse_mesh(tokenizer& t, k2a_mesh& m) {
 
 void parse_object(tokenizer& t, k2a_node& n) {
     int depth = 1;                       // '{' already consumed
+    bool seen_tm = false;
     while (depth > 0 && t.next()) {
         if (!t.quoted && is_close(t.tok)) { --depth; continue; }
         if (t.quoted) continue;
@@ -243,7 +244,17 @@ void parse_object(tokenizer& t, k2a_node& n) {
         if (t.tok == "*NODE_NAME")        { t.next(); n.name = t.tok; }
         else if (t.tok == "*NODE_PARENT") { t.next(); n.parent = t.tok; }
         else if (t.tok == "*MATERIAL_REF"){ t.next(); n.material_ref = to_int(t.tok); }
-        else if (t.tok == "*NODE_TM")     { t.next(); if (is_open(t.tok)) parse_node_tm(t, n); }
+        else if (t.tok == "*NODE_TM")     {
+            t.next();
+            if (!is_open(t.tok)) continue;
+            if (!seen_tm) { parse_node_tm(t, n); seen_tm = true; continue; }
+            // The second transform of a target camera is its target's.
+            k2a_node tgt;
+            std::memset(tgt.pos, 0, sizeof(tgt.pos));
+            parse_node_tm(t, tgt);
+            for (int k = 0; k < 3; ++k) n.target_pos[k] = tgt.pos[k];
+            n.has_target = true;
+        }
         else if (t.tok == "*MESH")        { t.next(); if (is_open(t.tok)) { n.has_mesh = true; parse_mesh(t, n.mesh); } }
 
         // --- trap block: flat fields, no braces
@@ -311,6 +322,8 @@ bool k2a_parse(const uint8_t* data, size_t size, k2a_file& out, std::string* err
             n.material_ref  = -1;
             n.has_mesh      = false;
             n.has_trap      = false;
+            n.has_target    = false;
+            std::memset(n.target_pos, 0, sizeof(n.target_pos));
             n.trap.id       = -1;
             n.trap.pivot_angle = 0.0f;
             std::memset(n.pos, 0, sizeof(n.pos));

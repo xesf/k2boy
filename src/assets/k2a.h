@@ -46,6 +46,7 @@ struct k2a_trap {
     float                    pivot_angle;
     std::vector<std::string> argv;
     std::string              comment;
+    std::string              node;           // owning node's name; filled by the loader's caller
 };
 
 struct k2a_mesh {
@@ -71,6 +72,11 @@ struct k2a_node {
     float rot_axis[3];
     float rot_angle;            // radians
     float scale[3];
+
+    // A target camera (*OBJECT CAMERA, CAMERA_TYPE Target) carries a second
+    // NODE_TM for "<name>.Target": where it looks. Max space, like `pos`.
+    bool      has_target;
+    float     target_pos[3];
 
     int32_t   material_ref;     // -1 when absent
     bool      has_mesh;

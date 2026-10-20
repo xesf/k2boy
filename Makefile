@@ -10,7 +10,8 @@
 #
 #   Playing: WASD move (relative to the camera), Shift run, drag LMB to look,
 #   Space act / grab a crate (hold), then W push, S pull; F free-fly camera,
-#   T show trigger volumes, Esc quit.
+#   T show trigger volumes (off in play), Esc quit. Cutscenes take all
+#   control until they end.
 #
 #   make            build (Debug)
 #   make run        build and launch the default room
@@ -62,7 +63,7 @@ JOBS      ?= $(shell sysctl -n hw.ncpu 2>/dev/null || echo 4)
 REGION    ?= 0
 TRACE     ?= 0
 ARGS      ?=
-PLAY_FLAGS = --boot --region $(REGION) $(if $(filter 1,$(TRACE)),--trapmsg) $(ARGS)
+PLAY_FLAGS = --boot --notrig --region $(REGION) $(if $(filter 1,$(TRACE)),--trapmsg) $(ARGS)
 
 # Configures a build directory, or reconfigures it when its cache points at a
 # CMake that no longer exists (a CMake upgrade otherwise breaks every target
