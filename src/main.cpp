@@ -5967,7 +5967,7 @@ int main(int argc, char** argv) {
                     if (looking && !input_locked) {
                         const float sens = 0.005f;
                         cam.yaw   += float(e.mouse_dx) * sens;
-                        cam.pitch += float(e.mouse_dy) * sens;
+                        cam.pitch -= float(e.mouse_dy) * sens;   // y grows downward
                         const float lim = 1.55f;   // just under 90 degrees
                         if (cam.pitch >  lim) cam.pitch =  lim;
                         if (cam.pitch < -lim) cam.pitch = -lim;

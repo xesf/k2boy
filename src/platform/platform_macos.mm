@@ -70,6 +70,15 @@ int32_t g_drawable_h = 0;
 
 int32_t g_last_mouse_x = 0;
 int32_t g_last_mouse_y = 0;
+
+// A window position in drawable pixels, top-left origin (Cocoa's is
+// bottom-left), as platform.h promises.
+void mouse_pos(NSEvent* ev, NSView* view, int32_t& x, int32_t& y) {
+    const NSPoint bp = [view convertPointToBacking:[ev locationInWindow]];
+    const NSRect b = [view convertRectToBacking:[view bounds]];
+    x = int32_t(bp.x);
+    y = int32_t(b.size.height - bp.y);
+}
 bool    g_have_mouse   = false;
 
 // audio
@@ -340,11 +349,8 @@ bool poll_event(event& out) {
                     case NSEventTypeMouseMoved:
                     case NSEventTypeLeftMouseDragged:
                     case NSEventTypeRightMouseDragged: {
-                        NSPoint p  = [ev locationInWindow];
-                        NSPoint bp = [g_view convertPointToBacking:p];
                         event e = make_event(EVENT_MOUSE_MOVE);
-                        e.mouse_x = int32_t(bp.x);
-                        e.mouse_y = int32_t(bp.y);
+                        mouse_pos(ev, g_view, e.mouse_x, e.mouse_y);
                         e.mouse_dx = g_have_mouse ? e.mouse_x - g_last_mouse_x : 0;
                         e.mouse_dy = g_have_mouse ? e.mouse_y - g_last_mouse_y : 0;
                         g_last_mouse_x = e.mouse_x;
@@ -368,6 +374,7 @@ bool poll_event(event& out) {
                     case NSEventTypeLeftMouseDown:
                     case NSEventTypeRightMouseDown: {
                         event e = make_event(EVENT_MOUSE_DOWN);
+                        mouse_pos(ev, g_view, e.mouse_x, e.mouse_y);
                         e.button = ([ev type] == NSEventTypeLeftMouseDown) ? MOUSE_LEFT
                                                                           : MOUSE_RIGHT;
                         push(e);
@@ -377,6 +384,7 @@ bool poll_event(event& out) {
                     case NSEventTypeLeftMouseUp:
                     case NSEventTypeRightMouseUp: {
                         event e = make_event(EVENT_MOUSE_UP);
+                        mouse_pos(ev, g_view, e.mouse_x, e.mouse_y);
                         e.button = ([ev type] == NSEventTypeLeftMouseUp) ? MOUSE_LEFT
                                                                         : MOUSE_RIGHT;
                         push(e);
