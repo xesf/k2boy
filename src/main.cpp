@@ -715,12 +715,15 @@ struct actor_inst {
     std::vector<std::string>          ambient;
     float                             home[3];
     float                             home_yaw;
+    // The whole body tipped forward about the pelvis (radians, + face
+    // down): swimming lays him flat; the swim clips are authored upright.
+    float                             body_pitch;
 
     actor_inst() : node(0), is_enemy(false), first_item(0), item_count(0),
                    skinned(false), clip(-1), clip_ms(0.0), clip_once(false), scripted(0), scripted_start(0),
                    scripted_yaw(0), remove_after(false), hidden(false), stance(0),
                    hold_last(false), posed_hold(false), health(100), max_health(100), armed(false),
-                   is_fixture(false), start_flag(false), hand_joint(-1), weapon_shown(false), carry_joint(-1), home_yaw(0) {
+                   is_fixture(false), start_flag(false), hand_joint(-1), weapon_shown(false), carry_joint(-1), home_yaw(0), body_pitch(0) {
         hand_off[0] = hand_off[1] = hand_off[2] = 0.0f;
         scripted_origin[0] = scripted_origin[1] = scripted_origin[2] = 0.0f;
         home[0] = home[1] = home[2] = 0.0f;
@@ -780,6 +783,17 @@ struct scene {
     // body name (Traps.txt); centre and pivot angle give the placement.
     std::vector<assets::k2a_trap> spawn_points;
     std::vector<assets::k2a_trap> fixture_points;   // Fixture traps, spawned as actors
+    std::vector<assets::k2a_trap> special_points;   // Specials traps (SPEC_ spikes, blades)
+    // A Specials trap: its SPEC_ actor and the actor's own Trigger and Kill
+    // volumes (actor space). See specials_update.
+    struct special {
+        int    actor;
+        float  trig[6], kill[6];
+        bool   have_trig, have_kill;
+        double struck_at, safe_at;      // -1 while not struck / not reset
+        special() : actor(-1), have_trig(false), have_kill(false), struck_at(-1), safe_at(-1) {}
+    };
+    std::vector<special> specials;
     // Static room triangles, for the pick primitive (0x512183). Actor bodies
     // and trigger volumes are not in it.
     k2::engine::collision_world coll;
@@ -1269,6 +1283,17 @@ void animate_actor(actor_inst& a, float dt) {
             for (int k = 0; k < 3; ++k) pos[k] = a.joint_local_bind[0].translate[k];
         transform_from_pos_quat(pos, q, a.joint_local_cur[j]);
     }
+    if (a.body_pitch != 0.0f && !a.joint_local_cur.empty()) {
+        // Tip the root about the pelvis: v' = P (v - pivot) + pivot.
+        const float c = std::cos(a.body_pitch), sn = std::sin(a.body_pitch);
+        const float pivot = 1.03f;
+        k2::engine::transform P;
+        P.rotate[4] = c;  P.rotate[5] = -sn;
+        P.rotate[7] = sn; P.rotate[8] = c;
+        P.translate[1] = pivot - c * pivot;
+        P.translate[2] = -sn * pivot;
+        k2::engine::transform_compose(P, a.joint_local_cur[0], a.joint_local_cur[0]);
+    }
     pose_actor(a);
 }
 
@@ -1466,6 +1491,8 @@ void scene_reset(scene& sc) {
     sc.root->name = "LevelRoot";
     sc.spawn_points.clear();
     sc.fixture_points.clear();
+    sc.special_points.clear();
+    sc.specials.clear();
     sc.points.clear();
     sc.pickups.clear();
     sc.coll.clear();
@@ -2215,6 +2242,10 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
             sc.fixture_points.push_back(n.trap);
             sc.fixture_points.back().node = n.name;
         }
+        if (n.trap.name == "Specials" && collide && n.trap.argv.size() > 1 && !n.trap.argv[1].empty()) {
+            sc.special_points.push_back(n.trap);
+            sc.special_points.back().node = n.name;
+        }
         if (n.trap.name == "Pickup" && collide) {
             scene::pickup_def pd;
             pd.name = n.name;
@@ -2755,6 +2786,37 @@ void spawn_fixtures(scene& sc) {
                     t.node.c_str(), who.c_str(), placed.home[0], placed.home[1], placed.home[2],
                     placed.item_count, placed.ambient.size(), placed.hidden ? ", hidden" : "");
     }
+    // Specials: the SPEC_ actor named by argv1 (Specials ctor, 0x4896B1:
+    // "actors\\<name>\\<name>.k2a"), and the volumes in it the binary looks
+    // up by name, "trigger" and "kill".
+    for (size_t i = 0; i < sc.special_points.size(); ++i) {
+        const assets::k2a_trap& t = sc.special_points[i];
+        scene::special sp;
+        sp.actor = spawn_prop(sc, t, t.argv[1], t.node);
+        if (sp.actor < 0) continue;
+        const std::string path = "actors\\" + t.argv[1] + "\\" + t.argv[1] + ".k2a";
+        size_t size = 0;
+        uint8_t* d = plat::fs_read(path.c_str(), size);
+        if (d) {
+            assets::k2a_file f;
+            std::string err;
+            if (assets::k2a_parse(d, size, f, &err))
+                for (size_t k = 0; k < f.nodes.size(); ++k) {
+                    if (!f.nodes[k].has_trap) continue;
+                    std::string nm = f.nodes[k].trap.name;
+                    for (size_t c = 0; c < nm.size(); ++c) nm[c] = char(std::tolower(static_cast<unsigned char>(nm[c])));
+                    float* box = nm == "trigger" ? sp.trig : nm == "kill" ? sp.kill : 0;
+                    if (!box) continue;
+                    for (int c = 0; c < 6; ++c) box[c] = f.nodes[k].trap.bbox[c];
+                    (nm == "trigger" ? sp.have_trig : sp.have_kill) = true;
+                }
+            plat::fs_free(d);
+        }
+        actor_inst& a = sc.actors[size_t(sp.actor)];
+        if (find_actor_skill(sc, a, "StartPosition")) play_once(sc, a, "StartPosition", 0.0, a.home_yaw, true);
+        sc.specials.push_back(sp);
+    }
+    if (!sc.specials.empty()) std::printf("  specials: %zu\n", sc.specials.size());
     // Pickups: a numbered potion is the TRAP_Potion actor; anything else
     // names its own (PrinceSword01, PICK_Jewel2, Key).
     for (size_t i = 0; i < sc.pickups.size(); ++i) {
@@ -4008,6 +4070,8 @@ const float  FLOAT      = 1.3f;     // feet under the surface while on it
 const float  SPEED      = 1.6f;     // m/s when the clip carries no travel
 const float  VSPEED     = 1.6f;     // m/s up or down, under water
 const double AIR        = 20.0;     // seconds of air; the bottle shows 4 steps
+const float  PITCH_SURFACE = 1.25f; // body tipped forward while stroking (radians)
+const float  PITCH_UNDER   = 1.45f;
 }
 
 struct swim_ctl {
@@ -4058,6 +4122,13 @@ bool swim_update(swim_ctl& sw, scene& sc, actor_inst& a, float* pos, float& yaw,
     const char* clip = under ? (ml > 1e-3f ? "SwimUnderWater_G" : "SwimAmbientUnderWater_G")
                              : (ml > 1e-3f ? "SwimOnSurface_G" : "SwimAmbientOnSurface_G");
     a.stance = find_actor_skill(sc, a, clip);
+    // The stroke clips are authored standing; swimming, he lies along the
+    // way he goes (flatter under water), and treads water upright.
+    {
+        const float want = ml > 1e-3f ? (under ? swim_tuning::PITCH_UNDER : swim_tuning::PITCH_SURFACE) : 0.0f;
+        const float k = std::min(1.0f, dt * 4.0f);
+        a.body_pitch += (want - a.body_pitch) * k;
+    }
     if (ml > 1e-3f) {
         float speed = swim_tuning::SPEED;
         if (a.stance) { const float cs = clip_speed(*a.stance); if (cs > 0.2f) speed = cs; }
@@ -4074,6 +4145,7 @@ bool swim_update(swim_ctl& sw, scene& sc, actor_inst& a, float* pos, float& yaw,
     if (gy > surf - swim_tuning::SWIM_ENTER) {
         sw.state = swim_ctl::NONE;
         a.stance = 0;
+        a.body_pitch = 0.0f;
         pos[1] = gy;
         return false;
     }
@@ -4432,6 +4504,55 @@ void prince_damage(combat_state& cs, scene& sc, actor_inst& p, int dmg, int dir,
     play_once(sc, p, std::string("CombatBeingInjured") + k_dir_names[dir] + "_L2", now, actor_yaw(p), false);
     cs.prince_busy_until = now + std::max(skill_seconds(sc, p, std::string("CombatBeingInjured") + k_dir_names[dir] + "_L2"),
                                           cs.params->fight("Sword Recover From Being Injured", 0.267));
+}
+
+// Specials traps (spikes in a pit floor, blades): the Prince inside the
+// actor's Trigger volume sets off Strike; from its '#kill#' event (66 ms)
+// until Reset's '#safe#' the Kill volume is deadly, and he dies there with
+// DeathSpikes_G. The original drives this from the clips' events through
+// the trap's own state (Specials, 0x4896B1); the 2 s before it resets once
+// he is clear of the trigger is ours.
+void specials_update(scene& sc, combat_state& cs, actor_inst& prince, double now) {
+    const float* p = prince.node->local.translate;
+    for (size_t i = 0; i < sc.specials.size(); ++i) {
+        scene::special& sp = sc.specials[i];
+        if (sp.actor < 0 || !sp.have_trig) continue;
+        actor_inst& a = sc.actors[size_t(sp.actor)];
+        const float dx = p[0] - a.home[0], dy = p[1] - a.home[1], dz = p[2] - a.home[2];
+        const float c = std::cos(a.home_yaw), sn = std::sin(a.home_yaw);
+        // Inverse of set_yaw: world -> actor space.
+        const float l[3] = { c * dx - sn * dz, dy, sn * dx + c * dz };
+        const bool in_trig = l[0] >= sp.trig[0] && l[0] <= sp.trig[3] && l[1] >= sp.trig[1] - 0.3f &&
+                             l[1] <= sp.trig[4] && l[2] >= sp.trig[2] && l[2] <= sp.trig[5];
+        // The kill slab is 0.21 high at the floor: his feet in it, his
+        // body's 0.3 radius counted (the pit's slabs leave gaps narrower
+        // than he is).
+        const float R = 0.3f;
+        const bool in_kill = sp.have_kill && l[0] >= sp.kill[0] - R && l[0] <= sp.kill[3] + R &&
+                             l[1] >= sp.kill[1] - 0.3f && l[1] <= sp.kill[4] + 0.3f &&
+                             l[2] >= sp.kill[2] - R && l[2] <= sp.kill[5] + R;
+        if (sp.struck_at < 0.0) {
+            if (sp.safe_at >= 0.0 && now < sp.safe_at) continue;
+            if (!in_trig) continue;
+            sp.struck_at = now;
+            sp.safe_at = -1.0;
+            play_once(sc, a, "Strike", now, a.home_yaw, true);
+            std::printf("specials: %s strikes\n", a.name.c_str());
+            continue;
+        }
+        const double t = now - sp.struck_at;
+        if (t >= 0.066 && in_kill && cs.dead_since < 0.0) {
+            prince_damage(cs, sc, prince, prince.health, 1, now);
+            if (cs.dead_since >= 0.0)
+                play_once(sc, prince, "DeathSpikes_G", now, actor_yaw(prince), true);
+            std::printf("specials: %s kills the Prince\n", a.name.c_str());
+        }
+        if (t > 2.0 && !in_trig && cs.dead_since < 0.0) {
+            play_once(sc, a, "Reset", now, a.home_yaw, true);
+            sp.struck_at = -1.0;
+            sp.safe_at = now + 0.066;
+        }
+    }
 }
 
 void enemy_damage(combat_state& cs, scene& sc, enemy_ai& e, int dmg, int dir, double now) {
@@ -5592,6 +5713,14 @@ int main(int argc, char** argv) {
                             t, j.xf[t].pos[0], j.xf[t].pos[1], j.xf[t].pos[2],
                             j.xf[t].quat[0], j.xf[t].quat[1], j.xf[t].quat[2], j.xf[t].quat[3]);
         }
+        // Sampled (SklS) clips: the first joints' tracks at the start.
+        for (size_t j = 0; j < sk.joints.size() && j < 4; ++j) {
+            if (!sk.joints[j].present) { std::printf("    joint %zu absent\n", j); continue; }
+            float p[3], q[4];
+            assets::skl_sample(sk.joints[j].path, 0, sk.interpolate != 0, p, q);
+            std::printf("    joint %zu pos=(%7.3f,%7.3f,%7.3f) quat=(%7.4f,%7.4f,%7.4f,%7.4f)\n",
+                        j, p[0], p[1], p[2], q[0], q[1], q[2], q[3]);
+        }
         for (size_t k = 0; k < sk.sound_keys.size(); ++k)
             std::printf("    sound t=%-6u '%s'\n", sk.sound_keys[k].time, sk.sound_keys[k].sound.c_str());
         for (size_t k = 0; k < sk.event_keys.size(); ++k)
@@ -5858,6 +5987,28 @@ int main(int argc, char** argv) {
         }
     }
     // --findledges: list standing spots with a ledge ahead, for testing.
+    // K2_WATERPROBE: each water area's triangles with the floor depth under
+    // their centres, to find where the outline covers dry ground.
+    if (std::getenv("K2_WATERPROBE")) {
+        for (size_t w = 0; w < sc.waters.size(); ++w) {
+            const scene::water_area& wa = sc.waters[w];
+            const scene_trap* t = dynamic_cast<const scene_trap*>(sc.traps[wa.trap]);
+            if (!t) continue;
+            const float* o = t->offset();
+            const float surf = t->box[4] + o[1];
+            std::printf("water %s surface %.2f\n", t->name().c_str(), surf);
+            for (size_t i = 0; i + 5 < wa.tris.size(); i += 6) {
+                const float cx = (wa.tris[i] + wa.tris[i + 2] + wa.tris[i + 4]) / 3.0f + o[0];
+                const float cz = (wa.tris[i + 1] + wa.tris[i + 3] + wa.tris[i + 5]) / 3.0f + o[2];
+                const float p[3] = { cx, surf + 0.05f, cz };
+                const float dn[3] = { 0.0f, -1.0f, 0.0f };
+                k2::engine::pick_hit h;
+                const bool hit = sc.coll.pick(p, dn, 20.0f, true, h);
+                std::printf("  tri %3zu at (%.1f, %.1f) depth %s%.2f\n", i / 6, cx, cz, hit ? "" : ">",
+                            hit ? surf - h.point[1] : 20.0f);
+            }
+        }
+    }
     if (find_ledges) {
         int found = 0;
         for (float x = sc.mn[0]; x < sc.mx[0] && found < 40; x += 1.0f)
@@ -6436,6 +6587,7 @@ int main(int argc, char** argv) {
                     break;
                 }
             }
+            if (!dead) specials_update(sc, combat, *player, game_time);
             // Pickups shown or hidden by script (P4BoxPotion02 appears when
             // its box breaks) follow their trap.
             for (size_t i = 0; i < sc.pickups.size(); ++i)
@@ -6490,7 +6642,17 @@ int main(int argc, char** argv) {
             float surf = 0.0f;
             const bool water = !noclip && !scripted_now && !on_ledge && ledges.state == hang_ctl::NONE &&
                                !dead && water_surface(sc, lt.translate, surf);
-            if (swim.state == swim_ctl::NONE && water && lt.translate[1] < surf - swim_tuning::SWIM_ENTER) {
+            // Under the outline but not under the water - a room below the
+            // pool or the pit, a ceiling between him and the surface - is dry.
+            // Checked on entry only: under water he may swim beneath an arch.
+            bool open_above = true;
+            if (swim.state == swim_ctl::NONE && water) {
+                const float from[3] = { lt.translate[0], lt.translate[1] + 0.3f, lt.translate[2] };
+                const float up[3] = { 0.0f, 1.0f, 0.0f };
+                k2::engine::pick_hit h;
+                if (surf - from[1] > 0.0f && sc.coll.pick(from, up, surf - from[1], false, h)) open_above = false;
+            }
+            if (swim.state == swim_ctl::NONE && water && open_above && lt.translate[1] < surf - swim_tuning::SWIM_ENTER) {
                 swim.state = swim_ctl::SURFACE;
                 jumps.state = jump_ctl::NONE;
                 player_vy = 0.0f;
@@ -6499,6 +6661,7 @@ int main(int argc, char** argv) {
                 std::printf("swim: in the water (surface %.2f)\n", surf);
             }
             if (swim.state != swim_ctl::NONE && !water) { swim.state = swim_ctl::NONE; player->stance = 0; }
+            if (swim.state == swim_ctl::NONE) player->body_pitch = 0.0f;
             bool in_swim = false;
             if (swim.state != swim_ctl::NONE) {
                 // Out over a low edge: the jump climbs, as on land.
@@ -6528,13 +6691,14 @@ int main(int argc, char** argv) {
                     in_jump = false;
                 }
             }
-            // Action at a ledge he can get onto climbs it (StStart1MClimb),
-            // unless a crate there wants the action.
+            // Action at a ledge he can get onto climbs it (StStart1MClimb).
+            // At a crate, action alone grabs it to push or pull; action
+            // while pushing toward it climbs on top, when there is room.
             if (act_pressed && !scripted_now && !on_ledge && !in_jump && !in_swim &&
                 ledges.state == hang_ctl::NONE && crates.state == crate_ctl::NONE && !dead) {
                 float ax[3];
                 const float pfw[3] = { std::sin(player_yaw), 0.0f, std::cos(player_yaw) };
-                if (!crate_in_front(sc, lt.translate, pfw, ax))
+                if (push || !crate_in_front(sc, lt.translate, pfw, ax))
                     hang_try_climb(ledges, *player, sc.coll, lt.translate, player_yaw, game_time);
             }
             const bool busy = on_ledge || ledges.state != hang_ctl::NONE || in_swim;
