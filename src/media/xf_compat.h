@@ -37,8 +37,10 @@ inline u64 xf_be64(const u8* p) { return u64(xf_be32(p)) << 32 | xf_be32(p + 4);
 inline u16 xf_le16(const u8* p) { return u16(p[0] | p[1] << 8); }
 inline u32 xf_le32(const u8* p) { return p[0] | u32(p[1]) << 8 | u32(p[2]) << 16 | u32(p[3]) << 24; }
 
-// A whole file read through the VFS.
-struct xf_file { u8* data; size_t size; };
+// A file opened through the VFS and read on demand: a cutscene is tens of
+// megabytes, and reading it whole before the first frame kept the Vita on
+// a black screen for seconds. One handle per thread (reads seek).
+struct xf_file { std::FILE* fp; size_t size; };
 xf_file* xf_open(const char* path);
 void xf_close(xf_file* f);
 inline u64 xf_size(xf_file* f) { return f->size; }

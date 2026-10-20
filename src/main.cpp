@@ -2343,6 +2343,7 @@ void prefetch_rooms(const std::vector<std::string>& paths) {
     j.files.resize(paths.size());
     j.ok.assign(paths.size(), 0);
     k2::jobs::parallel_for(paths.size(), &job::parse, &j);
+    const double t_parsed = plat::time_seconds();
     std::map<std::string, size_t> seen;
     for (size_t i = 0; i < paths.size(); ++i) {
         if (!j.ok[i]) continue;
@@ -2360,8 +2361,9 @@ void prefetch_rooms(const std::vector<std::string>& paths) {
     k2::jobs::parallel_for(j.images.size(), &job::decode, &j);
     for (size_t i = 0; i < j.images.size(); ++i)
         if (j.decoded[i].valid()) std::swap(g_decoded_images[image_key(j.images[i])], j.decoded[i]);
-    std::printf("prefetch: %zu files, %zu images in %.2f s on %d workers\n", paths.size(),
-                j.images.size(), plat::time_seconds() - t0, k2::jobs::worker_count());
+    std::printf("prefetch: %zu files parsed in %.2f s, %zu images decoded in %.2f s, on %d workers\n",
+                paths.size(), t_parsed - t0, j.images.size(), plat::time_seconds() - t_parsed,
+                k2::jobs::worker_count());
 }
 
 bool append_scene(const char* path, scene& sc, bool collide = true) {

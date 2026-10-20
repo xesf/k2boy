@@ -15,11 +15,13 @@
 #include <dirent.h>
 #include <sys/stat.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace k2 {
 namespace plat {
@@ -53,6 +55,70 @@ std::string normalise(const char* path) {
     return out;
 }
 
+// Every indexed file's relative path, in the order it was found: the order
+// decides which of two same-named files a basename lookup returns, so the
+// index cache keeps it.
+std::vector<std::string> g_order;
+
+void add_file(const std::string& rel, const std::string& abs) {
+    g_index.emplace(normalise(rel.c_str()), abs);
+    const size_t slash = rel.find_last_of('/');
+    std::string base = slash == std::string::npos ? rel : rel.substr(slash + 1);
+    for (size_t i = 0; i < base.size(); ++i)
+        if (base[i] >= 'A' && base[i] <= 'Z') base[i] = char(base[i] - 'A' + 'a');
+    g_by_name.emplace(base, abs);
+}
+
+// The names at the top of the install, sorted: enough to tell a cached
+// index from a different install.
+std::string root_signature(const std::string& root) {
+    std::vector<std::string> names;
+    if (DIR* d = ::opendir(root.c_str())) {
+        while (struct dirent* e = ::readdir(d)) names.push_back(e->d_name);
+        ::closedir(d);
+    }
+    std::sort(names.begin(), names.end());
+    std::string sig;
+    for (size_t i = 0; i < names.size(); ++i) { sig += names[i]; sig += '|'; }
+    return sig;
+}
+
+// Walking thousands of directory entries takes seconds on a memory card;
+// the index is kept in the user directory and reused while the install's
+// top level is unchanged.
+bool load_index_cache(const std::string& file, const std::string& header) {
+    FILE* f = std::fopen(file.c_str(), "rb");
+    if (!f) return false;
+    std::string text;
+    char buf[65536];
+    size_t n;
+    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) text.append(buf, n);
+    std::fclose(f);
+    size_t p = text.find('\n');
+    if (p == std::string::npos || text.compare(0, p, header) != 0) return false;
+    ++p;
+    while (p < text.size()) {
+        size_t e = text.find('\n', p);
+        if (e == std::string::npos) e = text.size();
+        if (e > p) {
+            const std::string rel = text.substr(p, e - p);
+            add_file(rel, g_root + "/" + rel);
+            g_order.push_back(rel);
+        }
+        p = e + 1;
+    }
+    return !g_index.empty();
+}
+
+void save_index_cache(const std::string& file, const std::string& header) {
+    FILE* f = std::fopen(file.c_str(), "wb");
+    if (!f) return;
+    std::fputs(header.c_str(), f);
+    std::fputc('\n', f);
+    for (size_t i = 0; i < g_order.size(); ++i) { std::fputs(g_order[i].c_str(), f); std::fputc('\n', f); }
+    std::fclose(f);
+}
+
 void index_dir(const std::string& abs, const std::string& rel) {
     DIR* d = ::opendir(abs.c_str());
     if (!d) return;
@@ -82,12 +148,8 @@ void index_dir(const std::string& abs, const std::string& rel) {
         } else if (is_reg) {
             // First writer wins. data/Rooms duplicates data/Geometry/Rooms; either
             // resolves to a byte-identical file, so collisions are harmless.
-            g_index.emplace(normalise(child_rel.c_str()), child_abs);
-
-            std::string base(name);
-            for (size_t i = 0; i < base.size(); ++i)
-                if (base[i] >= 'A' && base[i] <= 'Z') base[i] = char(base[i] - 'A' + 'a');
-            g_by_name.emplace(base, child_abs);
+            add_file(child_rel, child_abs);
+            g_order.push_back(child_rel);
         }
     }
     ::closedir(d);
@@ -107,7 +169,15 @@ bool fs_mount(const char* root_path) {
 
     g_index.clear();
     g_by_name.clear();
+    g_order.clear();
+    const std::string cache = user_dir() + "/vfs-index.txt";
+    const std::string header = "k2boy vfs 1 " + g_root + " " + root_signature(g_root);
+    if (load_index_cache(cache, header)) return true;
+    g_index.clear();
+    g_by_name.clear();
+    g_order.clear();
     index_dir(g_root, std::string());
+    if (!g_index.empty()) save_index_cache(cache, header);
     return !g_index.empty();
 }
 
@@ -147,6 +217,7 @@ uint8_t* read_real(const char* real, size_t& size_out) {
     size_out = 0;
     FILE* f = ::fopen(real, "rb");
     if (!f) return NULL;
+    ::setvbuf(f, NULL, _IONBF, 0);      // one read straight into the buffer, not BUFSIZ at a time
     ::fseek(f, 0, SEEK_END);
     long len = ::ftell(f);
     ::fseek(f, 0, SEEK_SET);
