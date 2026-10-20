@@ -69,7 +69,41 @@ struct tokenizer {
 
 // "12:" and "12" both yield 12. Handles the *MESH_FACE "0: A: 2 B: 0 C: 1" form.
 int32_t to_int(const std::string& s) { return int32_t(std::strtol(s.c_str(), 0, 10)); }
-float   to_float(const std::string& s) { return float(std::strtod(s.c_str(), 0)); }
+
+// The exporter writes plain decimals ("-55.0324", "1.0000", now and then
+// "1e-005"). strtod is general and, in the Vita's newlib, slow enough to
+// make parsing a level's rooms take seconds; this handles exactly that form
+// and falls back to strtod for anything else.
+float to_float(const std::string& str) {
+    const char* p = str.c_str();
+    bool neg = false;
+    if (*p == '-') { neg = true; ++p; } else if (*p == '+') ++p;
+    uint64_t mant = 0;
+    int digits = 0, scale = 0;
+    bool any = false;
+    for (; *p >= '0' && *p <= '9'; ++p, any = true)
+        if (digits < 18) { mant = mant * 10 + uint64_t(*p - '0'); if (mant) ++digits; } else ++scale;
+    if (*p == '.') {
+        for (++p; *p >= '0' && *p <= '9'; ++p, any = true)
+            if (digits < 18) { mant = mant * 10 + uint64_t(*p - '0'); if (mant) ++digits; --scale; }
+    }
+    if (!any) return float(std::strtod(str.c_str(), 0));
+    if (*p == 'e' || *p == 'E') {
+        ++p;
+        bool eneg = false;
+        if (*p == '-') { eneg = true; ++p; } else if (*p == '+') ++p;
+        int e = 0;
+        for (; *p >= '0' && *p <= '9'; ++p) if (e < 1000) e = e * 10 + (*p - '0');
+        scale += eneg ? -e : e;
+    }
+    if (*p && *p != ':' && *p != ',') return float(std::strtod(str.c_str(), 0));
+    static const double pow10[] = { 1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10,
+                                    1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22 };
+    double v = double(mant);
+    if (scale < 0) v = scale >= -22 ? v / pow10[-scale] : v * std::pow(10.0, scale);
+    else if (scale > 0) v = scale <= 22 ? v * pow10[scale] : v * std::pow(10.0, scale);
+    return float(neg ? -v : v);
+}
 
 bool is_open(const std::string& s)  { return s == "{"; }
 bool is_close(const std::string& s) { return s == "}"; }

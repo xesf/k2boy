@@ -5887,6 +5887,7 @@ void actor_part_matrices(const scene& sc, actor_inst& a, bool skin) {
 }
 
 int main(int argc, char** argv) {
+    if (std::getenv("K2_LINEBUF")) std::setvbuf(stdout, 0, _IOLBF, 0);     // for timing the log
     // Started without arguments on a console: the platform's defaults.
     std::vector<std::string> default_args;
     std::vector<char*> default_argv;

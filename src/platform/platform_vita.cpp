@@ -78,9 +78,23 @@ extern "C" {
 int __real_vfprintf(FILE*, const char*, va_list);
 int __real_vsnprintf(char*, size_t, const char*, va_list);
 
+uint64_t sceKernelGetProcessTimeWide(void);
+
+// Lines in the log carry the seconds since start, to see where time goes.
 int __wrap_vfprintf(FILE* f, const char* fmt, va_list ap) {
     char b[1024];
-    return __real_vfprintf(f, fix_format(fmt, b, sizeof(b)), ap);
+    static bool line_start = true;
+    if (f == stdout && line_start && fmt[0] && fmt[0] != '\n') {
+        static uint64_t t0 = sceKernelGetProcessTimeWide();
+        const double t = double(sceKernelGetProcessTimeWide() - t0) / 1e6;
+        char stamp[24];
+        std::snprintf(stamp, sizeof(stamp), "[%7.2f] ", t);
+        std::fputs(stamp, f);
+    }
+    const char* use = fix_format(fmt, b, sizeof(b));
+    const size_t n = std::strlen(use);
+    if (f == stdout && n) line_start = use[n - 1] == '\n';
+    return __real_vfprintf(f, use, ap);
 }
 int __wrap_vprintf(const char* fmt, va_list ap) { return __wrap_vfprintf(stdout, fmt, ap); }
 int __wrap_printf(const char* fmt, ...) {
