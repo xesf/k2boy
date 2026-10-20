@@ -105,6 +105,9 @@ SUBSYSTEMS = [
                                       'chain, nearest-hit rule, face normal, mask->category table and the '
                                       'category rule (room leaves minus alpha; Generic by Visible/Collideable) '
                                       'recovered and ported; ring shells and mover traps open'),
+    ('Trap scripts',              45, 'grammar, state blocks, send/fan-out, base messages, delay queue, '
+                                      'Area and TranslateMotion ported from the binary; prisonfix intro plays. '
+                                      'Camera, SkillAt, audio and most trap-specific handlers open'),
     ('K2*Activity family',         5, 'identified and named only'),
     ('Motivate planner',           0, 'MfLocoPlanner / MfManipActivity - not started'),
 
