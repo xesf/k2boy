@@ -1,89 +1,91 @@
-# `.nif` — NetImmerse 2.3 scene
+# .nif — NetImmerse 2.3 effects
 
-Location: `data/Geometry/Utils/*.nif` (151 files), `data/Geometry/Enemies/`, `data/Geometry/prince/`.
-Case varies (`.NIF` / `.nif`) — lookups must be case-insensitive.
+The visual effects (potion bursts and auras, beams, splashes, showers) are
+NetImmerse 2.3 scene files. The engine links NetImmerse whole, so the layout
+here is read off its own loaders; 107 of the 111 shipped files read through to
+"End Of File" (`k2boy --nifcheck <install>`).
 
-**Status: externally documented.** Do not reverse this from scratch.
+## File
 
-## Header
-
-Every file begins with a NUL-terminated ASCII banner:
-
-```
-NetImmerse File Format, Version 2.3\n
-Numerical Design Limited, Chapel Hill, NC 27514\n
-Copyright (c) 1996-1999\n
-All Rights Reserved\n
-```
-
-followed by a `uint32_t` version word and the object stream.
-
-## Why this matters
-
-NIF is the most thoroughly documented format in this game. The **NifTools** project
-(`nifxml` / NifSkope) has a machine-readable schema covering version 2.3 (`0x02030000`), which is
-one of the earliest shipping NetImmerse versions. Recommended approach:
-
-1. Try NifSkope / `pyffi` / `nifly` on `data/Geometry/Utils/Upr_Beam.NIF` first.
-2. Only fall back to reversing if POP3D turns out to use custom `NiExtraData` blocks — and it
-   does: the RTTI list includes non-standard-looking classes worth checking against the schema
-   (`NiAVInstance`, `NiGeometryInstance`, `NiMarkerNode`, `NiMarkerTriShape`, `NiCollPick`,
-   `NiFastAlphaAccumulator`, `NiFlipTextures`, `NiUserAction`, `Ni3dsAlphaAnimator`,
-   `Ni3dsPropertyAnimator`, `Ni3dsAnimationCore`).
-
-The `Ni3ds*` family are the NetImmerse 3ds-max animation importers; `Ni3dsMorphShape`,
-`Ni3dsEnvMorphShape`, `Ni3dsParticleSystem`, `Ni3dsPathController` and `Ni3dsAnimationNode` all
-appear inside `k2NetImmerseList<T>` template instantiations, so the engine keeps typed lists of
-each and ticks them per frame.
-
-## Class hierarchy present in this build
+Four text lines (`NetImmerse File Format, Version 2.3`, the NDL credit,
+copyright, rights), then blocks until `End Of File`:
 
 ```
-NiObject
-├── NiAVObject
-│   ├── NiNode
-│   │   ├── NiBillboardNode
-│   │   ├── NiCollisionSwitch
-│   │   └── NiMarkerNode
-│   └── NiGeometry
-│       └── NiTriBasedGeom
-│           ├── NiTriShape
-│           └── NiMarkerTriShape
-├── NiProperty
-│   ├── NiAlphaProperty        NiZBufferProperty      NiShadeProperty
-│   ├── NiFogProperty          NiDitherProperty       NiWireframeProperty
-│   ├── NiTextureModeProperty  NiVertexColorProperty  NiTransparentProperty
-├── NiExtraData
-├── NiAction ──> NiUserAction
-├── NiRawImageData
-└── NiScreenPolygon
+u32 len, char type[len]          block type name
+object                           per the type below
 ```
 
-Support types: `NiBoundingVolume` / `NiSphereBV`, `NiCollisionGroup`, `NiCollPick`,
-`NiAccumulator` / `NiFastAlphaAccumulator`, `Ni3DDeviceDesc` / `NiD3DDeviceDesc`,
-`NiTArray<T>`, `NiTMap<K,V>`, `NiTStringMap<V>`, `NiPointer<T>` (intrusive refcount),
-`NiStream` (the serializer — its `Load`/`Save` pair is the entry point if you do need to reverse).
+`Top Level Object` (as a type name) marks the next block as a root. Blocks
+refer to each other by the pointer value each was saved under (its first
+field), not by index.
 
-## The `.sef` companion
+## Common parts
 
-`data/Geometry/Utils/SpecialEffects.sef` is a tab-separated name → path table that maps effect names to
-`.nif` files:
+| Part | Loader | Fields |
+|---|---|---|
+| NiObject | 0x552BF0 | u32 id, string name, u32 n, n × (type string, inline extra data) |
+| NiStringExtraData (inline) | 0x580F00 | u32 size, string ("loop") |
+| Ni3dsPropAnimExtraData (inline) | 0x5FC070 | u32 size, u32 |
+| NiAVObject | 0x551EC0 | NiObject, u8 flags, vec3 translate, mat3 rotate (row-major), f scale, vec3 velocity, u32 n + n property ids, u32, u32 has-bound |
+| NiNode | 0x54F3B0 | NiAVObject, u32, u32, u8, u32 n + child ids, u32 n + effect ids |
+| NiProperty | 0x554C50 | NiObject, u8 flags |
+| 3ds anim header | 0x5FB420 | u32, 4 × u8, 6 × f (last: length in seconds) |
 
-```
-ArrowNormal<TAB><TAB>...geometry\utils\ArrowNormal.nif
-ArrowNormalImpact<TAB>...geometry\utils\ArrowNormalImpact.nif
-ArrowFire<TAB>...geometry\utils\ArrowFire.nif
-```
+`k2PostSceneNode`, `k2AnimationPropertyHub`, `k2AnimatedTextureHub` and
+`NiMarkerNode` are plain NiNodes on disk.
 
-Blank lines separate groups. Parsed by `k2SpecialEffectFactory` / `k2FileEffectController`.
-See [behavior.md](behavior.md).
+## Geometry
 
-## Where NIF meets K2
+NiGeometry (0x55A690): NiAVObject, u16 nverts, u32 has + verts, u32 has +
+normals, bound (vec3, f). NiTriBasedGeom (0x55C820): u16 ntris, u16 nuvsets,
+u32 has + uvw × nverts × nuvsets (three floats each), u32 has + rgba ×
+nverts, u32 has + 16 bytes × ntris. NiTriShape (0x5788E0) then 3 × u16 per
+triangle. NiParticles (0x56FD10): f radius, u16 active, u32 has + f size per
+vertex; NiAutoNormalParticles (0x570440): u32 has + vec3 per vertex.
 
-`data/Geometry/Utils/` is effects and props (`CSFX_AirBubbles.nif`, `ArrowSwarmResidual.NIF`,
-`Upr_Beam.NIF`). Characters and rooms come in as `.K2A` instead. So the split is roughly:
+## Properties and images
 
-- **`.nif`** — authored in the NetImmerse toolchain, particle/effect content, small props
-- **`.K2A`** — authored in 3DS Max via the K2 exporter, characters and level rooms
+| Type | Fields after NiProperty |
+|---|---|
+| NiAlphaProperty 0x5682A0 | u8 enable, u32 src, u32 dst (6/7 = alpha, dst 0 = additive) |
+| NiMaterialProperty 0x55D250 | 4 × rgb (ambient, diffuse, specular, emissive), f gloss, f alpha |
+| NiTextureProperty 0x5615B0 | u32, u32 n + n image ids |
+| NiTextureModeProperty 0x568F00 | 3 × u32 |
+| NiVertexColorProperty 0x56AB30 | u32 |
+| NiSpecularProperty 0x580A10 | u8 |
+| NiZBufferProperty 0x584AB0 | u8, u8 |
 
-Both end up as `NiNode` trees at runtime.
+NiImage (0x560010): NiObject, u8 external, then a file name or the id of a
+NiRawImageData, u32. NiRawImageData (0x55DA40, sizes from 0x55DAD0):
+NiObject, u32 width, u32 height, u32 format — 0: 256 × RGBA palette and
+8-bit indices, 1: RGB, 2: RGBA.
+
+## Animation
+
+Ni3dsAnimationNode (0x5E14F0): NiNode, anim header, then four tracks, each
+`i32 n` and, if n > 0, `u32 type` and n keys:
+
+* rotation (readers at 0x8B2D68): type 1 = 44 bytes (time, u32, axis, quat
+  w x y z, 2 f), 2 = 64, 3 (TCB) = 96, 4 (Euler) = 44 + u16 + three float
+  tracks;
+* position (0x8B280C): 1 = time + vec3 (16), 2 (Bézier) = 64, 3 (TCB) = 76;
+* scale, float keys (0x8B2A1C): 1 = time + value (8), 2 = 16, 3 = 28;
+* n × (u32, u8) visibility.
+
+Ni3dsParticleSystem (0x5E8C50), a 3ds Max SuperSpray: NiNode, anim header,
+u32 max particles, 2 × u8, 13 × f, vec3, 6 × f, vec3, 7 × f, u32 has + (u32
+m, m × u32), u32 has + 56 bytes per particle of saved state, u32, two
+counted u32 lists, a position track, 2 × u32. In the 13 floats: [0] size,
+[1] speed, [3] life, [5] birth rate (our reading).
+
+Also read: Ni3dsAlphaAnimator, Ni3dsColorAnimator, Ni3dsPathController,
+NiGravity. Not yet: NiFlipTextures, SimpleTrap (the game's own trap node).
+
+## Playing them
+
+The game places effects with **SpecialEffect** traps (argv1 the .nif, shown
+while Visible and "on"), potions (`Potion<Name>.NIF` on drinking,
+`Potion<Name>Residual.NIF` while it lasts, names from 0x4EB3D4) and
+`EffectAt` messages. Ours plays shapes with their node animation and turns
+each particle system into camera-facing sprites; emission spread, speeds and
+sprite fading are approximations.

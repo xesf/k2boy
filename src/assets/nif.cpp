@@ -83,7 +83,7 @@ void rot_keys(reader& r, int32_t n, std::vector<nif_quat_key>* out) {
         switch (type) {
         case 1: break;
         case 2: r.skip(16 + 4); break;              // 0x5EFD20
-        case 3: r.skip(12 + 32 + 4); break;         // 0x5F0740
+        case 3: r.skip(12 + 32 + 8); break;         // 0x5F0740
         case 4: {                                   // 0x5F0DD0: Euler, three float tracks
             r.skip(2);
             for (int a = 0; a < 3; ++a) {
@@ -272,9 +272,11 @@ void block(reader& r, const std::string& t, nif_block& b) {
     } else if (t == "NiVertexColorProperty") {
         b.kind = nif_block::VERTEX_COLOR;
         property(r, b); r.skip(4);
-    } else if (t == "NiZBufferProperty") {
-        property(r, b); r.skip(4);
-    } else if (t == "NiShadeProperty" || t == "NiSpecularProperty") {
+    } else if (t == "NiZBufferProperty") {         // 0x584AB0
+        property(r, b); r.skip(2);
+    } else if (t == "NiSpecularProperty") {        // 0x580A10
+        property(r, b); r.u8();
+    } else if (t == "NiShadeProperty") {           // 0x580460
         object(r, b); r.u8();
     } else if (t == "NiImage") {
         b.kind = nif_block::IMAGE;
@@ -310,6 +312,11 @@ void block(reader& r, const std::string& t, nif_block& b) {
         r.skip(1 + 4 + 4 + 8 + 2 + 1);
         if (npos) pos_keys(r, npos, 0);
         if (nflt) float_keys(r, nflt, r.u32(), 0);
+    } else if (t == "Ni3dsColorAnimator") {        // 0x5F9860
+        object(r, b); anim_header(r, b); r.u32();
+        r.u32();
+        const int32_t n = r.i32();
+        if (n > 0) pos_keys(r, n, 0); else r.u32();
     } else if (t == "NiGravity") {
         object(r, b); r.skip(12 + 24);
     } else {

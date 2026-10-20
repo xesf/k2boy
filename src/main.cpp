@@ -1438,6 +1438,9 @@ void bind_actor_weapon(const assets::master_file& m, actor_inst& inst, scene& sc
                     m.hands[0].node.c_str());
 }
 
+class effect_trap;
+std::vector<effect_trap*> g_effect_traps;     // owned by sc.traps
+
 void scene_reset(scene& sc) {
     sc.items.clear();
     sc.item_names.clear();
@@ -1456,6 +1459,7 @@ void scene_reset(scene& sc) {
     sc.script.clear();
     for (size_t i = 0; i < sc.traps.size(); ++i) delete sc.traps[i];
     sc.traps.clear();
+    g_effect_traps.clear();
     sc.areas.clear();
     sc.plates.clear();
     for (std::map<std::string, assets::skl_file*>::iterator it = sc.trap_skills.begin();
@@ -2050,6 +2054,32 @@ public:
     }
 };
 
+// A SpecialEffect trap: argv1 a .nif played at the trap while it is visible
+// and on ("on" / "off", "Visible:T/F"; the Moon Temple beams, the prison
+// showers). argv2 is not yet understood. The effect itself is run by
+// fx_sync_traps.
+class effect_trap : public k2::engine::trap_object {
+public:
+    effect_trap(k2::engine::script_world& w, const std::string& name, const k2::engine::trap_header& h,
+                const std::vector<std::string>& argv, const float* bbox, float yaw)
+        : trap_object(w, name, h), on(true), fx_id(-1), yaw(yaw) {
+        file = argv.size() > 1 ? argv[1] : std::string();
+        const size_t cut = file.find_last_of("/\\");
+        if (cut != std::string::npos) file = file.substr(cut + 1);
+        for (int k = 0; k < 3; ++k) pos[k] = (bbox[k] + bbox[k + 3]) * 0.5f;
+        pos[1] = bbox[1];
+    }
+    bool handle(const std::string& msg, k2::engine::script_target* sender) {
+        if (msg == "on" || msg == "On") { on = true; return true; }
+        if (msg == "off" || msg == "Off") { on = false; return true; }
+        return trap_object::handle(msg, sender);
+    }
+    std::string file;
+    bool  on;
+    int   fx_id;
+    float pos[3], yaw;
+};
+
 // An AudioMessage trap (registry key "Audio"). Traps.txt: argv1 use the trap's
 // radius, argv2 positional, argv3 sound. "play" plays argv3, "silence" stops
 // it, any other message names a sound to play here. Looping sounds named in
@@ -2342,6 +2372,11 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
                 t = a;
             } else if (n.trap.name == "Audio") {
                 t = new audio_trap(sc.script, n.name, hdr, n.trap.argv, n.trap.bbox);
+            } else if (n.trap.name == "SpecialEffect") {
+                effect_trap* e = new effect_trap(sc.script, n.name, hdr, n.trap.argv, n.trap.bbox,
+                                                 n.trap.pivot_angle);
+                g_effect_traps.push_back(e);
+                t = e;
             } else if (n.trap.name == "PressurePlate") {
                 const std::string actor = (n.trap.argv.size() > 1 && !n.trap.argv[1].empty())
                                           ? n.trap.argv[1] : std::string("TRAP_PressurePlate");
@@ -4519,6 +4554,375 @@ int nearest_enemy(const combat_state& cs, const scene& sc, const float* pp, floa
     return best;
 }
 
+// --- visual effects (.nif) -----------------------------------------------------
+//
+// A NetImmerse file played at a point or on an actor: its node tree posed
+// at time t (Ni3dsAnimationNode keys), its shapes drawn, and each
+// Ni3dsParticleSystem (a 3ds Max SuperSpray) emitting camera-facing sprites.
+// The files are in Max space (Z up) and are turned into the engine's the
+// way the rooms are, (x, y, z) -> (x, z, -y). The particle parameters'
+// meanings are read off the shipped effects, not traced.
+struct fx_def {
+    assets::nif_file nif;
+    std::vector<gfx::texture_id> tex;       // per block: RAW_IMAGE -> texture
+    std::vector<gfx::mesh_id>    mesh;      // per block: SHAPE -> mesh
+    std::vector<int>             parent;    // per block, -1 for none
+    float                        length;    // seconds
+    bool                         loop;
+};
+
+struct fx_particle { float p[3], v[3]; double born; float life, size; };
+
+struct fx_instance {
+    int     id;
+    fx_def* def;
+    float   pos[3];
+    float   yaw;
+    double  start, until;                   // until < 0: the file's own length
+    int     actor;                          // follows this actor, or -1
+    float   lift;                           // above the actor's feet
+    std::vector<std::vector<fx_particle> > parts;   // per block (PSYS)
+    std::vector<double> emit_acc;
+};
+
+std::map<std::string, fx_def*> g_fx_defs;
+std::vector<fx_instance> g_fx;
+int g_fx_next_id = 1;
+
+fx_def* fx_load(const std::string& name) {
+    std::string key = name;
+    for (size_t i = 0; i < key.size(); ++i) key[i] = char(std::tolower(static_cast<unsigned char>(key[i])));
+    std::map<std::string, fx_def*>::iterator it = g_fx_defs.find(key);
+    if (it != g_fx_defs.end()) return it->second;
+    fx_def* d = 0;
+    size_t size = 0;
+    uint8_t* data = plat::fs_read_basename(name.c_str(), size);
+    if (data) {
+        d = new fx_def();
+        std::string err;
+        if (!assets::nif_parse(data, size, d->nif, &err)) { delete d; d = 0; }
+        plat::fs_free(data);
+    }
+    if (d) {
+        const std::vector<assets::nif_block>& b = d->nif.blocks;
+        d->tex.assign(b.size(), gfx::INVALID_TEXTURE);
+        d->mesh.assign(b.size(), 0);
+        d->parent.assign(b.size(), -1);
+        d->length = 0.0f;
+        d->loop = false;
+        for (size_t i = 0; i < b.size(); ++i) {
+            for (size_t c = 0; c < b[i].children.size(); ++c) {
+                const int k = d->nif.find(b[i].children[c]);
+                if (k >= 0) d->parent[size_t(k)] = int(i);
+            }
+            if (b[i].anim_end > d->length) d->length = b[i].anim_end;
+            for (size_t e = 0; e < b[i].extra.size(); ++e) if (b[i].extra[e] == "loop") d->loop = true;
+            if (b[i].kind == assets::nif_block::RAW_IMAGE && !b[i].rgba.empty())
+                d->tex[i] = gfx::create_texture(int32_t(b[i].width), int32_t(b[i].height), &b[i].rgba[0]);
+            if (b[i].kind == assets::nif_block::SHAPE && !b[i].verts.empty() && !b[i].tris.empty()) {
+                const size_t nv = b[i].verts.size() / 3;
+                std::vector<gfx::vertex> v(nv);
+                std::memset(&v[0], 0, nv * sizeof(gfx::vertex));
+                for (size_t k = 0; k < nv; ++k) {
+                    v[k].x = b[i].verts[k * 3]; v[k].y = b[i].verts[k * 3 + 1]; v[k].z = b[i].verts[k * 3 + 2];
+                    v[k].nz = 1.0f;
+                    if (b[i].uvs.size() >= (k + 1) * 2) { v[k].u = b[i].uvs[k * 2]; v[k].v = b[i].uvs[k * 2 + 1]; }
+                    const float* c = b[i].colors.size() >= (k + 1) * 4 ? &b[i].colors[k * 4] : 0;
+                    v[k].r = uint8_t(255 * (c ? c[0] : 1)); v[k].g = uint8_t(255 * (c ? c[1] : 1));
+                    v[k].b = uint8_t(255 * (c ? c[2] : 1)); v[k].a = uint8_t(255 * (c ? c[3] : 1));
+                }
+                d->mesh[i] = gfx::create_mesh(&v[0], int32_t(nv), &b[i].tris[0], int32_t(b[i].tris.size()));
+            }
+        }
+        if (d->length <= 0.0f) d->length = 2.0f;
+        std::printf("fx: %s, %zu blocks%s, %.2f s%s\n", name.c_str(), b.size(),
+                    d->nif.complete ? "" : " (partial)", d->length, d->loop ? ", loops" : "");
+    } else {
+        std::printf("fx: %s not found\n", name.c_str());
+    }
+    g_fx_defs[key] = d;
+    return d;
+}
+
+// Starts an effect. `seconds` < 0 plays the file once (or for good, if it
+// loops and follows an actor until stopped with fx_stop).
+int fx_spawn(const std::string& name, const float* pos, float yaw, double now, double seconds,
+             int actor = -1, float lift = 0.0f) {
+    fx_def* d = fx_load(name);
+    if (!d) return -1;
+    fx_instance fi;
+    fi.id = g_fx_next_id++;
+    fi.def = d;
+    for (int k = 0; k < 3; ++k) fi.pos[k] = pos ? pos[k] : 0.0f;
+    fi.yaw = yaw;
+    fi.start = now;
+    fi.until = seconds >= 0.0 ? now + seconds : (d->loop && actor >= 0 ? 1.0e30 : now + d->length);
+    fi.actor = actor;
+    fi.lift = lift;
+    fi.parts.resize(d->nif.blocks.size());
+    fi.emit_acc.assign(d->nif.blocks.size(), 0.0);
+    g_fx.push_back(fi);
+    return fi.id;
+}
+
+bool fx_alive(int id) {
+    for (size_t i = 0; i < g_fx.size(); ++i) if (g_fx[i].id == id) return true;
+    return false;
+}
+
+void fx_stop(int id) {
+    for (size_t i = 0; i < g_fx.size(); ++i) if (g_fx[i].id == id) g_fx[i].until = 0.0;
+}
+
+// SpecialEffect traps: running while visible and on.
+void fx_sync_traps(double now) {
+    for (size_t i = 0; i < g_effect_traps.size(); ++i) {
+        effect_trap& e = *g_effect_traps[i];
+        const bool want = e.visible() && e.on && !e.file.empty();
+        const bool have = e.fx_id >= 0 && fx_alive(e.fx_id);
+        if (want && !have) e.fx_id = fx_spawn(e.file, e.pos, e.yaw, now, 1.0e30);
+        else if (!want && have) { fx_stop(e.fx_id); e.fx_id = -1; }
+    }
+}
+
+void fx_stop_on(int actor, const std::string& name) {
+    fx_def* d = fx_load(name);
+    for (size_t i = 0; i < g_fx.size(); ++i)
+        if (g_fx[i].actor == actor && g_fx[i].def == d) g_fx[i].until = 0.0;
+}
+
+// Column-major 4x4 helpers.
+void m4_mul(const float* a, const float* b, float* out) {
+    float r[16];
+    for (int c = 0; c < 4; ++c)
+        for (int rr = 0; rr < 4; ++rr) {
+            float s = 0.0f;
+            for (int k = 0; k < 4; ++k) s += a[k * 4 + rr] * b[c * 4 + k];
+            r[c * 4 + rr] = s;
+        }
+    std::memcpy(out, r, sizeof(r));
+}
+
+// A block's local transform at `t` seconds into the effect.
+void fx_local(const assets::nif_block& b, float t, float* m) {
+    float R[9], T[3], S = b.scale;
+    std::memcpy(R, b.rotate, sizeof(R));
+    std::memcpy(T, b.translate, sizeof(T));
+    if (b.kind == assets::nif_block::ANIM_NODE) {
+        const float span = b.anim_end > b.anim_start ? b.anim_end - b.anim_start : 0.0f;
+        const float tt = span > 0.0f ? b.anim_start + std::fmod(t, span) : t;
+        if (!b.pos_keys.empty()) {
+            size_t k = 0;
+            while (k + 1 < b.pos_keys.size() && b.pos_keys[k + 1].time <= tt) ++k;
+            const assets::nif_vec_key& a = b.pos_keys[k];
+            const assets::nif_vec_key& c = b.pos_keys[std::min(k + 1, b.pos_keys.size() - 1)];
+            const float u = c.time > a.time ? std::max(0.0f, std::min(1.0f, (tt - a.time) / (c.time - a.time))) : 0.0f;
+            for (int i = 0; i < 3; ++i) T[i] = a.v[i] + (c.v[i] - a.v[i]) * u;
+        }
+        if (!b.rot_keys.empty()) {
+            size_t k = 0;
+            while (k + 1 < b.rot_keys.size() && b.rot_keys[k + 1].time <= tt) ++k;
+            const assets::nif_quat_key& a = b.rot_keys[k];
+            const assets::nif_quat_key& c = b.rot_keys[std::min(k + 1, b.rot_keys.size() - 1)];
+            const float u = c.time > a.time ? std::max(0.0f, std::min(1.0f, (tt - a.time) / (c.time - a.time))) : 0.0f;
+            float q[4];
+            assets::skl_slerp(a.q, c.q, u, q);
+            const float w = q[0], x = q[1], y = q[2], z = q[3];
+            R[0]=1-2*(y*y+z*z); R[1]=  2*(x*y-w*z); R[2]=  2*(x*z+w*y);
+            R[3]=  2*(x*y+w*z); R[4]=1-2*(x*x+z*z); R[5]=  2*(y*z-w*x);
+            R[6]=  2*(x*z-w*y); R[7]=  2*(y*z+w*x); R[8]=1-2*(x*x+y*y);
+        }
+        if (!b.scale_keys.empty()) {
+            size_t k = 0;
+            while (k + 1 < b.scale_keys.size() && b.scale_keys[k + 1].time <= tt) ++k;
+            S = b.scale_keys[k].v;
+        }
+    }
+    // NiMatrix3 is row-major; v' = R v S + T.
+    for (int c = 0; c < 3; ++c)
+        for (int r = 0; r < 3; ++r) m[c * 4 + r] = R[r * 3 + c] * S;
+    m[3] = m[7] = m[11] = 0.0f;
+    m[12] = T[0]; m[13] = T[1]; m[14] = T[2]; m[15] = 1.0f;
+}
+
+// World matrix of block i: instance placement * Max->engine * the chain.
+void fx_world(const fx_instance& fi, int i, float t, float* out) {
+    const fx_def& d = *fi.def;
+    if (i < 0) {
+        float place[16], conv[16];
+        mat4_identity(place);
+        const float c = std::cos(fi.yaw), s = std::sin(fi.yaw);
+        place[0] = c;  place[2] = -s;               // set_yaw: model +X -> (c, 0, -s)
+        place[8] = s;  place[10] = c;               //          model +Z -> (s, 0, c)
+        place[12] = fi.pos[0]; place[13] = fi.pos[1]; place[14] = fi.pos[2];
+        mat4_identity(conv);                        // (x, y, z) -> (x, z, -y)
+        conv[5] = 0.0f; conv[6] = -1.0f;            // column y: Max +Y -> engine -Z
+        conv[9] = 1.0f; conv[10] = 0.0f;            // column z: Max +Z -> engine +Y
+        m4_mul(place, conv, out);
+        return;
+    }
+    float pm[16], lm[16];
+    fx_world(fi, d.parent[size_t(i)], t, pm);
+    fx_local(d.nif.blocks[size_t(i)], t, lm);
+    m4_mul(pm, lm, out);
+}
+
+// The property of `kind` on block i or the nearest ancestor that has one.
+int fx_prop(const fx_def& d, int i, assets::nif_block::kind_t kind) {
+    for (int b = i; b >= 0; b = d.parent[size_t(b)])
+        for (size_t p = 0; p < d.nif.blocks[size_t(b)].props.size(); ++p) {
+            const int k = d.nif.find(d.nif.blocks[size_t(b)].props[p]);
+            if (k >= 0 && d.nif.blocks[size_t(k)].kind == kind) return k;
+        }
+    return -1;
+}
+
+gfx::texture_id fx_texture(const fx_def& d, int i) {
+    const int tp = fx_prop(d, i, assets::nif_block::TEXTURE);
+    if (tp < 0 || d.nif.blocks[size_t(tp)].images.empty()) return gfx::INVALID_TEXTURE;
+    const int im = d.nif.find(d.nif.blocks[size_t(tp)].images[0]);
+    if (im < 0) return gfx::INVALID_TEXTURE;
+    const int raw = d.nif.find(d.nif.blocks[size_t(im)].raw);
+    return raw >= 0 ? d.tex[size_t(raw)] : gfx::INVALID_TEXTURE;
+}
+
+double fx_rand() { return double(std::rand() % 10000) / 10000.0; }
+
+void fx_update(scene& sc, double now, float dt) {
+    for (size_t n = 0; n < g_fx.size(); ) {
+        fx_instance& fi = g_fx[n];
+        if (now >= fi.until) { g_fx.erase(g_fx.begin() + long(n)); continue; }
+        if (fi.actor >= 0 && size_t(fi.actor) < sc.actors.size()) {
+            const actor_inst& a = sc.actors[size_t(fi.actor)];
+            for (int k = 0; k < 3; ++k) fi.pos[k] = a.node->local.translate[k];
+            fi.pos[1] += fi.lift;
+            fi.yaw = std::atan2(a.node->local.rotate[2], a.node->local.rotate[8]);
+        }
+        const float t = float(now - fi.start);
+        const fx_def& d = *fi.def;
+        for (size_t i = 0; i < d.nif.blocks.size(); ++i) {
+            const assets::nif_block& b = d.nif.blocks[i];
+            if (b.kind != assets::nif_block::PSYS) continue;
+            std::vector<fx_particle>& ps = fi.parts[i];
+            for (size_t k = 0; k < ps.size(); ) {
+                fx_particle& p = ps[k];
+                if (now - p.born > p.life) { ps.erase(ps.begin() + long(k)); continue; }
+                for (int c = 0; c < 3; ++c) p.p[c] += p.v[c] * dt;
+                ++k;
+            }
+            // Emit while the effect runs (to its length, or for good if it loops).
+            const bool emitting = d.loop || t < d.length;
+            if (!emitting) continue;
+            const float rate = std::max(5.0f, std::min(b.psys.rate, 200.0f));
+            fi.emit_acc[i] += rate * dt;
+            float wm[16];
+            fx_world(fi, int(i), t, wm);
+            const float up[3] = { wm[8], wm[9], wm[10] };    // the node's Max +Z, in the world
+            const float ul = std::sqrt(up[0] * up[0] + up[1] * up[1] + up[2] * up[2]);
+            const size_t cap = std::max<size_t>(8, std::min<size_t>(b.psys.max_particles, 200));
+            while (fi.emit_acc[i] >= 1.0 && ps.size() < cap) {
+                fi.emit_acc[i] -= 1.0;
+                fx_particle p;
+                for (int c = 0; c < 3; ++c) p.p[c] = wm[12 + c];
+                const float spread = std::max(0.25f, std::fabs(b.psys.spread_a));
+                const float a = float(fx_rand() * 6.2831853), r = float(fx_rand()) * spread;
+                float dir[3] = { up[0] / ul, up[1] / ul, up[2] / ul };
+                dir[0] += std::cos(a) * r; dir[2] += std::sin(a) * r;
+                const float dl = std::sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+                const float speed = std::max(0.3f, b.psys.speed * 3.0f) * float(0.8 + 0.4 * fx_rand());
+                for (int c = 0; c < 3; ++c) p.v[c] = dir[c] / dl * speed;
+                p.born = now;
+                p.life = b.psys.raw13[3] > 0.05f ? b.psys.raw13[3] : 1.0f;
+                p.size = std::max(0.08f, std::min(b.psys.size, 1.2f));
+                ps.push_back(p);
+            }
+            if (fi.emit_acc[i] > 1.0) fi.emit_acc[i] = 1.0;
+        }
+        ++n;
+    }
+}
+
+void fx_draw(scene& sc, const float* view, double now) {
+    (void)sc;
+    if (g_fx.empty()) return;
+    static gfx::mesh_id quads = 0;
+    const int maxq = 4000;
+    if (!quads) quads = gfx::create_dynamic_mesh(maxq * 4, maxq * 6);
+    // Camera right and up, from the view matrix's rows.
+    const float rt[3] = { view[0], view[4], view[8] }, upv[3] = { view[1], view[5], view[9] };
+    gfx::render_state rs;
+    rs.depth = gfx::DEPTH_TEST;
+    rs.alpha_test = false;
+    rs.vertex_color = true;
+    rs.wireframe = false;
+    rs.fog = false;
+    float ident[16];
+    mat4_identity(ident);
+    for (size_t n = 0; n < g_fx.size(); ++n) {
+        const fx_instance& fi = g_fx[n];
+        const fx_def& d = *fi.def;
+        const float t = float(now - fi.start);
+        for (size_t i = 0; i < d.nif.blocks.size(); ++i) {
+            const assets::nif_block& b = d.nif.blocks[i];
+            const int ap = fx_prop(d, int(i), assets::nif_block::ALPHA);
+            const bool additive = ap < 0 || d.nif.blocks[size_t(ap)].alpha_dst == 0;
+            rs.blend = additive ? gfx::BLEND_ADD : gfx::BLEND_ALPHA;
+            const int mp = fx_prop(d, int(i), assets::nif_block::MATERIAL);
+            float col[4] = { 1, 1, 1, 1 };
+            if (mp >= 0) {
+                const assets::nif_block& m = d.nif.blocks[size_t(mp)];
+                for (int c = 0; c < 3; ++c) col[c] = std::min(1.0f, m.emissive[c] + m.diffuse[c]);
+                col[3] = m.alpha;
+            }
+            if (b.kind == assets::nif_block::SHAPE && d.mesh[i]) {
+                float wm[16];
+                fx_world(fi, int(i), t, wm);
+                gfx::set_render_state(rs);
+                gfx::set_model(wm);
+                gfx::set_texture(fx_texture(d, int(i)));
+                gfx::set_tint(col[0], col[1], col[2], col[3]);
+                gfx::draw(d.mesh[i]);
+            } else if (b.kind == assets::nif_block::PSYS && !fi.parts[i].empty()) {
+                const std::vector<fx_particle>& ps = fi.parts[i];
+                std::vector<gfx::vertex> v;
+                std::vector<uint16_t> ix;
+                v.reserve(ps.size() * 4);
+                for (size_t k = 0; k < ps.size() && int(k) < maxq; ++k) {
+                    const fx_particle& p = ps[k];
+                    const float age = float(now - p.born) / p.life;
+                    const float fade = std::max(0.0f, 1.0f - age);
+                    const float h = p.size * 0.5f;
+                    const float cu[4][2] = { {-1,-1}, {1,-1}, {1,1}, {-1,1} };
+                    const uint16_t base = uint16_t(v.size());
+                    for (int c = 0; c < 4; ++c) {
+                        gfx::vertex q;
+                        std::memset(&q, 0, sizeof(q));
+                        q.x = p.p[0] + (rt[0] * cu[c][0] + upv[0] * cu[c][1]) * h;
+                        q.y = p.p[1] + (rt[1] * cu[c][0] + upv[1] * cu[c][1]) * h;
+                        q.z = p.p[2] + (rt[2] * cu[c][0] + upv[2] * cu[c][1]) * h;
+                        q.nz = 1.0f;
+                        q.u = (cu[c][0] + 1) * 0.5f; q.v = (1 - cu[c][1]) * 0.5f;
+                        q.r = uint8_t(255 * col[0]); q.g = uint8_t(255 * col[1]); q.b = uint8_t(255 * col[2]);
+                        q.a = uint8_t(255 * col[3] * fade);
+                        v.push_back(q);
+                    }
+                    const uint16_t qi[6] = { 0, 1, 2, 0, 2, 3 };
+                    for (int c = 0; c < 6; ++c) ix.push_back(uint16_t(base + qi[c]));
+                }
+                if (v.empty()) continue;
+                gfx::update_mesh(quads, &v[0], int32_t(v.size()), &ix[0], int32_t(ix.size()));
+                gfx::set_render_state(rs);
+                gfx::set_model(ident);
+                gfx::set_texture(fx_texture(d, int(i)));
+                gfx::set_tint(1, 1, 1, 1);
+                gfx::draw(quads);
+            }
+        }
+    }
+    gfx::set_tint(1, 1, 1, 1);
+    gfx::set_texture(gfx::INVALID_TEXTURE);
+}
+
 // --- pickups ------------------------------------------------------------------
 //
 // Traps.txt: Pickups argv1 ActorName, argv2 ItemName, argv3 code (a script),
@@ -4580,6 +4984,22 @@ void pickup_apply(combat_state& cs, scene& sc, actor_inst& p, const scene::picku
     default: break;
     }
     std::printf("pickup: %s - %s %s, health %d/%d\n", pk.name.c_str(), what, a2.c_str(), p.health, p.max_health);
+    // The drink's burst and, for the lasting ones, the aura while it holds
+    // (geometry/utils/Potion<Name>.NIF and Potion<Name>Residual.NIF, the
+    // names at 0x4EB3D4).
+    static const char* fx_names[11] = { 0, "Heal", "Life", "Strength", "Impervious", "Jump", "Fall",
+                                        "Camouflage", "Guard", "FullHeal", "Poison" };
+    if (type >= 1 && type <= 10) {
+        int who = -1;
+        for (size_t i = 0; i < sc.actors.size(); ++i) if (&sc.actors[i] == &p) who = int(i);
+        const std::string base = std::string("Potion") + fx_names[type];
+        fx_spawn(base + ".NIF", p.node->local.translate, actor_yaw(p), now, -1.0, who);
+        double lasts = 3.0;
+        if (type == 3 || type == 5) lasts = comma == std::string::npos ? -1.0 : v1;
+        else if (type == 4 || type == 6 || type == 7 || type == 8) lasts = v0;
+        fx_spawn(base + "Residual.NIF", p.node->local.translate, actor_yaw(p), now,
+                 lasts > 0.0 ? lasts : 1.0e9, who);
+    }
 }
 // The game module, as the original structures it: `gameModule` owns a level and
 // is entered through the module manager rather than being loaded inline.
@@ -5264,6 +5684,8 @@ int main(int argc, char** argv) {
         game_time += dt;
         if (!noscript) {
             sc.script.update(game_time);
+            fx_sync_traps(game_time);
+            fx_update(sc, game_time, dt);
             const float* pp = 0;
             for (size_t i = 0; i < sc.actors.size(); ++i)
                 if (is_prince(sc.actors[i])) { pp = sc.actors[i].node->local.translate; break; }
@@ -5994,6 +6416,10 @@ int main(int argc, char** argv) {
             }
             gfx::set_tint(1.0f, 1.0f, 1.0f, 1.0f);
         }
+
+        // Effects: after the world, before the HUD.
+        fx_draw(sc, view, game_time);
+        gfx::set_model(model);
 
         // HUD: the Prince's health as potion bottles along the bottom left,
         // as the game draws it (data/2D/health bottles, black keyed out).
