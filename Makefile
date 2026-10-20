@@ -8,8 +8,9 @@
 #                            ARGS=...  extra flags passed straight through
 #   make play-debug same, from the Debug build
 #
-#   Playing: WASD move (relative to the camera), Shift run, drag LMB to look,
-#   Space act / grab a crate (hold), then W push, S pull; F free-fly camera,
+#   Playing: WASD move (relative to the camera), Shift run, Space jump
+#   (up, or toward the direction held; while running: a running jump),
+#   E act / grab a crate (hold), then W push, S pull; drag LMB to look; F free-fly camera,
 #   T show trigger volumes (off in play), Esc quit. Cutscenes take all
 #   control until they end.
 #

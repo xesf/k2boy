@@ -665,6 +665,7 @@ struct actor_inst {
     std::vector<bool>                 loco_ok;
     int                               clip;
     double                            clip_ms;
+    bool                              clip_once;      // hold the last frame instead of looping
 
     // Scripts address an actor by the node that spawned it ("prince" for the
     // Prince); "SkillAt:" plays one of its skills once, at a placeholder.
@@ -678,7 +679,7 @@ struct actor_inst {
     bool                              hidden;
 
     actor_inst() : node(0), is_enemy(false), first_item(0), item_count(0),
-                   skinned(false), clip(-1), clip_ms(0.0), scripted(0), scripted_start(0),
+                   skinned(false), clip(-1), clip_ms(0.0), clip_once(false), scripted(0), scripted_start(0),
                    scripted_yaw(0), remove_after(false), hidden(false) {
         scripted_origin[0] = scripted_origin[1] = scripted_origin[2] = 0.0f;
     }
@@ -690,12 +691,26 @@ struct actor_inst {
 //
 // The crate set follows: the skills StStartCrateMove (0x4D648C) chooses from,
 // in its own order of names (off_74AB28 .. off_74AB3C), plus the grab.
+//
+// The jump set follows, named as StContinueJump (0x4B6A0F) and
+// StStartActualJump (0x4B6C40) name them.
 enum loco_clip { LOCO_BASE = 0, LOCO_RUN, LOCO_WALK,
                  CRATE_FINISH, CRATE_BASE, CRATE_PUSH, CRATE_PUSH_FAIL,
-                 CRATE_PULL, CRATE_PULL_FAIL, CRATE_ANTIC, LOCO_COUNT };
+                 CRATE_PULL, CRATE_PULL_FAIL, CRATE_ANTIC,
+                 JUMP_UP_ANTIC, JUMP_UP, JUMP_FWD_ANTIC, JUMP_FWD, JUMP_BACK_ANTIC, JUMP_BACK,
+                 JUMP_LEFT_ANTIC, JUMP_LEFT, JUMP_RIGHT_ANTIC, JUMP_RIGHT,
+                 LAND_VERT, LAND_FWD, LAND_BACK, LAND_LEFT, LAND_RIGHT, LAND_PAINFUL,
+                 RUN_JUMP_ANTIC, RUN_JUMPING, RUN_JUMP_LAND, FALL_VERT,
+                 LOCO_COUNT };
 const char* const k_loco_names[LOCO_COUNT] = { "BasePose_L", "Running_L", "Walk_L",
     "PushOrPullFinish_M", "PushOrPullBase_M", "Push_M", "PushFail_M",
-    "Pull_M", "PullFail_M", "PushOrPullAntic_M" };
+    "Pull_M", "PullFail_M", "PushOrPullAntic_M",
+    "JumpUpAntic_G", "JumpingUp_G", "JumpForwardAntic_G", "JumpingForward_G",
+    "JumpBackAntic_G", "JumpingBack_G", "JumpLeftAntic_G", "JumpingLeft_G",
+    "JumpRightAntic_G", "JumpingRight_G",
+    "LandVertSafe_G", "LandJumpForward_G", "LandBackSafe_G", "LandLeftSafe_G",
+    "LandRightSafe_G", "LandVertPainful_G",
+    "RunJumpAnticLeft_L", "RunJumpingLeft_G", "RunJumpLand_L", "FallVertUncontrolled_G" };
 
 
 struct scene {
@@ -1120,6 +1135,7 @@ float clip_speed(const assets::skl_file& s) {
 }
 
 void set_clip(actor_inst& a, int clip) {
+    a.clip_once = false;
     if (clip == a.clip) return;
     if (clip >= 0 && (clip >= int(a.loco_ok.size()) || !a.loco_ok[size_t(clip)])) clip = -1;
     a.clip = clip;
@@ -1135,7 +1151,8 @@ void animate_actor(actor_inst& a, float dt) {
     const assets::skl_file& s = a.loco[size_t(a.clip)];
     const uint32_t len = clip_length_ms(s);
     a.clip_ms += double(dt) * 1000.0;
-    if (len) a.clip_ms = std::fmod(a.clip_ms, double(len));
+    if (len) a.clip_ms = a.clip_once ? std::min(a.clip_ms, double(len))
+                                     : std::fmod(a.clip_ms, double(len));
     const uint32_t t = uint32_t(a.clip_ms);
 
     const size_t n = std::min(a.joint_local_cur.size(), s.joints.size());
@@ -1193,6 +1210,7 @@ void load_loco_clips(const std::string& act_name, actor_inst& a) {
             std::printf("  skill %s: SklK playback not implemented, ignored\n", path.c_str()),
             a.loco_ok[size_t(c)] = false;
         if (!a.loco_ok[size_t(c)]) continue;
+        if (c > LOCO_WALK) continue;
         const assets::skl_file& s = a.loco[size_t(c)];
         float rm[3] = {0, 0, 0};
         clip_root_motion(s, rm);
@@ -2838,6 +2856,161 @@ void crate_input(crate_ctl& cc, scene& sc, actor_inst& a, const float* pos, floa
     }
 }
 
+// --- jumps ----------------------------------------------------------------------
+//
+// The Prince's stand and run jumps. Recovered from the binary:
+//   * StContinueJump (0x4B6A0F) picks the direction from the input relative to
+//     him - none: up; left / right; forward / back - and plays the matching
+//     *Antic_G clip
+//   * StStartActualJump (0x4B6C40) launches him with a velocity built from the
+//     tuning block (dword_801C2C, defaults in its ctor 0x4F8547, keys parsed by
+//     0x4F8667; the CONFIG.ENT that would override them is not shipped):
+//       up       fwd*fStandJumpUpZ      + up*fStandJumpUpY        0.07, 8.7
+//       forward  fwd*fStandJumpForwardZ + up*fStandJumpForwardY   5.7, 2.75
+//       back     fwd*fStandJumpBackZ    + up*fStandJumpBackY     -4.2, 3.75
+//       side     side*fStandJumpSideZ   + up*fStandJumpSideY      3.28, 3.28
+//       run      fwd*fRunJumpZ          + up*fRunJumpY            7.2, 5.1
+//     and gravity is FallGravity, -17.
+// Landing picks the matching Land* clip, or LandVertPainful_G past
+// MinFallHeight (6.25). How the original detects the landing (the predictive
+// planner) is not traced; here the floor probe ends the flight.
+namespace jump_tuning {
+const float GRAVITY = -17.0f;
+const float MIN_FALL_HEIGHT = 6.25f;
+}
+
+struct jump_ctl {
+    enum state_t { NONE, ANTIC, AIR, LAND } state;
+    int    dir;            // 0 up, 1 forward, 2 back, 3 left, 4 right, 5 run
+    double t0;
+    float  origin[3];
+    float  vel[3];
+    float  peak_y;
+
+    jump_ctl() : state(NONE), dir(0), t0(0), peak_y(0) {
+        for (int k = 0; k < 3; ++k) origin[k] = vel[k] = 0.0f;
+    }
+};
+
+// Plays clip `c` once from now, from `pos`.
+void jump_begin(jump_ctl& jc, actor_inst& a, int c, double now, const float* pos) {
+    set_clip(a, c);
+    a.clip_once = true;
+    a.clip_ms = 0.0;
+    jc.t0 = now;
+    for (int k = 0; k < 3; ++k) jc.origin[k] = pos[k];
+}
+
+bool clip_finished(const actor_inst& a, int c, const jump_ctl& jc, double now) {
+    return c < 0 || !a.loco_ok[size_t(c)] ||
+           (now - jc.t0) * 1000.0 >= double(clip_length_ms(a.loco[size_t(c)]));
+}
+
+// Starts a jump. `local_dir` is the input direction in the Prince's frame
+// (x right, z forward); zero for straight up. Returns false without the clips.
+bool jump_start(jump_ctl& jc, actor_inst& a, bool running, const float* local_dir,
+                double now, const float* pos) {
+    if (jc.state != jump_ctl::NONE || !a.loco_ok[JUMP_UP_ANTIC]) return false;
+    int antic;
+    if (running) { jc.dir = 5; antic = RUN_JUMP_ANTIC; }
+    else if (local_dir[0] == 0.0f && local_dir[2] == 0.0f) { jc.dir = 0; antic = JUMP_UP_ANTIC; }
+    else if (std::fabs(local_dir[2]) >= std::fabs(local_dir[0])) {
+        jc.dir = local_dir[2] > 0 ? 1 : 2;
+        antic = jc.dir == 1 ? JUMP_FWD_ANTIC : JUMP_BACK_ANTIC;
+    } else {
+        // The Prince's +x is his left (set_yaw maps +z forward, +x to the left
+        // of a viewer behind him).
+        jc.dir = local_dir[0] > 0 ? 3 : 4;
+        antic = jc.dir == 3 ? JUMP_LEFT_ANTIC : JUMP_RIGHT_ANTIC;
+    }
+    jc.state = jump_ctl::ANTIC;
+    jump_begin(jc, a, antic, now, pos);
+    return true;
+}
+
+// One frame of a jump. Returns true while the jump owns the body.
+bool jump_update(jump_ctl& jc, actor_inst& a, const k2::engine::collision_world& w,
+                 float* pos, float yaw, double now, float dt) {
+    if (jc.state == jump_ctl::NONE) return false;
+    const float fwd[3]  = { std::sin(yaw), 0.0f, std::cos(yaw) };
+    const float side[3] = { std::cos(yaw), 0.0f, -std::sin(yaw) };    // his left
+    static const int anti[6] = { JUMP_UP_ANTIC, JUMP_FWD_ANTIC, JUMP_BACK_ANTIC,
+                                 JUMP_LEFT_ANTIC, JUMP_RIGHT_ANTIC, RUN_JUMP_ANTIC };
+    static const int air[6]  = { JUMP_UP, JUMP_FWD, JUMP_BACK, JUMP_LEFT, JUMP_RIGHT, RUN_JUMPING };
+    static const int land[6] = { LAND_VERT, LAND_FWD, LAND_BACK, LAND_LEFT, LAND_RIGHT, RUN_JUMP_LAND };
+
+    if (jc.state == jump_ctl::ANTIC || jc.state == jump_ctl::LAND) {
+        const int c = jc.state == jump_ctl::ANTIC ? anti[jc.dir] : a.clip;
+        if (c >= 0 && a.loco_ok[size_t(c)]) {
+            const assets::skl_file& s = a.loco[size_t(c)];
+            const uint32_t len = clip_length_ms(s);
+            const double el = (now - jc.t0) * 1000.0;
+            float d[3];
+            root_delta(s, el >= double(len) ? len : uint32_t(el), yaw, d);
+            float target[3] = { jc.origin[0] + d[0], pos[1], jc.origin[2] + d[2] };
+            move_horizontal(w, pos, target[0] - pos[0], target[2] - pos[2]);
+        }
+        if (!clip_finished(a, c, jc, now)) return true;
+        if (jc.state == jump_ctl::LAND) {
+            jc.state = jump_ctl::NONE;
+            set_clip(a, LOCO_BASE);
+            return false;
+        }
+        // StStartActualJump: launch.
+        float Y, Z;
+        switch (jc.dir) {
+            case 0:  Y = 8.7f;  Z = 0.07f; break;
+            case 1:  Y = 2.75f; Z = 5.7f;  break;
+            case 2:  Y = 3.75f; Z = -4.2f; break;
+            case 5:  Y = 5.1f;  Z = 7.2f;  break;
+            default: Y = 3.28f; Z = 3.28f; break;
+        }
+        for (int k = 0; k < 3; ++k) jc.vel[k] = 0.0f;
+        if (jc.dir == 3 || jc.dir == 4) {
+            const float sgn = jc.dir == 3 ? 1.0f : -1.0f;
+            for (int k = 0; k < 3; ++k) jc.vel[k] = side[k] * Z * sgn;
+        } else {
+            for (int k = 0; k < 3; ++k) jc.vel[k] = fwd[k] * Z;
+        }
+        jc.vel[1] = Y;
+        jc.peak_y = pos[1];
+        jc.state = jump_ctl::AIR;
+        jump_begin(jc, a, air[jc.dir], now, pos);
+        return true;
+    }
+
+    // Airborne: ballistic under FallGravity; walls stop the horizontal part.
+    jc.vel[1] += jump_tuning::GRAVITY * dt;
+    const float before[2] = { pos[0], pos[2] };
+    move_horizontal(w, pos, jc.vel[0] * dt, jc.vel[2] * dt);
+    if (std::fabs(pos[0] - before[0]) < std::fabs(jc.vel[0] * dt) * 0.5f) jc.vel[0] = 0.0f;
+    if (std::fabs(pos[2] - before[1]) < std::fabs(jc.vel[2] * dt) * 0.5f) jc.vel[2] = 0.0f;
+    const float dy = jc.vel[1] * dt;
+    if (dy > 0.0f) {
+        // Rising: a ceiling stops the climb.
+        const float o[3] = { pos[0], pos[1] + 1.8f, pos[2] };
+        const float up[3] = { 0.0f, 1.0f, 0.0f };
+        k2::engine::pick_hit h;
+        if (w.pick(o, up, dy, false, h)) jc.vel[1] = 0.0f;
+        else pos[1] += dy;
+        if (pos[1] > jc.peak_y) jc.peak_y = pos[1];
+        return true;
+    }
+    const float o[3] = { pos[0], pos[1] + 0.05f, pos[2] };
+    const float down[3] = { 0.0f, -1.0f, 0.0f };
+    k2::engine::pick_hit h;
+    if (w.pick(o, down, -dy + 0.05f, true, h) && h.normal[1] >= move_tuning::FLOOR_MIN_NY) {
+        pos[1] = h.point[1];
+        const float fell = jc.peak_y - pos[1];
+        jc.state = jump_ctl::LAND;
+        const int c = fell > jump_tuning::MIN_FALL_HEIGHT ? LAND_PAINFUL : land[jc.dir];
+        jump_begin(jc, a, c, now, pos);
+        return true;
+    }
+    pos[1] += dy;
+    return true;
+}
+
 // The game module, as the original structures it: `gameModule` owns a level and
 // is entered through the module manager rather than being loaded inline.
 //
@@ -2910,6 +3083,7 @@ int main(int argc, char** argv) {
     bool noclip   = false;
     bool noscript = false;
     bool autopush = false;
+    bool autojump = false;
     std::vector<std::string> send_args;
     const char* place_arg = 0;
     bool trapmsg  = false;
@@ -2954,6 +3128,7 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--noclip") == 0) noclip = true;
         else if (std::strcmp(argv[i], "--noscript") == 0) noscript = true;
         else if (std::strcmp(argv[i], "--autopush") == 0) autopush = true;
+        else if (std::strcmp(argv[i], "--autojump") == 0) autojump = true;
         else if (std::strcmp(argv[i], "--send") == 0 && i + 1 < argc) send_args.push_back(argv[++i]);
         else if (std::strcmp(argv[i], "--place") == 0 && i + 1 < argc) place_arg = argv[++i];
         else if (std::strcmp(argv[i], "--trapmsg") == 0) trapmsg = true;
@@ -3270,6 +3445,8 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < send_args.size(); ++i) sc.script.send_item(send_args[i], 0);
     double game_time = 0.0;
     crate_ctl crates;
+    jump_ctl  jumps;
+    bool      jump_was_down = false;
     std::printf("scripts: %zu traps, %zu areas, %zu plates%s\n", sc.traps.size(),
                 sc.areas.size(), sc.plates.size(),
                 noscript ? " (disabled by --noscript)" : "");
@@ -3398,7 +3575,7 @@ int main(int argc, char** argv) {
             const float* pp = 0;
             for (size_t i = 0; i < sc.actors.size(); ++i)
                 if (!sc.actors[i].is_enemy) { pp = sc.actors[i].node->local.translate; break; }
-            const bool action = follow_mode && down[plat::KEY_SPACE];
+            const bool action = follow_mode && down[plat::KEY_E];
             for (size_t i = 0; i < sc.areas.size(); ++i)
                 sc.areas[i]->update(game_time, pp && sc.areas[i]->contains(pp), action);
             for (size_t i = 0; i < sc.plates.size(); ++i)
@@ -3440,17 +3617,34 @@ int main(int argc, char** argv) {
             const float ml = std::sqrt(mv[0]*mv[0] + mv[2]*mv[2]);
             k2::engine::transform& lt = player->node->local;
             const bool run = autorun || down[plat::KEY_LSHIFT] || down[plat::KEY_RSHIFT];
-            // Crates take over the body while one is held: Space grabs and
-            // holds, W pushes, S pulls (see update_crate).
-            const bool act  = !snoozed && (down[plat::KEY_SPACE] || autopush);
+            // Crates take over the body while one is held: E grabs and holds,
+            // W pushes, S pulls (see update_crate). Space jumps.
+            const bool act  = !snoozed && (down[plat::KEY_E] || autopush);
             const bool push = !snoozed && (down[plat::KEY_W] || autopush);
             const bool pull = !snoozed && down[plat::KEY_S];
             const bool scripted_now = player->scripted != 0;
-            const bool in_crate = !scripted_now &&
+            // Jump: Space, edge-triggered, from the ground and not mid-crate.
+            const bool jump_key = !snoozed && (down[plat::KEY_SPACE] || autojump);
+            if (jump_key && !jump_was_down && !scripted_now && crates.state == crate_ctl::NONE &&
+                jumps.state == jump_ctl::NONE && player_vy == 0.0f) {
+                const float pf[3] = { std::sin(player_yaw), 0.0f, std::cos(player_yaw) };
+                const float ps[3] = { std::cos(player_yaw), 0.0f, -std::sin(player_yaw) };
+                float local[3] = { 0.0f, 0.0f, 0.0f };
+                if (ml > 1e-6f) {
+                    local[0] = (mv[0] * ps[0] + mv[2] * ps[2]) / ml;
+                    local[2] = (mv[0] * pf[0] + mv[2] * pf[2]) / ml;
+                }
+                const bool running = run && ml > 1e-6f && player->clip == LOCO_RUN;
+                jump_start(jumps, *player, running, local, game_time, lt.translate);
+            }
+            jump_was_down = jump_key;
+            const bool in_jump = !scripted_now &&
+                jump_update(jumps, *player, sc.coll, lt.translate, player_yaw, game_time, dt);
+            const bool in_crate = !scripted_now && !in_jump &&
                                   update_crate(crates, sc, *player, lt.translate, player_yaw,
                                                game_time, act, push, pull);
-            if (scripted_now) {
-                // A scripted skill owns the body: no input, no gravity.
+            if (scripted_now || in_jump) {
+                // A scripted skill or a jump owns the body: no walking, no gravity.
             } else if (in_crate) {
                 crate_input(crates, sc, *player, lt.translate, player_yaw, game_time, act, push, pull);
             } else if (ml > 1e-6f) {
@@ -3484,7 +3678,7 @@ int main(int argc, char** argv) {
                 set_clip(*player, LOCO_BASE);
             }
             // Stand on the floor, step up small ledges, fall off edges.
-            if (!noclip && !scripted_now) {
+            if (!noclip && !scripted_now && !in_jump) {
                 float gy;
                 if (player_vy <= 0.0f && ground_under(sc.coll, lt.translate, gy)) {
                     lt.translate[1] = gy;

@@ -61,4 +61,4 @@ Reproduce with
 
 How a crate is detected and grabbed (`sub_4B0F1B` around `0x4B1789`). The port grabs the
 nearest Crate within 1.2 units ahead on the same floor, and squares the Prince up to the
-crate's nearest axis. It also skips the room test `sub_4117B7`, which follows the floor probe.
+crate's nearest axis. In play, E grabs and holds; W pushes, S pulls. It also skips the room test `sub_4117B7`, which follows the floor probe.
