@@ -92,7 +92,8 @@ size_t movie::audio_samples() const {
     return frames * size_t(m_audio->channels ? m_audio->channels : 1);
 }
 
-size_t movie::decode_audio_into(int16_t* dst, size_t capacity, const volatile bool* stop) const {
+size_t movie::decode_audio_into(int16_t* dst, size_t capacity, const volatile bool* stop,
+                                volatile size_t* progress) const {
     if (!m_audio || m_path.empty()) return 0;
     xf_mov own;
     std::memset(&own, 0, sizeof(own));
@@ -105,6 +106,7 @@ size_t movie::decode_audio_into(int16_t* dst, size_t capacity, const volatile bo
             const size_t n = std::min(out.size(), capacity - written);
             if (n) std::memcpy(dst + written, &out[0], n * sizeof(int16_t));
             written += n;
+            if (progress) *progress = written;
             out.clear();
             return !(stop && *stop) && written < capacity;
         });

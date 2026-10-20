@@ -57,7 +57,9 @@ public:
     // Decodes the sound track into dst, at most `capacity` samples, from a
     // second handle on the file - safe beside next_frame() on another
     // thread. Stops early when *stop turns true. Returns samples written.
-    size_t decode_audio_into(int16_t* dst, size_t capacity, const volatile bool* stop) const;
+    // `progress`, when given, follows the samples written so far.
+    size_t decode_audio_into(int16_t* dst, size_t capacity, const volatile bool* stop,
+                             volatile size_t* progress = 0) const;
     int audio_rate() const { return m_audio_rate; }
     int audio_channels() const { return m_audio_channels; }
 

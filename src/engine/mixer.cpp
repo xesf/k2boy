@@ -20,6 +20,11 @@ void mixer::add_sound(const std::string& name, const assets::sfx_file& s) {
     m_sounds[lower(name)] = s;
 }
 
+void mixer::add_sound(const std::string& name, assets::sfx_file&& s) {
+    std::lock_guard<std::mutex> g(m_lock);
+    m_sounds[lower(name)] = std::move(s);
+}
+
 bool mixer::has_sound(const std::string& name) const {
     std::lock_guard<std::mutex> g(m_lock);
     return m_sounds.count(lower(name)) != 0;

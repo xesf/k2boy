@@ -5161,8 +5161,9 @@ struct movie_play {
     volatile bool        decode_finished;
     int16_t*             pcm;
     size_t               pcm_cap;
+    volatile size_t      pcm_ready;         // samples the sound thread has written
     movie_play() : mv(0), width(0), height(0), bytes(0), decoded(0), head(0), space(0), to_convert(0),
-                   done(0), stop(false), decode_finished(false), pcm(0), pcm_cap(0) {}
+                   done(0), stop(false), decode_finished(false), pcm(0), pcm_cap(0), pcm_ready(0) {}
 
     static void video(void* u) {
         movie_play& p = *static_cast<movie_play*>(u);
@@ -5197,13 +5198,15 @@ struct movie_play {
 
     static void audio(void* u) {
         movie_play& p = *static_cast<movie_play*>(u);
-        p.mv->decode_audio_into(p.pcm, p.pcm_cap, &p.stop);
+        p.mv->decode_audio_into(p.pcm, p.pcm_cap, &p.stop, &p.pcm_ready);
+        p.pcm_ready = p.pcm_cap;
         plat::sema_signal(p.done, 1);
     }
 };
 } // namespace
 
 bool play_movie(const std::string& name) {
+    const double t_open = plat::time_seconds();
     media::movie mv;
     std::string path = "movies/" + name;
     if (path.size() < 4 || path.compare(path.size() - 4, 4, ".mov") != 0) path += ".mov";
@@ -5213,6 +5216,9 @@ bool play_movie(const std::string& name) {
                 mv.duration(), mv.audio_samples());
 
     static movie_play p;
+    p.pcm = 0;
+    p.pcm_cap = 0;
+    p.pcm_ready = 0;
     p.mv = &mv;
     p.stop = false;
     p.decode_finished = false;
@@ -5229,8 +5235,8 @@ bool play_movie(const std::string& name) {
     p.done = plat::sema_create(0);
     int threads = 0;
 
-    // The sound: a silent buffer of the track's length, registered and
-    // playing at once, filled ahead of the play head by its own thread.
+    // The sound: a silent buffer of the track's length, registered, and
+    // filled ahead of the play head by its own thread.
     int32_t voice = 0;
     if (!g_mixer) std::printf("movie: no mixer, silent\n");
     if (g_mixer && mv.audio_samples()) {
@@ -5238,20 +5244,48 @@ bool play_movie(const std::string& name) {
         sf.channels = mv.audio_channels();
         sf.rate = mv.audio_rate();
         sf.samples.assign(mv.audio_samples(), 0);
-        g_mixer->add_sound("__movie", sf);
-        p.pcm = g_mixer->sound_samples("__movie");
         p.pcm_cap = sf.samples.size();
+        g_mixer->add_sound("__movie", std::move(sf));
+        p.pcm = g_mixer->sound_samples("__movie");
         if (p.pcm && plat::thread_start(&movie_play::audio, &p, 0, "k2 movie audio")) ++threads;
-        voice = g_mixer->play("__movie", 0, 0.0f, false, 1.0f);
     }
     if (plat::thread_start(&movie_play::video, &p, 1, "k2 movie video")) ++threads;
     if (plat::thread_start(&movie_play::convert, &p, 2, "k2 movie colour")) ++threads;
+
+    // Picture and sound start together: the clock waits for the first frame
+    // and a second of decoded sound (or all of it). Started at once, the
+    // first frames came late and the sound played silence until its decoder
+    // passed the play head - a frozen black screen, then sound seconds late.
+    bool alive = true, skip = false;
+    {
+        const double t0 = plat::time_seconds();
+        const size_t want = std::min(p.pcm_cap, size_t(mv.audio_rate()) * size_t(mv.audio_channels()));
+        while (alive && !skip && plat::time_seconds() - t0 < 5.0) {
+            const bool video_ready = p.head.load() >= 1 || p.decode_finished;
+            const bool audio_ready = !p.pcm || p.pcm_ready >= want;
+            if (video_ready && audio_ready) break;
+            plat::event e;
+            while (plat::poll_event(e)) {
+                if (e.type == plat::EVENT_QUIT) alive = false;
+                if (e.type == plat::EVENT_PAD_BUTTON && e.pad_pressed) skip = true;
+                if (e.type == plat::EVENT_KEY_DOWN && e.k == plat::KEY_ESCAPE) skip = true;
+            }
+            gfx::begin_frame();
+            gfx::set_clear_color(0.0f, 0.0f, 0.0f);
+            gfx::clear(true, true);
+            gfx::end_frame();
+            plat::swap_buffers();
+        }
+        std::printf("movie: opened in %.2f s, buffered in %.2f s (%d frames, %.1f s of sound)\n",
+                    t0 - t_open, plat::time_seconds() - t0, p.head.load(),
+                    p.pcm_cap ? double(p.pcm_ready) / (mv.audio_rate() * mv.audio_channels()) : 0.0);
+    }
+    if (g_mixer && p.pcm) voice = g_mixer->play("__movie", 0, 0.0f, false, 1.0f);
     std::fflush(stdout);
 
     gfx::texture_id tex = gfx::INVALID_TEXTURE;
     const double start = plat::time_seconds();
     int shown = -1;
-    bool alive = true, skip = false;
     while (alive && !skip) {
         plat::event e;
         while (plat::poll_event(e)) {

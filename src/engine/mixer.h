@@ -33,6 +33,9 @@ public:
 
     // Registers a decoded sound under a lower-case name.
     void add_sound(const std::string& name, const assets::sfx_file& s);
+    // As above, taking the samples over rather than copying them (a movie's
+    // whole sound track is megabytes).
+    void add_sound(const std::string& name, assets::sfx_file&& s);
     bool has_sound(const std::string& name) const;
     // A registered sound's samples, for filling while it plays (a movie's
     // track decoded on another thread into a buffer sized up front). Valid
