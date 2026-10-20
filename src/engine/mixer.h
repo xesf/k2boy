@@ -26,7 +26,7 @@ namespace engine {
 
 class mixer {
 public:
-    explicit mixer(int32_t out_rate) : m_rate(out_rate), m_next_id(1) {
+    explicit mixer(int32_t out_rate) : m_rate(out_rate), m_next_id(1), m_volume(1.0f) {
         for (int k = 0; k < 3; ++k) m_ear[k] = 0.0f;
         m_ear_right[0] = 1.0f; m_ear_right[1] = m_ear_right[2] = 0.0f;
     }
@@ -41,6 +41,8 @@ public:
     void    stop(int32_t id);
 
     void set_listener(const float pos[3], const float right[3]);
+    // Scales everything mixed (the Options' Sound Volume), 0..1.
+    void set_volume(float v) { m_volume = v; }
 
     // Audio thread: adds `frames` stereo frames into `out`.
     void mix(float* out, int32_t frames);
@@ -61,6 +63,7 @@ private:
     std::vector<voice> m_voices;
     mutable std::mutex m_lock;
     int32_t m_next_id;
+    float   m_volume;
     float   m_ear[3], m_ear_right[3];
 };
 

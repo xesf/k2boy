@@ -26,6 +26,9 @@
 #include "media/svq1.h"
 #include "media/qdm2.h"
 #include "media/movie.h"
+#include "ui/frontend.h"
+
+#include <unistd.h>
 
 #include <cstdio>
 #include <cstring>
@@ -2010,6 +2013,8 @@ k2::engine::mixer* g_mixer = 0;
 void audio_callback(float* out, int32_t frames, void*) {
     std::memset(out, 0, size_t(frames) * 2 * sizeof(float));
     if (g_mixer) g_mixer->mix(out, frames);
+    static FILE* tap = std::getenv("K2_AUDIO_TAP") ? std::fopen(std::getenv("K2_AUDIO_TAP"), "wb") : 0;
+    if (tap) { std::fwrite(out, sizeof(float), size_t(frames) * 2, tap); std::fflush(tap); }
 }
 
 // A bare name ("L01waterdropN") stands for its numbered variants on disk
@@ -4595,6 +4600,39 @@ int nearest_enemy(const combat_state& cs, const scene& sc, const float* pp, floa
     return best;
 }
 
+// --- relaunch ---------------------------------------------------------------------
+//
+// Restart Level, Main Menu and Load from the in-game menu start the binary
+// afresh: the original's arguments without the ones that place or set up a
+// run, then `extra`. The data root (the last argument) is kept.
+void relaunch(int argc, char** argv, const std::vector<std::string>& extra) {
+    static const char* drop1[] = { "--menu", "--menu-game", "--armed", "--boot", 0 };
+    static const char* drop2[] = { "--place", "--region", "--health", "--send", "--movie", 0 };
+    std::vector<std::string> args;
+    args.push_back(argv[0]);
+    std::string root;
+    for (int i = 1; i < argc; ++i) {
+        bool skip = false;
+        for (int k = 0; drop1[k]; ++k) if (std::strcmp(argv[i], drop1[k]) == 0) skip = true;
+        for (int k = 0; drop2[k]; ++k) if (std::strcmp(argv[i], drop2[k]) == 0) { skip = true; ++i; }
+        if (skip) continue;
+        if (i == argc - 1 && argv[i][0] != '-') { root = argv[i]; continue; }
+        args.push_back(argv[i]);
+    }
+    args.insert(args.end(), extra.begin(), extra.end());
+    if (!root.empty()) args.push_back(root);
+    std::vector<char*> cargs;
+    for (size_t i = 0; i < args.size(); ++i) cargs.push_back(const_cast<char*>(args[i].c_str()));
+    cargs.push_back(0);
+    std::fflush(stdout);
+    plat::audio_close();
+    gfx::shutdown();
+    plat::shutdown();
+    ::execv(argv[0], &cargs[0]);
+    std::perror("relaunch");
+    std::exit(1);
+}
+
 // --- cutscenes -------------------------------------------------------------------
 //
 // Plays a movie (data/Movies/<name>.mov) full screen, its sound through the
@@ -4609,6 +4647,7 @@ bool play_movie(const std::string& name) {
     std::printf("movie: %s %dx%d, %.1f s, %zu audio samples\n", path.c_str(), mv.width(), mv.height(),
                 mv.duration(), mv.pcm().size());
     int32_t voice = 0;
+    if (!g_mixer) std::printf("movie: no mixer, silent\n");
     if (g_mixer && !mv.pcm().empty()) {
         assets::sfx_file sf;
         sf.channels = mv.audio_channels();
@@ -4616,6 +4655,9 @@ bool play_movie(const std::string& name) {
         sf.samples = mv.pcm();
         g_mixer->add_sound("__movie", sf);
         voice = g_mixer->play("__movie", 0, 0.0f, false, 1.0f);
+        std::printf("movie: sound voice %d (%zu voices), %d Hz %dch\n", voice, g_mixer->voices(),
+                    sf.rate, sf.channels);
+        std::fflush(stdout);
     }
     gfx::texture_id tex = gfx::INVALID_TEXTURE;
     const double start = plat::time_seconds();
@@ -5177,6 +5219,9 @@ int main(int argc, char** argv) {
     bool classic  = false;
     bool mute     = false;
     bool start_armed = false;
+    bool use_menu = false;          // --menu: the title screens, Esc menu in play
+    bool menu_in_game_only = false; // --menu-game: straight into play, Esc menu only
+    int  start_health = -1, start_max_health = -1;   // --health H,MAX (from a save)
     bool sounds_only = false;
     bool find_ledges = false;
     struct key_hold { std::string keys; double from, to; };
@@ -5237,6 +5282,10 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--findledges") == 0) find_ledges = true;
         else if (std::strcmp(argv[i], "--mute") == 0) mute = true;
         else if (std::strcmp(argv[i], "--armed") == 0) start_armed = true;
+        else if (std::strcmp(argv[i], "--menu") == 0) use_menu = true;
+        else if (std::strcmp(argv[i], "--menu-game") == 0) { use_menu = true; menu_in_game_only = true; }
+        else if (std::strcmp(argv[i], "--health") == 0 && i + 1 < argc)
+            std::sscanf(argv[++i], "%d,%d", &start_health, &start_max_health);
         else if (std::strcmp(argv[i], "--sounds") == 0) sounds_only = true;
         else if (std::strcmp(argv[i], "--hold") == 0 && i + 1 < argc) {
             const std::string h = argv[++i];
@@ -5361,6 +5410,10 @@ int main(int argc, char** argv) {
             chunk.resize(bytes);
             if (bytes) media::xf_read_at(mv.file, at->chunk_offset[c], &chunk[0], bytes);
             if (at->codec == 0x51444D32 /* QDM2 */) q.decode(bytes ? &chunk[0] : 0, bytes, pcm);
+        }
+        if (const char* raw = std::getenv("K2_PCM_OUT")) {         // raw s16le dump, for comparison
+            FILE* f = std::fopen(raw, "wb");
+            if (f) { std::fwrite(pcm.empty() ? 0 : &pcm[0], 2, pcm.size(), f); std::fclose(f); }
         }
         double sum = 0;
         for (size_t k = 0; k < pcm.size(); ++k) sum += double(pcm[k]) * pcm[k];
@@ -5495,6 +5548,49 @@ int main(int argc, char** argv) {
     int32_t w = 0, h = 0;
     plat::drawable_size(w, h);
     gfx::resize(w, h);
+
+    // --menu: the Red Orb logo, then the title screen. New Game shows the
+    // Introduction cinematic and boots the first level; Load boots the
+    // saved level with the Prince where the save put him.
+    static std::string fe_place, fe_region;
+    ui::frontend frontend;
+    const bool fe_ok = use_menu && frontend.init([](const std::string& n) { return play_movie(n); });
+    if (use_menu && !menu_in_game_only) {
+        k2::engine::mixer fe_mixer(44100);
+        bool fe_audio = false;
+        if (!mute) {
+            g_mixer = &fe_mixer;
+            fe_audio = plat::audio_open(44100, audio_callback, 0);
+            if (!fe_audio) g_mixer = 0;
+        }
+        bool alive = play_movie("Broder");
+        ui::save_game sv;
+        const ui::result r = alive ? frontend.main_menu(sv) : ui::R_CLOSED;
+        if (r == ui::R_NEW_GAME) {
+            alive = play_movie("cs01");
+            boot = true;
+        } else if (r == ui::R_LOAD) {
+            boot = true;
+            region_arg = sv.region;
+            char b[96];
+            std::snprintf(b, sizeof(b), "%.3f,%.3f,%.3f,%.2f", sv.pos[0], sv.pos[1], sv.pos[2],
+                          sv.yaw * 180.0f / 3.14159265f);
+            fe_place = b;
+            place_arg = fe_place.c_str();
+            start_health = sv.health;
+            start_max_health = sv.max_health;
+            start_armed = sv.armed;
+            send_args.push_back("IntroAnim,enable:F");   // the opening scene has been seen
+        }
+        if (fe_audio) plat::audio_close();
+        g_mixer = 0;
+        if (!alive || (r != ui::R_NEW_GAME && r != ui::R_LOAD)) {
+            gfx::shutdown();
+            plat::shutdown();
+            return 0;
+        }
+        classic = frontend.prefs().classic;
+    }
 
     // --boot: do what WinMain does. Read distribution.dat, then resolve the
     // startup module id to its level. No hardcoded path.
@@ -5745,6 +5841,12 @@ int main(int argc, char** argv) {
     if (start_armed)
         for (size_t i = 0; i < sc.actors.size(); ++i)
             if (is_prince(sc.actors[i])) sc.actors[i].armed = true;
+    if (start_health > 0)
+        for (size_t i = 0; i < sc.actors.size(); ++i)
+            if (is_prince(sc.actors[i])) {
+                sc.actors[i].max_health = start_max_health > 0 ? start_max_health : start_health;
+                sc.actors[i].health = start_health;
+            }
     std::vector<bool> pickup_taken(sc.pickups.size(), false);
     std::printf("combat: %zu fight.ini values, %zu enemy.dat values, %zu guards, %zu pickups\n",
                 fight_tuning.fight_count(), fight_tuning.enemy_count(), combat.enemies.size(),
@@ -5819,6 +5921,7 @@ int main(int argc, char** argv) {
     gfx::set_clear_color(0.05f, 0.06f, 0.09f);
 
     bool running = true;
+    bool open_menu = false;
     while (running) {
         plat::event e;
         while (plat::poll_event(e)) {
@@ -5827,7 +5930,10 @@ int main(int argc, char** argv) {
                     running = false;
                     break;
                 case plat::EVENT_KEY_DOWN:
-                    if (e.k == plat::KEY_ESCAPE) running = false;
+                    if (e.k == plat::KEY_ESCAPE) {
+                        if (!use_menu || !fe_ok || shot_path) running = false;
+                        else open_menu = true;
+                    }
                     if (e.k == plat::KEY_R) frame_scene(cam, sc);
                     if (e.k == plat::KEY_V && !input_locked) {
                         follow_mode = !follow_mode;
@@ -5882,6 +5988,71 @@ int main(int argc, char** argv) {
                 default:
                     break;
             }
+        }
+
+        // K2_GAME_MENU=1 opens the in-game menu on the tenth frame (headless checks).
+        {
+            static int menu_frames = 0;
+            if (++menu_frames == 10 && std::getenv("K2_GAME_MENU") && use_menu && fe_ok) open_menu = true;
+        }
+        if (open_menu) {
+            open_menu = false;
+            do {
+                    // The in-game menu (Game Menu art). Resume carries on;
+                    // the rest start a fresh run of the binary.
+                    ui::save_game cur;
+                    cur.level = boot_level.empty() ? "prisonfix" : boot_level;
+                    cur.region = region_arg;
+                    for (size_t i = 0; i < sc.actors.size(); ++i)
+                        if (is_prince(sc.actors[i])) {
+                            for (int k = 0; k < 3; ++k) cur.pos[k] = sc.actors[i].node->local.translate[k];
+                            cur.health = sc.actors[i].health;
+                            cur.max_health = sc.actors[i].max_health;
+                            cur.armed = sc.actors[i].armed;
+                        }
+                    cur.yaw = player_yaw;
+                    {
+                        // The level's name in GameText, for the save list.
+                        static const char* names[][2] = {
+                            { "prisonfix", "Prison" }, { "ivorytwr", "Ivory_Tower" }, { "cistern", "Cistern" },
+                            { "palace2", "Palace_2" }, { "palace3", "Palace_3" }, { "palace4", "Palace_4" },
+                            { "roof1", "Rooftops" }, { "cityanddocks", "StreetsDocks" },
+                            { "dirig1a", "Lower_Dirigible" }, { "dirig1b", "Lower_Dirigible_2" },
+                            { "dirig2", "Upper_Dirigible" }, { "dirigfinale", "Dirigible_Finale" },
+                            { "ruins", "Floating_Ruins" }, { "cliffs", "Cliffs" }, { "solar1", "Sun_Temple" },
+                            { "moontemple", "Moon_Temple" }, { "finale", "Finale" } };
+                        std::string lv = cur.level;
+                        for (size_t k = 0; k < lv.size(); ++k) lv[k] = char(std::tolower(static_cast<unsigned char>(lv[k])));
+                        for (size_t k = 0; k < sizeof(names) / sizeof(names[0]); ++k)
+                            if (lv.find(std::string(names[k][0]) + ".lvl") != std::string::npos)
+                                cur.name = frontend.text().get(names[k][1]);
+                        if (cur.name.empty()) cur.name = lv;
+                    }
+                    ui::save_game ld;
+                    const ui::result r = frontend.game_menu(cur, ld);
+                    for (int k = 0; k < plat::KEY_COUNT; ++k) down[k] = false;
+                    classic = frontend.prefs().classic;
+                    if (r == ui::R_RESUME || r == ui::R_NONE) break;
+                    if (r == ui::R_QUIT || r == ui::R_CLOSED) { running = false; break; }
+                    std::vector<std::string> extra;
+                    if (r == ui::R_MAIN_MENU) extra.push_back("--menu");
+                    if (r == ui::R_LOAD) {
+                        char b[96];
+                        std::snprintf(b, sizeof(b), "%.3f,%.3f,%.3f,%.2f", ld.pos[0], ld.pos[1], ld.pos[2],
+                                      ld.yaw * 180.0f / 3.14159265f);
+                        extra.push_back("--boot"); extra.push_back("--menu-game");
+                        extra.push_back("--region"); extra.push_back(std::to_string(ld.region));
+                        extra.push_back("--place"); extra.push_back(b);
+                        std::snprintf(b, sizeof(b), "%d,%d", ld.health, ld.max_health);
+                        extra.push_back("--health"); extra.push_back(b);
+                        if (ld.armed) extra.push_back("--armed");
+                        extra.push_back("--send"); extra.push_back("IntroAnim,enable:F");
+                    }
+                    if (r == ui::R_RESTART) { extra.push_back("--boot"); extra.push_back("--menu-game"); }
+                    relaunch(argc, argv, extra);
+                    running = false;
+            } while (false);
+            if (!running) break;
         }
 
         // --- free-fly camera integration

@@ -9,6 +9,11 @@
 #                            ARGS=...  extra flags passed straight through
 #   make play-debug same, from the Debug build
 #
+#   make play starts at the Red Orb logo and the title screen (New Game,
+#   Load, Options, Cinematics, Credits); Esc in play opens the game menu
+#   (save, load, restart, options). MENU=0 goes straight into the level.
+#   Saves and settings live in ~/.k2boy.
+#
 #   Controls (C switches scheme in game):
 #     Modern   WASD / left stick move relative to the camera; mouse drag or
 #              right stick turns the camera. A full stick push runs.
@@ -82,7 +87,7 @@ REGION    ?= 0
 CONTROLS  ?= modern
 TRACE     ?= 0
 ARGS      ?=
-PLAY_FLAGS = --boot --notrig --controls $(CONTROLS) --region $(REGION) $(if $(filter 1,$(TRACE)),--trapmsg) $(ARGS)
+PLAY_FLAGS = --boot --notrig $(if $(filter 0,$(MENU)),--controls $(CONTROLS),--menu) --region $(REGION) $(if $(filter 1,$(TRACE)),--trapmsg) $(ARGS)
 
 # Configures a build directory, or reconfigures it when its cache points at a
 # CMake that no longer exists (a CMake upgrade otherwise breaks every target

@@ -64,7 +64,7 @@ void mixer::mix(float* out, int32_t frames) {
         voice& v = m_voices[vi];
         const assets::sfx_file& s = *v.sound;
         const double step = double(s.rate) / double(m_rate);
-        float gl = v.gain * 0.7071f, gr = v.gain * 0.7071f;
+        float gl = v.gain * m_volume * 0.7071f, gr = v.gain * m_volume * 0.7071f;
         if (v.positional) {
             const float d[3] = { v.pos[0] - m_ear[0], v.pos[1] - m_ear[1], v.pos[2] - m_ear[2] };
             const float dist = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
@@ -74,8 +74,8 @@ void mixer::mix(float* out, int32_t frames) {
             const float pan = dist > 1e-3f ? (d[0] * m_ear_right[0] + d[1] * m_ear_right[1] +
                                               d[2] * m_ear_right[2]) / dist : 0.0f;
             const float a = (pan + 1.0f) * 0.25f * 3.14159265f;      // 0 .. pi/2
-            gl = v.gain * att * std::cos(a);
-            gr = v.gain * att * std::sin(a);
+            gl = v.gain * m_volume * att * std::cos(a);
+            gr = v.gain * m_volume * att * std::sin(a);
         }
         const size_t n = s.frames();
         const int ch = s.channels;
