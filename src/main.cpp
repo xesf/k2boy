@@ -692,6 +692,7 @@ struct actor_inst {
     // through `ambient`, a random pick each time, and plays any skill a
     // script names. `home` is where it stands between them.
     bool                              is_fixture;
+    bool                              start_flag;     // "Start" received (0x1000 at +0xD8)
     std::vector<std::string>          ambient;
     float                             home[3];
     float                             home_yaw;
@@ -700,7 +701,7 @@ struct actor_inst {
                    skinned(false), clip(-1), clip_ms(0.0), clip_once(false), scripted(0), scripted_start(0),
                    scripted_yaw(0), remove_after(false), hidden(false), stance(0),
                    hold_last(false), posed_hold(false), health(100), max_health(100), armed(false),
-                   is_fixture(false), home_yaw(0) {
+                   is_fixture(false), start_flag(false), home_yaw(0) {
         scripted_origin[0] = scripted_origin[1] = scripted_origin[2] = 0.0f;
         home[0] = home[1] = home[2] = 0.0f;
     }
@@ -1584,6 +1585,14 @@ private:
 //                                    and facing; REMOVE hides it afterwards
 bool play_once(scene& sc, actor_inst& a, const std::string& name, double now, float yaw, bool hold);
 
+bool equals_nocase(const std::string& a, const char* b) {
+    size_t i = 0;
+    for (; i < a.size() && b[i]; ++i)
+        if (std::tolower(static_cast<unsigned char>(a[i])) != std::tolower(static_cast<unsigned char>(b[i])))
+            return false;
+    return i == a.size() && !b[i];
+}
+
 class actor_target : public k2::engine::script_target {
 public:
     actor_target(k2::engine::script_world& w, scene& sc, size_t actor)
@@ -1598,6 +1607,13 @@ public:
         if (msg.compare(0, 8, "SkillAt:") == 0 || msg.compare(0, 8, "skillat:") == 0)
             return skill_at(msg.substr(8));
         actor_inst& a = m_sc.actors[m_actor];
+        if (a.is_enemy) {
+            // EnemyStart's table (0x46CB7C): Start sets flag 0x1000; Remove
+            // takes him out of the level.
+            if (equals_nocase(msg, "start")) { a.start_flag = true; return true; }
+            if (equals_nocase(msg, "remove")) { a.hidden = true; return true; }
+            return false;
+        }
         if (!a.is_fixture) return false;
         std::string l = msg;
         for (size_t i = 0; i < l.size(); ++i) l[i] = char(std::tolower(static_cast<unsigned char>(l[i])));
@@ -3802,6 +3818,14 @@ struct enemy_ai {
     pending_hit hit;
     std::string set;        // clip suffix: "_G1"
     std::string hurt_set;   // "_L1"
+    // EnemyStart argv4 (+0x11C): run when he falls ("P4_gatenew,move,...").
+    std::string on_death;
+    // argv5, the "start" skill (0x4A8B4E): "*Name" loops as his idle;
+    // otherwise he holds its first frame, waiting, until "Start" (actor flag
+    // 0x1000, 0x46D9C4) or he sees the Prince, then plays it and takes over.
+    std::string start_skill;
+    bool        start_loops;
+    bool        waiting;
 };
 
 struct combat_state {
@@ -3860,11 +3884,22 @@ void combat_init(combat_state& cs, scene& sc, const k2::engine::fight_params& fp
         e.hit.active = false;
         e.set = "_G1";
         e.hurt_set = "_L1";
+        e.start_loops = false;
+        e.waiting = false;
         // EnemyStart argv: body, "difficulty,weapon,health", waypoints, ...
         for (size_t t = 0; t < sc.spawn_points.size(); ++t) {
             const assets::k2a_trap& sp = sc.spawn_points[t];
             if (sp.node != a.script_name) continue;
             if (sp.argv.size() > 1) a.max_health = a.health = 50 + 25 * std::atoi(sp.argv[1].c_str());
+            if (sp.argv.size() > 4) e.on_death = sp.argv[4];
+            if (sp.argv.size() > 5 && !sp.argv[5].empty()) {
+                e.start_loops = sp.argv[5][0] == '*';
+                e.start_skill = e.start_loops ? sp.argv[5].substr(1) : sp.argv[5];
+                if (!e.start_loops && play_once(sc, a, e.start_skill, 0.0, actor_yaw(a), true)) {
+                    a.scripted_start = 1.0e9;       // held at its first frame until woken
+                    e.waiting = true;
+                }
+            }
             if (sp.argv.size() > 2) {
                 std::string list = sp.argv[2];
                 size_t st = 0;
@@ -3913,6 +3948,7 @@ void enemy_damage(combat_state& cs, scene& sc, enemy_ai& e, int dmg, int dir, do
         a.stance = 0;
         play_once(sc, a, "CombatDying" + e.set, now, actor_yaw(a), true);
         std::printf("combat: %s is defeated\n", a.script_name.c_str());
+        if (!e.on_death.empty()) sc.script.execute(e.on_death, 0);
         return;
     }
     const std::string hurt = std::string("CombatBeingInjured") + k_dir_names[dir] + e.hurt_set;
@@ -3945,6 +3981,23 @@ void enemy_update(combat_state& cs, scene& sc, enemy_ai& e, actor_inst& prince,
     actor_inst& a = sc.actors[size_t(e.actor)];
     if (e.state == enemy_ai::DEAD || a.hidden) return;
     const k2::engine::fight_params& fp = *cs.params;
+    if (e.waiting) {
+        // Asleep, or braced behind a door: wakes on "Start", on being hit,
+        // or when the Prince comes close.
+        const float* q = a.node->local.translate;
+        const float* r = prince.node->local.translate;
+        const float wx = r[0] - q[0], wz = r[2] - q[2];
+        const bool near = prince_available && std::fabs(r[1] - q[1]) < 1.5f &&
+                          wx * wx + wz * wz < 9.0f;
+        if (!a.start_flag && !near && a.health == a.max_health) return;
+        e.waiting = false;
+        a.scripted_start = now;
+        a.hold_last = false;
+        a.posed_hold = false;
+        e.busy_until = now + skill_seconds(sc, a, e.start_skill);
+        std::printf("combat: %s starts (%s)\n", a.script_name.c_str(), e.start_skill.c_str());
+        return;
+    }
     float* p = a.node->local.translate;
     const float* pp = prince.node->local.translate;
     const float dx = pp[0] - p[0], dz = pp[2] - p[2];
@@ -3995,7 +4048,10 @@ void enemy_update(combat_state& cs, scene& sc, enemy_ai& e, actor_inst& prince,
         } else {
             const float hx = e.home[0] - p[0], hz = e.home[2] - p[2];
             if (hx * hx + hz * hz > 0.25f) steer(sc, a, e.home, false, dt);
-            else { a.stance = 0; set_clip(a, LOCO_BASE); }
+            else if (e.start_loops) {
+                a.stance = find_actor_skill(sc, a, e.start_skill);   // "*AmbientType_G4"
+                if (!a.stance) set_clip(a, LOCO_BASE);
+            } else { a.stance = 0; set_clip(a, LOCO_BASE); }
         }
         break;
     case enemy_ai::CHARGE:
@@ -4042,7 +4098,7 @@ void prince_hit_resolve(combat_state& cs, scene& sc, actor_inst& p, double now) 
     float best_d = combat_tuning::REACH;
     for (size_t i = 0; i < cs.enemies.size(); ++i) {
         enemy_ai& e = cs.enemies[i];
-        if (e.state == enemy_ai::DEAD) continue;
+        if (e.state == enemy_ai::DEAD || sc.actors[size_t(e.actor)].hidden) continue;
         const float* q = sc.actors[size_t(e.actor)].node->local.translate;
         const float dx = q[0] - pp[0], dz = q[2] - pp[2];
         const float d = std::sqrt(dx * dx + dz * dz);
