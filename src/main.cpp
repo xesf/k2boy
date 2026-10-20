@@ -2967,6 +2967,33 @@ void move_horizontal(const k2::engine::collision_world& w, float* p, float dx, f
     p[2] += dz;
 }
 
+// Where the hands (LGrip/RGrip, averaged) are in a clip's pose at time t,
+// in the actor's own frame. False without grip joints.
+bool clip_grip(actor_inst& a, const assets::skl_file& s, uint32_t t, float* out) {
+    std::vector<k2::engine::transform> keep = a.joint_local_cur;
+    const size_t n = std::min(a.joint_local_cur.size(), s.joints.size());
+    for (size_t j = 0; j < n; ++j) {
+        if (!s.joints[j].present) continue;
+        float pos[3], q[4];
+        assets::skl_sample(s.joints[j].path, t, true, pos, q);
+        if (j == 0) for (int k = 0; k < 3; ++k) pos[k] = a.joint_local_bind[0].translate[k];
+        transform_from_pos_quat(pos, q, a.joint_local_cur[j]);
+    }
+    pose_actor(a);
+    float sum[3] = { 0, 0, 0 };
+    int cnt = 0;
+    for (size_t j = 0; j < a.joint_names.size(); ++j)
+        if (a.joint_names[j] == "LGrip" || a.joint_names[j] == "RGrip") {
+            for (int k = 0; k < 3; ++k) sum[k] += a.cur[j].translate[k];
+            ++cnt;
+        }
+    a.joint_local_cur = keep;
+    pose_actor(a);
+    if (!cnt) return false;
+    for (int k = 0; k < 3; ++k) out[k] = sum[k] / float(cnt);
+    return true;
+}
+
 // --- crates -------------------------------------------------------------------
 //
 // The Prince's crate states, StStartCrateGrab -> StIdleCrate -> StStartCrateMove
@@ -3075,9 +3102,29 @@ bool update_crate(crate_ctl& cc, scene& sc, actor_inst& a, float* pos, float& ya
         if (!t) return false;
         cc.crate = t;
         yaw = std::atan2(axis[0], axis[2]);               // square up to it
+        // Stand where the antic's 0.7 step in leaves his hands on the face
+        // (PushOrPullBase_M's grip reach), centred on the crate; grabbing
+        // from wherever he stopped put his arms through it.
+        float grip[3];
+        if (a.loco_ok[CRATE_BASE] && clip_grip(a, a.loco[CRATE_BASE], 0, grip)) {
+            float step[3] = { 0.0f, 0.0f, 0.7f };
+            clip_root_motion(a.loco[CRATE_ANTIC], step);
+            const float in = std::sqrt(step[0] * step[0] + step[2] * step[2]);
+            const float* o = t->offset();
+            const float mn[3] = { t->box[0] + o[0], t->box[1] + o[1], t->box[2] + o[2] };
+            const float mx[3] = { t->box[3] + o[0], t->box[4] + o[1], t->box[5] + o[2] };
+            const float back = in + grip[2];
+            if (axis[0] != 0.0f) {
+                pos[0] = (axis[0] > 0 ? mn[0] : mx[0]) - axis[0] * back;
+                pos[2] = (mn[2] + mx[2]) * 0.5f;
+            } else {
+                pos[2] = (axis[2] > 0 ? mn[2] : mx[2]) - axis[2] * back;
+                pos[0] = (mn[0] + mx[0]) * 0.5f;
+            }
+        }
         cc.state = crate_ctl::ANTIC;
         cc.begin(a, CRATE_ANTIC, now, pos, false);
-        std::printf("crate: grab %s\n", t->name().c_str());
+        std::printf("crate: grab %s at (%.2f, %.2f)\n", t->name().c_str(), pos[0], pos[2]);
         return true;
     }
 
@@ -3371,32 +3418,6 @@ struct hang_ctl {
     }
 };
 
-// Where the hands (LGrip/RGrip, averaged) are in a clip's pose at time t,
-// in the actor's own frame. False without grip joints.
-bool clip_grip(actor_inst& a, const assets::skl_file& s, uint32_t t, float* out) {
-    std::vector<k2::engine::transform> keep = a.joint_local_cur;
-    const size_t n = std::min(a.joint_local_cur.size(), s.joints.size());
-    for (size_t j = 0; j < n; ++j) {
-        if (!s.joints[j].present) continue;
-        float pos[3], q[4];
-        assets::skl_sample(s.joints[j].path, t, true, pos, q);
-        if (j == 0) for (int k = 0; k < 3; ++k) pos[k] = a.joint_local_bind[0].translate[k];
-        transform_from_pos_quat(pos, q, a.joint_local_cur[j]);
-    }
-    pose_actor(a);
-    float sum[3] = { 0, 0, 0 };
-    int cnt = 0;
-    for (size_t j = 0; j < a.joint_names.size(); ++j)
-        if (a.joint_names[j] == "LGrip" || a.joint_names[j] == "RGrip") {
-            for (int k = 0; k < 3; ++k) sum[k] += a.cur[j].translate[k];
-            ++cnt;
-        }
-    a.joint_local_cur = keep;
-    pose_actor(a);
-    if (!cnt) return false;
-    for (int k = 0; k < 3; ++k) out[k] = sum[k] / float(cnt);
-    return true;
-}
 
 // Where the grip joints sit in the hang pose, relative to the root: pose
 // LedgeHangBase_M at t = 0 and read LGrip/RGrip. Cached in `hc`.
