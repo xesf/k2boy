@@ -420,7 +420,7 @@ result frontend::options() {
             static const char* lines[6] = {
                 "Move: WASD / arrows / left stick", "Run: Shift    Jump: Space",
                 "Act, climb, talk: E", "Sword: R draw, F attack, G block",
-                "Camera: mouse drag / right stick", "C switches scheme in play" };
+                "Camera: mouse drag / right stick", "Tab switches scheme in play" };
             for (int i = 0; i < 6; ++i) m_canvas.text(lines[i], 255, 160 + i * 18.0f, 13, INK);
         } else {                                // Graphics: nothing to set in a window
             m_canvas.text("The game runs in a resizable window.", 255, 150, 15, FAINT);

@@ -3602,17 +3602,26 @@ bool ground_under(const k2::engine::collision_world& w, const float* p, float& y
     return true;
 }
 
+void move_horizontal(const k2::engine::collision_world& w, float* p, float dx, float dz, bool low);
+inline void move_horizontal(const k2::engine::collision_world& w, float* p, float dx, float dz) {
+    move_horizontal(w, p, dx, dz, false);
+}
+
 // Moves the body by (dx, dz), sliding along walls. Each probe height casts
 // along the move from the body's centre; a hit inside RADIUS of the new
 // position removes the component of the move that points into the wall.
-void move_horizontal(const k2::engine::collision_world& w, float* p, float dx, float dz) {
+// `low`: crouched or crawling, so only what is below his lowered body stops
+// him - a gap under a wall is a way through.
+void move_horizontal(const k2::engine::collision_world& w, float* p, float dx, float dz, bool low) {
+    static const float LOW_HEIGHTS[3] = { 0.25f, 0.5f, 0.75f };
+    const float* heights = low ? LOW_HEIGHTS : move_tuning::PROBE_HEIGHTS;
     for (int pass = 0; pass < 2; ++pass) {
         const float len = std::sqrt(dx * dx + dz * dz);
         if (len < 1e-6f) return;
         const float d[3] = { dx / len, 0.0f, dz / len };
         bool blocked = false;
         for (int k = 0; k < 3 && !blocked; ++k) {
-            const float o[3] = { p[0], p[1] + move_tuning::PROBE_HEIGHTS[k], p[2] };
+            const float o[3] = { p[0], p[1] + heights[k], p[2] };
             k2::engine::pick_hit h;
             if (!w.pick(o, d, len + move_tuning::RADIUS, false, h)) continue;
             if (h.normal[1] >= move_tuning::FLOOR_MIN_NY) continue;   // a slope, not a wall
@@ -4234,6 +4243,113 @@ bool hang_try_climb(hang_ctl& hc, actor_inst& a, const k2::engine::collision_wor
     hang_begin_rise(hc, a);
     std::printf("ledge: climb %.2f (%s)\n", dh, k_loco_names[c]);
     return true;
+}
+
+double skill_seconds(scene& sc, const actor_inst& a, const std::string& name);
+
+// --- crouching and crawling ------------------------------------------------------
+//
+// The original's states (strings at 0x7CA8A8 on): StStartStandToCrouch
+// (CrouchAntic_G), StCrouching (CrouchBase_G), StStartCrouchToCrawl /
+// StStartCrawling (CrawlForward_L, CrawlBase_G at rest), StStartCrawlToCrouch
+// (CrawlToCrouch_G), StStartCrouchToStand (CrouchToStand_G). C crouches
+// (the manual's "Crouch - C"); held, he stays down, and moving forward
+// crawls. He cannot stand where there is no room - that is what lets him
+// through low gaps. The pivot clips and the original's CrawlCollider are
+// not used: he turns as he crawls, and his wall probes drop to knee height.
+struct crouch_ctl {
+    enum state_t { NONE, DOWN, CROUCH, TO_CRAWL, CRAWL, TO_CROUCH, UP } state;
+    double until;           // when the current transition clip ends
+    crouch_ctl() : state(NONE), until(0) {}
+};
+
+void crouch_clip(scene& sc, actor_inst& a, const char* name, bool once) {
+    const assets::skl_file* sk = find_actor_skill(sc, a, name);
+    if (a.stance == sk) return;
+    a.stance = sk;
+    a.clip_ms = 0.0;
+    a.clip_once = once;
+}
+
+// Room to stand: nothing solid within his height above the floor.
+bool crouch_headroom(const k2::engine::collision_world& w, const float* pos) {
+    const float o[3] = { pos[0], pos[1] + 0.1f, pos[2] };
+    const float up[3] = { 0.0f, 1.0f, 0.0f };
+    k2::engine::pick_hit h;
+    return !w.pick(o, up, 1.75f, false, h);
+}
+
+// One frame. `held` is the crouch key; `mv`/`ml` the world move input.
+// True while crouched in any way: it owns the body.
+bool crouch_update(crouch_ctl& cc, scene& sc, actor_inst& a, const k2::engine::collision_world& w,
+                   float* pos, float& yaw, bool held, const float* mv, float ml, bool classic,
+                   float in_x, float in_y, double now, float dt) {
+    const bool moving = classic ? in_y > 0.2f : ml > 0.2f;
+    switch (cc.state) {
+    case crouch_ctl::NONE:
+        if (!held) return false;
+        crouch_clip(sc, a, "CrouchAntic_G", true);
+        cc.until = now + skill_seconds(sc, a, "CrouchAntic_G");
+        cc.state = crouch_ctl::DOWN;
+        return true;
+    case crouch_ctl::DOWN:
+        if (now >= cc.until) { cc.state = crouch_ctl::CROUCH; crouch_clip(sc, a, "CrouchBase_G", false); }
+        return true;
+    case crouch_ctl::CROUCH:
+        if (!held && crouch_headroom(w, pos)) {
+            crouch_clip(sc, a, "CrouchToStand_G", true);
+            cc.until = now + skill_seconds(sc, a, "CrouchToStand_G");
+            cc.state = crouch_ctl::UP;
+        } else if (moving) {
+            crouch_clip(sc, a, "CrawlAntic_G", true);
+            cc.until = now + skill_seconds(sc, a, "CrawlAntic_G");
+            cc.state = crouch_ctl::TO_CRAWL;
+        }
+        return true;
+    case crouch_ctl::TO_CRAWL:
+        if (now >= cc.until) { cc.state = crouch_ctl::CRAWL; crouch_clip(sc, a, "CrawlBase_G", false); }
+        return true;
+    case crouch_ctl::CRAWL: {
+        // Let go of crouch where there is room: back to a crouch, then up.
+        if (!held && crouch_headroom(w, pos)) {
+            crouch_clip(sc, a, "CrawlToCrouch_G", true);
+            cc.until = now + skill_seconds(sc, a, "CrawlToCrouch_G");
+            cc.state = crouch_ctl::TO_CROUCH;
+            return true;
+        }
+        if (!moving) {
+            crouch_clip(sc, a, "CrawlBase_G", false);
+            if (classic && std::fabs(in_x) > 0.2f) yaw -= in_x * 1.6f * dt;
+            return true;
+        }
+        crouch_clip(sc, a, "CrawlForward_L", false);
+        // Modern: turn toward the stick, a crawl's worth at a time.
+        if (!classic && ml > 1e-6f) {
+            const float want = std::atan2(mv[0], mv[2]);
+            float d = std::fmod(want - yaw + 3.14159265f, 6.2831853f);
+            if (d < 0) d += 6.2831853f;
+            d -= 3.14159265f;
+            const float turn = 2.5f * dt;
+            yaw += d > turn ? turn : d < -turn ? -turn : d;
+        } else if (classic && std::fabs(in_x) > 0.2f) {
+            yaw -= in_x * 1.6f * dt;
+        }
+        float speed = 0.8f;
+        if (a.stance) { const float cs = clip_speed(*a.stance); if (cs > 0.1f) speed = cs; }
+        const float step = speed * dt;
+        move_horizontal(w, pos, std::sin(yaw) * step, std::cos(yaw) * step, true);
+        float gy;
+        if (ground_under(w, pos, gy)) pos[1] = gy;
+        return true;
+    }
+    case crouch_ctl::TO_CROUCH:
+        if (now >= cc.until) { cc.state = crouch_ctl::CROUCH; crouch_clip(sc, a, "CrouchBase_G", false); }
+        return true;
+    case crouch_ctl::UP:
+        if (now >= cc.until) { cc.state = crouch_ctl::NONE; a.stance = 0; a.clip_once = false; return false; }
+        return true;
+    }
+    return false;
 }
 
 // --- swimming -----------------------------------------------------------------
@@ -5210,6 +5326,26 @@ fx_def* fx_load(const std::string& name) {
         d->parent.assign(b.size(), -1);
         d->length = 0.0f;
         d->loop = false;
+        // K2_FXDUMP: each block's kind, name, transform and emitter.
+        if (std::getenv("K2_FXDUMP"))
+            for (size_t i = 0; i < b.size(); ++i) {
+                std::printf("  [%zu] f%02x %-22s %-18s T(%.2f %.2f %.2f) R(%.2f %.2f %.2f / %.2f %.2f %.2f / %.2f %.2f %.2f) s %.2f\n",
+                            i, unsigned(b[i].av_flags), b[i].type.c_str(), b[i].name.c_str(), b[i].translate[0], b[i].translate[1],
+                            b[i].translate[2], b[i].rotate[0], b[i].rotate[1], b[i].rotate[2], b[i].rotate[3],
+                            b[i].rotate[4], b[i].rotate[5], b[i].rotate[6], b[i].rotate[7], b[i].rotate[8], b[i].scale);
+                if (b[i].kind == assets::nif_block::RAW_IMAGE && !b[i].rgba.empty()) {
+                    int amin = 255, amax = 0, mag = 0;
+                    for (size_t q = 0; q + 3 < b[i].rgba.size(); q += 4) {
+                        amin = std::min<int>(amin, b[i].rgba[q + 3]); amax = std::max<int>(amax, b[i].rgba[q + 3]);
+                        if (b[i].rgba[q] > 240 && b[i].rgba[q + 1] < 16 && b[i].rgba[q + 2] > 240) ++mag;
+                    }
+                    std::printf("        image %ux%u alpha %d..%d, magenta %d px\n", b[i].width, b[i].height, amin, amax, mag);
+                }
+                if (b[i].kind == assets::nif_block::PSYS)
+                    std::printf("        psys axis(%.2f %.2f %.2f) speed %.2f size %.2f life %.2f rate %.1f spread %.2f/%.2f\n",
+                                b[i].psys.axis[0], b[i].psys.axis[1], b[i].psys.axis[2], b[i].psys.speed,
+                                b[i].psys.size, b[i].psys.life, b[i].psys.rate, b[i].psys.spread_a, b[i].psys.spread_b);
+            }
         for (size_t i = 0; i < b.size(); ++i) {
             for (size_t c = 0; c < b[i].children.size(); ++c) {
                 const int k = d->nif.find(b[i].children[c]);
@@ -5367,6 +5503,14 @@ void fx_world(const fx_instance& fi, int i, float t, float* out) {
     m4_mul(pm, lm, out);
 }
 
+// Hidden in the file (NiAVObject flag bit 0, APP_CULLED), itself or an
+// ancestor: the shower's "Box" is the spray's helper volume, magenta in Max.
+bool fx_hidden(const fx_def& d, int i) {
+    for (int b = i; b >= 0; b = d.parent[size_t(b)])
+        if (d.nif.blocks[size_t(b)].av_flags & 1) return true;
+    return false;
+}
+
 // The property of `kind` on block i or the nearest ancestor that has one.
 int fx_prop(const fx_def& d, int i, assets::nif_block::kind_t kind) {
     for (int b = i; b >= 0; b = d.parent[size_t(b)])
@@ -5417,7 +5561,11 @@ void fx_update(scene& sc, double now, float dt) {
             fi.emit_acc[i] += rate * dt;
             float wm[16];
             fx_world(fi, int(i), t, wm);
-            const float up[3] = { wm[8], wm[9], wm[10] };    // the node's Max +Z, in the world
+            // The emitter's own axis (node +Y for these SuperSprays), in the world.
+            const float* ax = b.psys.axis;
+            const float up[3] = { wm[0] * ax[0] + wm[4] * ax[1] + wm[8] * ax[2],
+                                  wm[1] * ax[0] + wm[5] * ax[1] + wm[9] * ax[2],
+                                  wm[2] * ax[0] + wm[6] * ax[1] + wm[10] * ax[2] };
             const float ul = std::sqrt(up[0] * up[0] + up[1] * up[1] + up[2] * up[2]);
             const size_t cap = std::max<size_t>(8, std::min<size_t>(b.psys.max_particles, 200));
             while (fi.emit_acc[i] >= 1.0 && ps.size() < cap) {
@@ -5474,7 +5622,7 @@ void fx_draw(scene& sc, const float* view, double now) {
                 for (int c = 0; c < 3; ++c) col[c] = std::min(1.0f, m.emissive[c] + m.diffuse[c]);
                 col[3] = m.alpha;
             }
-            if (b.kind == assets::nif_block::SHAPE && d.mesh[i]) {
+            if (b.kind == assets::nif_block::SHAPE && d.mesh[i] && !fx_hidden(d, int(i))) {
                 float wm[16];
                 fx_world(fi, int(i), t, wm);
                 gfx::set_render_state(rs);
@@ -6404,6 +6552,7 @@ int main(int argc, char** argv) {
     jump_ctl  jumps;
     hang_ctl  ledges;
     swim_ctl  swim;
+    crouch_ctl crouch;
     int       prince_last_dir = -1;
     double    prince_last_attack = -10.0;
     double    drown_tick = 0.0;
@@ -6481,7 +6630,7 @@ int main(int argc, char** argv) {
                         std::printf("camera: %s\n", follow_mode ? "follow" : "free-fly");
                         std::fflush(stdout);
                     }
-                    if (e.k == plat::KEY_C) {
+                    if (e.k == plat::KEY_TAB) {
                         classic = !classic;
                         std::printf("controls: %s\n", classic ? "classic" : "modern");
                         std::fflush(stdout);
@@ -6938,6 +7087,7 @@ int main(int argc, char** argv) {
                 regrab_after = game_time + 0.6;
             }
             if (!on_ledge && jump_pressed && !scripted_now && crates.state == crate_ctl::NONE &&
+                crouch.state == crouch_ctl::NONE &&
                 jumps.state == jump_ctl::NONE && player_vy == 0.0f && swim.state == swim_ctl::NONE) {
                 // Jump never climbs (the original climbs from StStartStepBack,
                 // on the action input, 0x4B4CC8): under a high ledge it jumps
@@ -7028,7 +7178,14 @@ int main(int argc, char** argv) {
                 if (push || !crate_in_front(sc, lt.translate, pfw, ax))
                     hang_try_climb(ledges, *player, sc.coll, lt.translate, player_yaw, game_time);
             }
-            const bool busy = on_ledge || ledges.state != hang_ctl::NONE || in_swim;
+            // C / pad B (sword away) crouches; held and moving, he crawls.
+            const bool crouch_key = !snoozed && !dead && !combat.prince_drawn &&
+                (down[plat::KEY_C] || (pad.connected && pad.button[plat::PAD_B]));
+            const bool crouched = !scripted_now && !in_jump && !on_ledge && !in_swim &&
+                ledges.state == hang_ctl::NONE && crates.state == crate_ctl::NONE &&
+                crouch_update(crouch, sc, *player, sc.coll, lt.translate, player_yaw, crouch_key,
+                              mv, ml, classic, in_x, in_y, game_time, dt);
+            const bool busy = on_ledge || ledges.state != hang_ctl::NONE || in_swim || crouched;
             const bool in_crate = !scripted_now && !in_jump && !busy &&
                                   update_crate(crates, sc, *player, lt.translate, player_yaw,
                                                game_time, act, push, pull);

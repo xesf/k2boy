@@ -57,6 +57,7 @@ struct nif_block {
     std::string type;
     std::string name;
     uint32_t    id;                         // the pointer it was saved under
+    uint8_t     av_flags;                   // NiAVObject flags; bit 0 hides it (APP_CULLED)
     bool        top;                        // preceded by "Top Level Object"
     std::vector<std::string> extra;         // NiStringExtraData ("loop", ...)
 
@@ -88,7 +89,7 @@ struct nif_block {
     uint32_t width, height;                 // NiRawImageData, as RGBA8
     std::vector<uint8_t> rgba;
 
-    nif_block() : kind(OTHER), id(0), top(false), scale(1), anim_start(0), anim_end(0),
+    nif_block() : kind(OTHER), id(0), av_flags(0), top(false), scale(1), anim_start(0), anim_end(0),
                   alpha_enable(0), alpha_src(6), alpha_dst(7), gloss(0), alpha(1), raw(0),
                   width(0), height(0) {
         for (int i = 0; i < 3; ++i) translate[i] = ambient[i] = specular[i] = emissive[i] = 0;

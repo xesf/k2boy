@@ -77,7 +77,7 @@ Saves, settings and logs go to `~/.k2boy/`.
 
 ## Controls
 
-Two schemes, switched with **C** in game or in Options:
+Two schemes, switched with **Tab** in game or in Options:
 
 - **Modern:** movement is relative to the camera, and the mouse or the right stick turns the
   camera. A full stick push runs.
@@ -92,6 +92,7 @@ Two schemes, switched with **C** in game or in Options:
 | Jump | Space | A |
 | Action: grab a crate, climb, talk, pull levers, pick up | E | X |
 | Climb onto a crate | E while pushing toward it | X + forward |
+| Crouch (hold); move to crawl through low gaps | C | B, with the sword away |
 | Draw / sheathe sword | R | Y |
 | Attack (left / right / centre by the stick) | F | B |
 | Block | G | LB |
@@ -121,7 +122,7 @@ make vita                  # → build-vita/k2boy.vpk  (VitaSDK at $VITASDK or ~
 | Vita | Game |
 |---|---|
 | Left stick / d-pad, right stick | move, camera |
-| Cross / Circle / Square / Triangle | jump / attack / action / draw sword |
+| Cross / Circle / Square / Triangle | jump / attack (crouch with the sword away) / action / draw sword |
 | L / R | block / run |
 | Start / Select | game menu / motion camera |
 | Front touch | tap menus, drag to look |

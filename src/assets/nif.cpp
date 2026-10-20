@@ -119,7 +119,7 @@ void object(reader& r, nif_block& b) {
 
 void av_object(reader& r, nif_block& b) {
     object(r, b);
-    r.u8();                                         // flags
+    b.av_flags = r.u8();
     r.fs(b.translate, 3);
     r.fs(b.rotate, 9);
     b.scale = r.f();

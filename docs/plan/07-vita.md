@@ -62,7 +62,7 @@ mixer runs on its own high-priority thread. The pool synchronises with kernel se
 | Left stick / d-pad | move |
 | Right stick | camera |
 | Cross | jump (menus: confirm) |
-| Circle | attack (menus: back) |
+| Circle | attack with the sword drawn, else crouch (hold; move to crawl) (menus: back) |
 | Square | action (grab, climb, talk, pick up) |
 | Triangle | draw / sheathe |
 | L | block |
