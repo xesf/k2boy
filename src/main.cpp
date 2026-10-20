@@ -688,14 +688,26 @@ struct actor_inst {
     bool                              posed_hold;     // holding that frame now
     int                               health, max_health;
     bool                              armed;          // the Prince has his sword
+    // A Fixture trap's actor (prisoners, rats, levers, cranes): it idles
+    // through `ambient`, a random pick each time, and plays any skill a
+    // script names. `home` is where it stands between them.
+    bool                              is_fixture;
+    std::vector<std::string>          ambient;
+    float                             home[3];
+    float                             home_yaw;
 
     actor_inst() : node(0), is_enemy(false), first_item(0), item_count(0),
                    skinned(false), clip(-1), clip_ms(0.0), clip_once(false), scripted(0), scripted_start(0),
                    scripted_yaw(0), remove_after(false), hidden(false), stance(0),
-                   hold_last(false), posed_hold(false), health(100), max_health(100), armed(false) {
+                   hold_last(false), posed_hold(false), health(100), max_health(100), armed(false),
+                   is_fixture(false), home_yaw(0) {
         scripted_origin[0] = scripted_origin[1] = scripted_origin[2] = 0.0f;
+        home[0] = home[1] = home[2] = 0.0f;
     }
 };
+
+// The player: neither a guard nor a Fixture's actor.
+inline bool is_prince(const actor_inst& a) { return !a.is_enemy && !a.is_fixture; }
 
 // The original's locomotion set, in the order of its name table at 0x749C30:
 // { "BasePose_L", "Running_L", "Walk_L", "AmbientType_G" }. AmbientType_G is a
@@ -746,6 +758,7 @@ struct scene {
     // PrinceStart / EnemyStart trap blocks found in the rooms. argv[0] is the
     // body name (Traps.txt); centre and pivot angle give the placement.
     std::vector<assets::k2a_trap> spawn_points;
+    std::vector<assets::k2a_trap> fixture_points;   // Fixture traps, spawned as actors
     // Static room triangles, for the pick primitive (0x512183). Actor bodies
     // and trigger volumes are not in it.
     k2::engine::collision_world coll;
@@ -1336,6 +1349,7 @@ void scene_reset(scene& sc) {
     sc.root = new k2::engine::level_group();
     sc.root->name = "LevelRoot";
     sc.spawn_points.clear();
+    sc.fixture_points.clear();
     sc.points.clear();
     sc.pickups.clear();
     sc.coll.clear();
@@ -1521,6 +1535,8 @@ private:
 //                                    play one of its skills once; with a
 //                                    placeholder, from that node's position
 //                                    and facing; REMOVE hides it afterwards
+bool play_once(scene& sc, actor_inst& a, const std::string& name, double now, float yaw, bool hold);
+
 class actor_target : public k2::engine::script_target {
 public:
     actor_target(k2::engine::script_world& w, scene& sc, size_t actor)
@@ -1534,6 +1550,17 @@ public:
         }
         if (msg.compare(0, 8, "SkillAt:") == 0 || msg.compare(0, 8, "skillat:") == 0)
             return skill_at(msg.substr(8));
+        actor_inst& a = m_sc.actors[m_actor];
+        if (!a.is_fixture) return false;
+        std::string l = msg;
+        for (size_t i = 0; i < l.size(); ++i) l[i] = char(std::tolower(static_cast<unsigned char>(l[i])));
+        if (l == "enable:t" || l == "visible:t") { a.hidden = false; return true; }
+        if (l == "visible:f") { a.hidden = true; return true; }
+        if (l.compare(0, 7, "enable:") == 0 || l.compare(0, 6, "state:") == 0) return true;
+        // Anything else names one of its skills. One that interrupts the
+        // idles goes back to them; a prop (no idles) keeps its last frame.
+        if (play_once(m_sc, a, msg, m_world.now(), a.home_yaw, a.ambient.empty())) return true;
+        std::printf("fixture %s: no skill %s\n", name().c_str(), msg.c_str());
         return false;
     }
 
@@ -1938,6 +1965,10 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
             sc.spawn_points.push_back(n.trap);
             sc.spawn_points.back().node = n.name;
         }
+        if (n.trap.name == "Fixture" && n.trap.argv.size() > 1 && !n.trap.argv[1].empty()) {
+            sc.fixture_points.push_back(n.trap);
+            sc.fixture_points.back().node = n.name;
+        }
         if (n.trap.name == "Pickup" && collide) {
             scene::pickup_def pd;
             pd.name = n.name;
@@ -2128,7 +2159,8 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
             sc.traps.push_back(t);
             // A spawn trap's messages are its actor's (EnemyStart__ctor knows
             // "SkillAt"); the actor answers under this name instead.
-            if (n.trap.name != "EnemyStart" && n.trap.name != "PrinceStart")
+            if (n.trap.name != "EnemyStart" && n.trap.name != "PrinceStart" &&
+                !(n.trap.name == "Fixture" && n.trap.argv.size() > 1 && !n.trap.argv[1].empty()))
                 sc.script.add(t);
         }
     }
@@ -2285,6 +2317,8 @@ size_t spawn_prince_from_level(const assets::lvl_file& lv, scene& sc,
                                std::vector<k2::engine::actor_spawn>& spawns,
                                int region);
 
+void spawn_fixtures(scene& sc);
+
 void spawn_level_actors(scene& sc, k2::engine::body_table& bodies,
                         std::vector<k2::engine::actor_spawn>& spawns) {
     for (size_t i = 0; i < sc.spawn_points.size(); ++i) {
@@ -2346,6 +2380,100 @@ void spawn_level_actors(scene& sc, k2::engine::body_table& bodies,
                     an->local.translate[0], an->local.translate[1],
                     an->local.translate[2], t.pivot_angle, inst.item_count,
                     lmn[0], lmx[0], lmn[1], lmx[1], lmn[2], lmx[2]);
+    }
+    spawn_fixtures(sc);
+}
+
+// Fixture traps: "<skill>,<visible>,<collide>,<?>" "<actor>" "<ambient,...>".
+// The actor is a directory under Actors with its own .act and .K2A and no
+// master.dat (Prisoner3, rat, Lever01, FIX_Crane), placed at the trap and
+// answering scripts under the trap's node name. Its messages are mostly its
+// own skill names: "Prisoner3,LookUp", "P4FIX_Crane01,lower4m".
+bool ground_under(const k2::engine::collision_world& w, const float* p, float& y);
+
+void spawn_fixtures(scene& sc) {
+    std::vector<std::string> k2as;
+    plat::fs_list_paths_by_extension(".k2a", k2as);
+    for (size_t i = 0; i < sc.fixture_points.size(); ++i) {
+        const assets::k2a_trap& t = sc.fixture_points[i];
+        const std::string& who = t.argv[1];
+        const std::string dir = actor_dir_for(who + ".act");
+        if (dir.empty()) { std::printf("  fixture %s: no actor %s\n", t.node.c_str(), who.c_str()); continue; }
+        std::string geo;
+        for (size_t k = 0; k < k2as.size(); ++k)
+            if (k2as[k].size() > dir.size() && k2as[k].compare(0, dir.size(), dir) == 0 &&
+                k2as[k].find('/', dir.size()) == std::string::npos) { geo = k2as[k]; break; }
+        if (geo.empty()) { std::printf("  fixture %s: %s has no .k2a\n", t.node.c_str(), who.c_str()); continue; }
+
+        assets::master_file m;
+        m.name = who;
+        m.geometry = geo;
+        m.actor = who;
+
+        k2::engine::animation_node* an = new k2::engine::animation_node();
+        an->name = t.node;
+        an->is_enemy = false;
+        an->local.set_yaw(t.pivot_angle);
+        for (int k = 0; k < 3; ++k) an->local.translate[k] = t.center[k];
+        sc.root->add_child(an);
+
+        actor_inst inst;
+        inst.name = t.node;
+        inst.node = an;
+        inst.is_fixture = true;
+        float lmn[3], lmx[3];
+        if (!append_actor_geometry(geo, sc, inst.first_item, inst.item_count, lmn, lmx)) {
+            std::printf("  fixture %s: %s did not load\n", t.node.c_str(), geo.c_str());
+            continue;
+        }
+        float gy;
+        // The prisoners' meshes are built around the pelvis, not the feet:
+        // lift them by how far they reach below their origin.
+        // Probed from the box's floor: some (the Mopers) sit in pits under
+        // a grate that a probe from the centre would land on.
+        const float base[3] = { t.center[0], t.bbox[1] + 0.2f, t.center[2] };
+        if (ground_under(sc.coll, base, gy) || ground_under(sc.coll, t.center, gy))
+            an->local.translate[1] = gy - std::min(0.0f, lmn[1]);
+        const int owner = int(sc.actors.size());
+        for (size_t k = 0; k < inst.item_count; ++k) sc.items[inst.first_item + k].owner = owner;
+        inst.script_name = t.node;
+        bind_actor_skeleton(m, inst, sc);
+        if (inst.skill_dir.empty()) inst.skill_dir = dir;
+        for (int k = 0; k < 3; ++k) inst.home[k] = an->local.translate[k];
+        inst.home_yaw = t.pivot_angle;
+
+        std::vector<std::string> f0;
+        {
+            const std::string& a0 = t.argv[0];
+            size_t st = 0;
+            for (;;) {
+                const size_t c = a0.find(',', st);
+                f0.push_back(a0.substr(st, c == std::string::npos ? std::string::npos : c - st));
+                if (c == std::string::npos) break;
+                st = c + 1;
+            }
+        }
+        if (f0.size() > 1 && (f0[1] == "false" || f0[1] == "F" || f0[1] == "f")) inst.hidden = true;
+        if (t.argv.size() > 2) {
+            const std::string& a2 = t.argv[2];
+            size_t st = 0;
+            for (;;) {
+                const size_t c = a2.find(',', st);
+                const std::string w = a2.substr(st, c == std::string::npos ? std::string::npos : c - st);
+                if (!w.empty()) inst.ambient.push_back(w);
+                if (c == std::string::npos) break;
+                st = c + 1;
+            }
+        }
+        sc.actors.push_back(inst);
+        actor_inst& placed = sc.actors.back();
+        // A named starting state ("Empty", "closed") is posed and held.
+        if (!f0.empty() && !f0[0].empty() && find_actor_skill(sc, placed, f0[0]))
+            play_once(sc, placed, f0[0], 0.0, placed.home_yaw, true);
+        sc.root->update_world();
+        std::printf("  fixture %-20s %-16s at (%.1f, %.1f, %.1f) %zu meshes, %zu ambient%s\n",
+                    t.node.c_str(), who.c_str(), placed.home[0], placed.home[1], placed.home[2],
+                    placed.item_count, placed.ambient.size(), placed.hidden ? ", hidden" : "");
     }
 }
 
@@ -2673,7 +2801,7 @@ void frame_scene(camera& c, const scene& sc) {
     // near anything interesting. Falls back to the box when there is no actor.
     int start = -1;
     for (size_t i = 0; i < sc.actors.size(); ++i)
-        if (!sc.actors[i].is_enemy) { start = int(i); break; }
+        if (is_prince(sc.actors[i])) { start = int(i); break; }
     if (start < 0 && !sc.actors.empty()) start = 0;
 
     if (start >= 0) {
@@ -3673,6 +3801,7 @@ void combat_init(combat_state& cs, scene& sc, const k2::engine::fight_params& fp
     cs.enemies.clear();
     for (size_t i = 0; i < sc.actors.size(); ++i) {
         actor_inst& a = sc.actors[i];
+        if (a.is_fixture) continue;
         if (!a.is_enemy) {
             for (int k = 0; k < 3; ++k) cs.spawn[k] = a.node->local.translate[k];
             cs.spawn_yaw = actor_yaw(a);
@@ -4318,7 +4447,7 @@ int main(int argc, char** argv) {
     if (follow_mode) {
         const int32_t pi = k2::engine::find_prince(spawns);
         for (size_t i = 0; i < sc.actors.size(); ++i)
-            if (!sc.actors[i].is_enemy) {
+            if (is_prince(sc.actors[i])) {
                 player_yaw = std::atan2(sc.actors[i].node->local.rotate[2],
                                         sc.actors[i].node->local.rotate[8]);
                 break;
@@ -4332,7 +4461,7 @@ int main(int argc, char** argv) {
         float v[4] = {0,0,0,0};
         if (std::sscanf(place_arg, "%f,%f,%f,%f", &v[0], &v[1], &v[2], &v[3]) >= 3)
             for (size_t i = 0; i < sc.actors.size(); ++i)
-                if (!sc.actors[i].is_enemy) {
+                if (is_prince(sc.actors[i])) {
                     for (int k = 0; k < 3; ++k) sc.actors[i].node->local.translate[k] = v[k];
                     player_yaw = v[3] * 3.14159265f / 180.0f;
                     cam.yaw = 3.14159265f - player_yaw;   // look the way he faces
@@ -4343,7 +4472,7 @@ int main(int argc, char** argv) {
     {
         std::printf("collision: %zu triangles\n", sc.coll.triangle_count());
         for (size_t i = 0; i < sc.actors.size(); ++i) {
-            if (sc.actors[i].is_enemy) continue;
+            if (!is_prince(sc.actors[i])) continue;
             float gy;
             const float* p = sc.actors[i].node->local.translate;
             if (ground_under(sc.coll, p, gy))
@@ -4400,7 +4529,7 @@ int main(int argc, char** argv) {
         actor_target* t = new actor_target(sc.script, sc, i);
         actor_msgs.push_back(t);
         sc.script.add(t);
-        if (!sc.actors[i].is_enemy) prince_ptr = t;
+        if (is_prince(sc.actors[i])) prince_ptr = t;
     }
     actor_target* const prince_msgs = prince_ptr;  // 0 when no Prince was spawned
 
@@ -4417,7 +4546,7 @@ int main(int argc, char** argv) {
     combat_init(combat, sc, fight_tuning);
     if (start_armed)
         for (size_t i = 0; i < sc.actors.size(); ++i)
-            if (!sc.actors[i].is_enemy) sc.actors[i].armed = true;
+            if (is_prince(sc.actors[i])) sc.actors[i].armed = true;
     std::vector<bool> pickup_taken(sc.pickups.size(), false);
     std::printf("combat: %zu fight.ini values, %zu enemy.dat values, %zu guards, %zu pickups\n",
                 fight_tuning.fight_count(), fight_tuning.enemy_count(), combat.enemies.size(),
@@ -4568,7 +4697,7 @@ int main(int argc, char** argv) {
             sc.script.update(game_time);
             const float* pp = 0;
             for (size_t i = 0; i < sc.actors.size(); ++i)
-                if (!sc.actors[i].is_enemy) { pp = sc.actors[i].node->local.translate; break; }
+                if (is_prince(sc.actors[i])) { pp = sc.actors[i].node->local.translate; break; }
             const bool action = follow_mode && down[plat::KEY_E];
             for (size_t i = 0; i < sc.areas.size(); ++i)
                 sc.areas[i]->update(game_time, pp && sc.areas[i]->contains(pp), action);
@@ -4576,13 +4705,27 @@ int main(int argc, char** argv) {
                 sc.plates[i]->update(game_time, pp && sc.plates[i]->contains(pp));
             // Scripted skills ("SkillAt:") drive their actors outright.
             for (size_t i = 0; i < sc.actors.size(); ++i)
-                if (update_scripted(sc.actors[i], game_time) && !sc.actors[i].is_enemy)
+                if (update_scripted(sc.actors[i], game_time) && is_prince(sc.actors[i]))
                     player_yaw = sc.actors[i].scripted_yaw;
+            // Fixtures between scripted skills: the next idle, picked at
+            // random from the trap's list, from where they stand.
+            for (size_t i = 0; i < sc.actors.size(); ++i) {
+                actor_inst& fa = sc.actors[i];
+                if (!fa.is_fixture || fa.scripted || fa.posed_hold || fa.hidden) continue;
+                while (!fa.ambient.empty()) {
+                    const size_t pick = size_t(std::rand()) % fa.ambient.size();
+                    for (int k = 0; k < 3; ++k) fa.node->local.translate[k] = fa.home[k];
+                    if (play_once(sc, fa, fa.ambient[pick], game_time, fa.home_yaw, false)) break;
+                    // Not a sampled skill (the rats' are SklK keyframes): drop it.
+                    fa.ambient.erase(fa.ambient.begin() + long(pick));
+                    if (fa.ambient.empty()) std::printf("fixture %s: no playable idles\n", fa.name.c_str());
+                }
+            }
 
             // Combat: guards, swings landing, and a fallen Prince coming back.
             actor_inst* prince_a = 0;
             for (size_t i = 0; i < sc.actors.size(); ++i)
-                if (!sc.actors[i].is_enemy) { prince_a = &sc.actors[i]; break; }
+                if (is_prince(sc.actors[i])) { prince_a = &sc.actors[i]; break; }
             if (prince_a) {
                 const bool snoozing = game_time < (prince_msgs ? prince_msgs->snooze_until : 0.0);
                 const bool available = !snoozing && combat.dead_since < 0.0;
@@ -4639,7 +4782,7 @@ int main(int argc, char** argv) {
         actor_inst* player = 0;
         if (follow_mode) {
             for (size_t i = 0; i < sc.actors.size(); ++i)
-                if (!sc.actors[i].is_enemy) { player = &sc.actors[i]; break; }
+                if (is_prince(sc.actors[i])) { player = &sc.actors[i]; break; }
         }
 
         // --hold KEYS@T: headless input. Letters, or ' ' for Space, held from
@@ -5213,7 +5356,7 @@ int main(int argc, char** argv) {
         {
             actor_inst* pa = 0;
             for (size_t i = 0; i < sc.actors.size(); ++i)
-                if (!sc.actors[i].is_enemy) { pa = &sc.actors[i]; break; }
+                if (is_prince(sc.actors[i])) { pa = &sc.actors[i]; break; }
             if (pa && follow_mode && !input_locked) {
                 static gfx::mesh_id quad = 0;
                 if (!quad) {
@@ -5312,7 +5455,7 @@ int main(int argc, char** argv) {
                 std::vector<uint8_t> px(size_t(w) * size_t(h) * 4);
                 gfx::read_pixels(w, h, &px[0]);
                 for (size_t a = 0; a < sc.actors.size(); ++a) {
-                    if (sc.actors[a].is_enemy) continue;
+                    if (!is_prince(sc.actors[a])) continue;
                     const k2::engine::transform& tw = sc.actors[a].node->world();
                     std::printf("player at (%.2f, %.2f, %.2f) yaw %.2f  camera (%.2f, %.2f, %.2f)  health %d\n",
                                 tw.translate[0], tw.translate[1], tw.translate[2],
