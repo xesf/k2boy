@@ -1384,6 +1384,23 @@ public:
             m_moving = true;
             return true;
         }
+        // Water: "raise,d,t" / "lower,d,t" move the surface d along y over t
+        // seconds - a TranslateMotion built directly (0x48C939 -> 0x47ABDC),
+        // with no ease.
+        if (type == "Water" && (msg.compare(0, 6, "raise,") == 0 || msg.compare(0, 6, "lower,") == 0)) {
+            const bool up = msg[0] == 'r';
+            std::string rest = msg.substr(6);
+            const size_t c = rest.find(',');
+            const float d = float(std::atof(rest.c_str()));
+            const float t = c == std::string::npos ? 0.0f : float(std::atof(rest.c_str() + c + 1));
+            k2::engine::translate_motion m;
+            if (!m.parse(std::string("blue,") + (up ? "" : "-") + std::to_string(d) + "," +
+                         std::to_string(t) + ",0,0")) return false;
+            m.begin(m_world.now());
+            m_motion = m;
+            m_moving = true;
+            return true;
+        }
         // A Door plays the skill its message names ("openslow", "pivot90");
         // the original reports "Doors can't handle message %s" otherwise.
         if (!actor.empty()) {
