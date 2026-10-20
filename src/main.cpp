@@ -774,7 +774,12 @@ struct scene {
     struct named_point { float pos[3]; bool has_target; float target[3]; float yaw; };
     std::map<std::string, named_point> points;
     // Pickup traps: position (bbox centre) and argv, for the Prince to collect.
-    struct pickup_def { std::string name; std::vector<std::string> argv; float pos[3]; };
+    struct pickup_def {
+        std::string name; std::vector<std::string> argv; float pos[3];
+        assets::k2a_trap trap;      // for placing its model
+        int actor;                  // the model in actors, or -1
+        pickup_def() : actor(-1) {}
+    };
     std::vector<pickup_def> pickups;
     // Trap actors' skills, loaded on first use: "actor/skill" lower-case.
     std::map<std::string, assets::skl_file*> trap_skills;
@@ -2034,6 +2039,8 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
             scene::pickup_def pd;
             pd.name = n.name;
             pd.argv = n.trap.argv;
+            pd.trap = n.trap;
+            pd.trap.node = n.name;
             for (int k = 0; k < 3; ++k) pd.pos[k] = (n.trap.bbox[k] + n.trap.bbox[k + 3]) * 0.5f;
             sc.pickups.push_back(pd);
         }
@@ -2452,19 +2459,21 @@ void spawn_level_actors(scene& sc, k2::engine::body_table& bodies,
 // own skill names: "Prisoner3,LookUp", "P4FIX_Crane01,lower4m".
 bool ground_under(const k2::engine::collision_world& w, const float* p, float& y);
 
-void spawn_fixtures(scene& sc) {
-    std::vector<std::string> k2as;
-    plat::fs_list_paths_by_extension(".k2a", k2as);
-    for (size_t i = 0; i < sc.fixture_points.size(); ++i) {
-        const assets::k2a_trap& t = sc.fixture_points[i];
-        const std::string& who = t.argv[1];
-        const std::string dir = actor_dir_for(who + ".act");
-        if (dir.empty()) { std::printf("  fixture %s: no actor %s\n", t.node.c_str(), who.c_str()); continue; }
-        std::string geo;
-        for (size_t k = 0; k < k2as.size(); ++k)
-            if (k2as[k].size() > dir.size() && k2as[k].compare(0, dir.size(), dir) == 0 &&
-                k2as[k].find('/', dir.size()) == std::string::npos) { geo = k2as[k]; break; }
-        if (geo.empty()) { std::printf("  fixture %s: %s has no .k2a\n", t.node.c_str(), who.c_str()); continue; }
+// An actor directory's body placed at a trap: Actors/<who>/<who>.act and the
+// .K2A beside it, stood on the floor found under the trap. Returns its index
+// in sc.actors, or -1. Fixtures and pickups both come through here.
+int spawn_prop(scene& sc, const assets::k2a_trap& t, const std::string& who,
+               const std::string& script_name) {
+    static std::vector<std::string> k2as;
+    if (k2as.empty()) plat::fs_list_paths_by_extension(".k2a", k2as);
+    const std::string dir = actor_dir_for(who + ".act");
+    if (dir.empty()) { std::printf("  prop %s: no actor %s\n", t.node.c_str(), who.c_str()); return -1; }
+    std::string geo;
+    for (size_t k = 0; k < k2as.size(); ++k)
+        if (k2as[k].size() > dir.size() && k2as[k].compare(0, dir.size(), dir) == 0 &&
+            k2as[k].find('/', dir.size()) == std::string::npos) { geo = k2as[k]; break; }
+    if (geo.empty()) { std::printf("  prop %s: %s has no .k2a\n", t.node.c_str(), who.c_str()); return -1; }
+    {
 
         assets::master_file m;
         m.name = who;
@@ -2484,8 +2493,8 @@ void spawn_fixtures(scene& sc) {
         inst.is_fixture = true;
         float lmn[3], lmx[3];
         if (!append_actor_geometry(geo, sc, inst.first_item, inst.item_count, lmn, lmx)) {
-            std::printf("  fixture %s: %s did not load\n", t.node.c_str(), geo.c_str());
-            continue;
+            std::printf("  prop %s: %s did not load\n", t.node.c_str(), geo.c_str());
+            return -1;
         }
         float gy;
         // Probed from the box's floor: some (the Mopers) sit in pits under
@@ -2495,11 +2504,24 @@ void spawn_fixtures(scene& sc) {
             an->local.translate[1] = gy;
         const int owner = int(sc.actors.size());
         for (size_t k = 0; k < inst.item_count; ++k) sc.items[inst.first_item + k].owner = owner;
-        inst.script_name = t.node;
+        inst.script_name = script_name;
         bind_actor_skeleton(m, inst, sc);
         if (inst.skill_dir.empty()) inst.skill_dir = dir;
         for (int k = 0; k < 3; ++k) inst.home[k] = an->local.translate[k];
         inst.home_yaw = t.pivot_angle;
+        sc.actors.push_back(inst);
+        sc.root->update_world();
+        return int(sc.actors.size()) - 1;
+    }
+}
+
+void spawn_fixtures(scene& sc) {
+    for (size_t i = 0; i < sc.fixture_points.size(); ++i) {
+        const assets::k2a_trap& t = sc.fixture_points[i];
+        const std::string& who = t.argv[1];
+        const int idx = spawn_prop(sc, t, who, t.node);
+        if (idx < 0) continue;
+        actor_inst& inst = sc.actors[size_t(idx)];
 
         std::vector<std::string> f0;
         {
@@ -2524,15 +2546,21 @@ void spawn_fixtures(scene& sc) {
                 st = c + 1;
             }
         }
-        sc.actors.push_back(inst);
-        actor_inst& placed = sc.actors.back();
+        actor_inst& placed = inst;
         // A named starting state ("Empty", "closed") is posed and held.
         if (!f0.empty() && !f0[0].empty() && find_actor_skill(sc, placed, f0[0]))
             play_once(sc, placed, f0[0], 0.0, placed.home_yaw, true);
-        sc.root->update_world();
         std::printf("  fixture %-20s %-16s at (%.1f, %.1f, %.1f) %zu meshes, %zu ambient%s\n",
                     t.node.c_str(), who.c_str(), placed.home[0], placed.home[1], placed.home[2],
                     placed.item_count, placed.ambient.size(), placed.hidden ? ", hidden" : "");
+    }
+    // Pickups: a numbered potion is the TRAP_Potion actor; anything else
+    // names its own (PrinceSword01, PICK_Jewel2, Key).
+    for (size_t i = 0; i < sc.pickups.size(); ++i) {
+        scene::pickup_def& pk = sc.pickups[i];
+        if (pk.argv.size() < 2 || pk.argv[1].empty()) continue;
+        const bool numbered = pk.argv[1].find_first_not_of("0123456789") == std::string::npos;
+        pk.actor = spawn_prop(sc, pk.trap, numbered ? std::string("TRAP_Potion") : pk.argv[1], "");
     }
 }
 
@@ -3392,6 +3420,18 @@ void crate_input(crate_ctl& cc, scene& sc, actor_inst& a, const float* pos, floa
 // Landing picks the matching Land* clip, or LandVertPainful_G past
 // MinFallHeight (6.25). How the original detects the landing (the predictive
 // planner) is not traced; here the floor probe ends the flight.
+// Potions on the Prince, timed effects from the pickup handler (0x47FC8C):
+// "Strength:dmg,t", "Shield:t", "Camo:t", "Guard:t", "Jump:f,t", "Fall:t".
+// Each holds until game time `*_until`; a duration of -1 is for good.
+struct potion_state {
+    double strength_until, shield_until, camo_until, guard_until, jump_until, fall_until;
+    float  strength, jump;
+    potion_state() : strength_until(-1), shield_until(-1), camo_until(-1), guard_until(-1),
+                     jump_until(-1), fall_until(-1), strength(0), jump(1) {}
+    static bool on(double until, double now) { return until >= 1.0e29 || now < until; }
+};
+potion_state g_potions;
+
 namespace jump_tuning {
 const float GRAVITY = -17.0f;           // FallGravity
 const float MIN_FALL_HEIGHT = 6.25f;
@@ -3490,6 +3530,8 @@ bool jump_update(jump_ctl& jc, actor_inst& a, const k2::engine::collision_world&
         } else {
             for (int k = 0; k < 3; ++k) jc.vel[k] = fwd[k] * Z;
         }
+        // Jump potion: f times the height, so sqrt(f) on the launch.
+        if (potion_state::on(g_potions.jump_until, now)) Y *= std::sqrt(std::max(1.0f, g_potions.jump));
         jc.vel[1] = Y;
         jc.peak_y = pos[1];
         jc.state = jump_ctl::AIR;
@@ -3521,7 +3563,8 @@ bool jump_update(jump_ctl& jc, actor_inst& a, const k2::engine::collision_world&
         pos[1] = h.point[1];
         const float fell = jc.peak_y - pos[1];
         jc.state = jump_ctl::LAND;
-        const int c = fell > jump_tuning::MIN_FALL_HEIGHT ? LAND_PAINFUL : land[jc.dir];
+        const bool feather = potion_state::on(g_potions.fall_until, now);    // Fall potion
+        const int c = fell > jump_tuning::MIN_FALL_HEIGHT && !feather ? LAND_PAINFUL : land[jc.dir];
         jump_begin(jc, a, c, now, pos);
         return true;
     }
@@ -3924,6 +3967,10 @@ void combat_init(combat_state& cs, scene& sc, const k2::engine::fight_params& fp
 
 void prince_damage(combat_state& cs, scene& sc, actor_inst& p, int dmg, int dir, double now) {
     if (cs.dead_since >= 0.0) return;
+    if (dmg > 0 && potion_state::on(g_potions.shield_until, now)) {       // Shield potion
+        play_sound("gblswordclank", p.node->local.translate, 14.0f, false);
+        return;
+    }
     p.health -= dmg;
     play_sound("GBLpfiteinjur", p.node->local.translate, 14.0f, false);
     if (p.health <= 0) {
@@ -4009,7 +4056,7 @@ void enemy_update(combat_state& cs, scene& sc, enemy_ai& e, actor_inst& prince,
         e.hit.active = false;
         const bool in_front = angle_diff(yaw_toward(p, pp), actor_yaw(a)) < 1.2f;
         if (prince_available && same_floor && d <= combat_tuning::REACH && in_front) {
-            if (cs.prince_blocking) {
+            if (cs.prince_blocking || potion_state::on(g_potions.guard_until, now)) {   // Guard potion
                 play_sound("gblswordclank", p, 14.0f, false);
                 const std::string rec = std::string("CombatBlocked") + k_dir_names[e.hit.dir] + e.set;
                 play_once(sc, a, rec, now, actor_yaw(a), false);
@@ -4029,7 +4076,8 @@ void enemy_update(combat_state& cs, scene& sc, enemy_ai& e, actor_inst& prince,
     const float watch  = float(fp.enemy("distFarFromEnemy", 10.0));
     const float charge = float(fp.enemy("distApproachEnemy", 5.0));
     const float periph = float(fp.enemy("peripheral", 30.0)) * 3.14159265f / 180.0f;
-    const bool  sees = prince_available && same_floor && d < watch &&
+    const bool  camo = potion_state::on(g_potions.camo_until, now) && e.state == enemy_ai::PATROL;
+    const bool  sees = !camo && prince_available && same_floor && d < watch &&
                        (d < charge || angle_diff(yaw_toward(p, pp), actor_yaw(a)) < periph);
 
     switch (e.state) {
@@ -4117,7 +4165,8 @@ void prince_hit_resolve(combat_state& cs, scene& sc, actor_inst& p, double now) 
         best->busy_until = now + 0.5;
         return;
     }
-    enemy_damage(cs, sc, *best, 25, cs.prince_hit.dir, now);
+    const int dmg = 25 + (potion_state::on(g_potions.strength_until, now) ? int(g_potions.strength) : 0);
+    enemy_damage(cs, sc, *best, dmg, cs.prince_hit.dir, now);
 }
 
 // The guard nearest the Prince within `range`, or -1.
@@ -4144,6 +4193,56 @@ struct pickup {
     float       pos[3];
     bool        taken;
 };
+
+// Whether a pickup's trap is shown and enabled (Visible:T / Enable:T).
+bool pickup_live(scene& sc, size_t i) {
+    const std::string& nm = sc.pickups[i].name;
+    for (size_t t = 0; t < sc.traps.size(); ++t)
+        if (sc.traps[t]->name() == nm) return sc.traps[t]->visible() && sc.traps[t]->enabled();
+    return true;
+}
+
+// The pickup handler (0x47FC8C). argv1 is the item: a number is a potion,
+// mapped by the table built at 0x4EB9D6 to the effect it applies with argv2
+// as its argument; a name is an object (PrinceSword01 and argv2 "weapon"
+// arms the Prince). Durations become absolute game times; -1 is for good.
+void pickup_apply(combat_state& cs, scene& sc, actor_inst& p, const scene::pickup_def& pk, double now) {
+    const std::string a1 = pk.argv.size() > 1 ? pk.argv[1] : "";
+    const std::string a2 = pk.argv.size() > 2 ? pk.argv[2] : "";
+    std::string lo = a2;
+    for (size_t i = 0; i < lo.size(); ++i) lo[i] = char(std::tolower(static_cast<unsigned char>(lo[i])));
+    if (lo == "weapon") {
+        p.armed = true;
+        std::printf("pickup: %s - the Prince has a sword (R draws it)\n", pk.name.c_str());
+        return;
+    }
+    if (a1.empty() || a1.find_first_not_of("0123456789") != std::string::npos) {
+        std::printf("pickup: %s (%s)\n", pk.name.c_str(), a1.c_str());
+        return;
+    }
+    const int type = std::atoi(a1.c_str());
+    const double v0 = std::atof(a2.c_str());
+    const size_t comma = a2.find(',');
+    const double v1 = comma == std::string::npos ? -1.0 : std::atof(a2.c_str() + comma + 1);
+    struct until { static double at(double d, double now) { return d > 0.0 ? now + d : 1.0e30; } };
+    const char* what = "?";
+    switch (type) {
+    case 1:  what = "Heal";       p.health = std::min(p.max_health, p.health + int(v0)); break;
+    case 9:  what = "FullHeal";   p.health = p.max_health; break;
+    case 2:  what = "ExtraLife";  p.max_health = std::min(240, p.max_health + 24); p.health = p.max_health; break;
+    case 10: what = "Poison";     prince_damage(cs, sc, p, int(v0), 0, now); break;
+    case 3:  what = "Strength";   g_potions.strength = float(v0);
+                                  g_potions.strength_until = until::at(comma == std::string::npos ? -1 : v1, now); break;
+    case 4:  what = "Shield";     g_potions.shield_until = until::at(v0, now); break;
+    case 5:  what = "Jump";       g_potions.jump = float(v0);
+                                  g_potions.jump_until = until::at(comma == std::string::npos ? -1 : v1, now); break;
+    case 6:  what = "Fall";       g_potions.fall_until = until::at(v0, now); break;
+    case 7:  what = "Camo";       g_potions.camo_until = until::at(v0, now); break;
+    case 8:  what = "Guard";      g_potions.guard_until = until::at(v0, now); break;
+    default: break;
+    }
+    std::printf("pickup: %s - %s %s, health %d/%d\n", pk.name.c_str(), what, a2.c_str(), p.health, p.max_health);
+}
 // The game module, as the original structures it: `gameModule` owns a level and
 // is entered through the module manager rather than being loaded inline.
 //
@@ -5044,27 +5143,23 @@ int main(int argc, char** argv) {
             // E near a pickup collects it.
             if (act && !dead) {
                 for (size_t i = 0; i < sc.pickups.size(); ++i) {
-                    if (pickup_taken[i]) continue;
+                    if (pickup_taken[i] || !pickup_live(sc, i)) continue;
                     const scene::pickup_def& pk = sc.pickups[i];
                     const float dx = pk.pos[0] - lt.translate[0], dz = pk.pos[2] - lt.translate[2];
                     if (dx * dx + dz * dz > 1.6f * 1.6f || std::fabs(pk.pos[1] - lt.translate[1]) > 2.0f) continue;
                     pickup_taken[i] = true;
-                    const std::string a1 = pk.argv.size() > 1 ? pk.argv[1] : "";
-                    const std::string a2 = pk.argv.size() > 2 ? pk.argv[2] : "";
-                    if (a2 == "weapon") {
-                        player->armed = true;
-                        std::printf("pickup: %s - the Prince has a sword (R draws it)\n", pk.name.c_str());
-                    } else if (a1 == "1") {
-                        player->health = std::min(player->max_health, player->health + std::atoi(a2.c_str()));
-                        std::printf("pickup: %s - health %d\n", pk.name.c_str(), player->health);
-                    } else {
-                        std::printf("pickup: %s (%s) - not used yet\n", pk.name.c_str(), a1.c_str());
-                    }
+                    if (pk.actor >= 0) sc.actors[size_t(pk.actor)].hidden = true;
+                    pickup_apply(combat, sc, *player, pk, game_time);
                     if (pk.argv.size() > 3 && !pk.argv[3].empty()) sc.script.execute(pk.argv[3], 0);
                     play_sound("PRNpickup", lt.translate, 10.0f, false);
                     break;
                 }
             }
+            // Pickups shown or hidden by script (P4BoxPotion02 appears when
+            // its box breaks) follow their trap.
+            for (size_t i = 0; i < sc.pickups.size(); ++i)
+                if (sc.pickups[i].actor >= 0)
+                    sc.actors[size_t(sc.pickups[i].actor)].hidden = pickup_taken[i] || !pickup_live(sc, i);
             // While the sword is drawn, jump is not a jump.
             const bool jump_pressed = jump_pressed_raw && !combat.prince_drawn && !dead;
 
