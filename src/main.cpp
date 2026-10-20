@@ -5248,7 +5248,7 @@ int nearest_enemy(const combat_state& cs, const scene& sc, const float* pp, floa
 // run, then `extra`. The data root (the last argument) is kept.
 void relaunch(int argc, char** argv, const std::vector<std::string>& extra) {
     static const char* drop1[] = { "--menu", "--menu-game", "--armed", "--boot", 0 };
-    static const char* drop2[] = { "--place", "--region", "--health", "--send", "--movie", 0 };
+    static const char* drop2[] = { "--place", "--region", "--health", "--send", "--movie", "--level", 0 };
     std::vector<std::string> args;
     std::string root;
     for (int i = 1; i < argc; ++i) {
@@ -6443,7 +6443,9 @@ int main(int argc, char** argv) {
             alive = play_movie("cs01");
             boot = true;
         } else if (r == ui::R_LOAD) {
-            boot = true;
+            static std::string load_level_path;
+            if (sv.level.empty() || sv.level.find("prisonfix") != std::string::npos) boot = true;
+            else { load_level_path = sv.level; level_path = load_level_path.c_str(); }
             region_arg = sv.region;
             char b[96];
             std::snprintf(b, sizeof(b), "%.3f,%.3f,%.3f,%.2f", sv.pos[0], sv.pos[1], sv.pos[2],
@@ -6619,6 +6621,7 @@ int main(int argc, char** argv) {
             }
         (void)pi;
         cam.pitch = -0.22f;
+        cam.yaw = 3.14159265f - player_yaw;     // behind him, looking the way he faces
     }
     // --place x,y,z,yaw puts the Prince somewhere for a test; yaw in degrees,
     // 0 facing +z.
@@ -6749,6 +6752,18 @@ int main(int argc, char** argv) {
                 sc.pickups.size());
     camera_target camera_msgs(sc);
     sc.script.add(&camera_msgs);
+    // "game": "exit" ends the level (prison6's exit door: "delay,2,game,exit").
+    struct game_target : public k2::engine::script_target {
+        bool exit_requested;
+        game_target() : script_target("game"), exit_requested(false) {}
+        bool receive(const std::string& msg, k2::engine::script_target*) {
+            if (equals_nocase(msg, "exit")) { exit_requested = true; return true; }
+            return false;
+        }
+    };
+    static game_target game_msgs;
+    game_msgs.exit_requested = false;
+    sc.script.add(&game_msgs);
     // While a script holds the Prince (snooze) the player has no control at
     // all, camera included: that is a cutscene.
     bool input_locked = false;
@@ -6905,6 +6920,42 @@ int main(int argc, char** argv) {
             }
         }
 
+        // The level is over: on to the next, in the game's order (the
+        // order GameText lists the levels' names in - the module that
+        // follows a level is not traced). A relaunch, as Load is.
+        if (game_msgs.exit_requested) {
+            game_msgs.exit_requested = false;
+            static const char* order[] = {
+                "geometry\\rooms\\prisonfix\\prisonfix.lvl", "geometry\\rooms\\ivorytwr\\ivorytwr.lvl",
+                "geometry\\rooms\\Cistern\\cistern.lvl", "geometry\\rooms\\palace2\\palace2.lvl",
+                "geometry\\rooms\\palace3\\palace3.lvl", "geometry\\rooms\\palace4\\palace4.lvl",
+                "geometry\\rooms\\roof1\\roof1.lvl", "geometry\\rooms\\cityanddocks\\cityanddocks.lvl",
+                "geometry\\rooms\\dirig1a\\dirig1a.lvl", "geometry\\rooms\\dirig1b\\dirig1b.lvl",
+                "geometry\\rooms\\dirig2\\dirig2.lvl", "geometry\\rooms\\DirigFinale\\DirigFinale.lvl",
+                "geometry\\rooms\\ruins\\ruins.lvl", "geometry\\rooms\\cliffs\\cliffs.lvl",
+                "geometry\\rooms\\solar1\\solar1.lvl", "geometry\\rooms\\moontemple\\moontemple.lvl",
+                "geometry\\rooms\\finale\\finale.lvl" };
+            const size_t n = sizeof(order) / sizeof(order[0]);
+            std::string cur = boot_level.empty() ? (level_path ? level_path : "") : boot_level;
+            for (size_t k = 0; k < cur.size(); ++k) cur[k] = char(std::tolower(static_cast<unsigned char>(cur[k])));
+            size_t next = n;
+            for (size_t k = 0; k + 1 < n && next == n; ++k) {
+                std::string o = order[k];
+                for (size_t q = 0; q < o.size(); ++q) o[q] = char(std::tolower(static_cast<unsigned char>(o[q])));
+                if (cur == o) next = k + 1;
+            }
+            if (next < n) {
+                std::printf("level: exit to %s\n", order[next]);
+                std::vector<std::string> extra;
+                extra.push_back("--level");
+                extra.push_back(order[next]);
+                if (use_menu) extra.push_back("--menu-game");
+                relaunch(argc, argv, extra);
+            } else {
+                std::printf("level: exit with no level after %s\n", cur.c_str());
+            }
+        }
+
         // K2_GAME_MENU=1 opens the in-game menu on the tenth frame (headless checks).
         {
             static int menu_frames = 0;
@@ -6916,7 +6967,7 @@ int main(int argc, char** argv) {
                     // The in-game menu (Game Menu art). Resume carries on;
                     // the rest start a fresh run of the binary.
                     ui::save_game cur;
-                    cur.level = boot_level.empty() ? "prisonfix" : boot_level;
+                    cur.level = !boot_level.empty() ? boot_level : level_path ? std::string(level_path) : std::string("prisonfix");
                     cur.region = region_arg;
                     for (size_t i = 0; i < sc.actors.size(); ++i)
                         if (is_prince(sc.actors[i])) {
@@ -6956,7 +7007,10 @@ int main(int argc, char** argv) {
                         char b[96];
                         std::snprintf(b, sizeof(b), "%.3f,%.3f,%.3f,%.2f", ld.pos[0], ld.pos[1], ld.pos[2],
                                       ld.yaw * 180.0f / 3.14159265f);
-                        extra.push_back("--boot"); extra.push_back("--menu-game");
+                        // The prison boots as the original does; later levels load by path.
+                        if (ld.level.empty() || ld.level.find("prisonfix") != std::string::npos) extra.push_back("--boot");
+                        else { extra.push_back("--level"); extra.push_back(ld.level); }
+                        extra.push_back("--menu-game");
                         extra.push_back("--region"); extra.push_back(std::to_string(ld.region));
                         extra.push_back("--place"); extra.push_back(b);
                         std::snprintf(b, sizeof(b), "%d,%d", ld.health, ld.max_health);
@@ -6964,7 +7018,11 @@ int main(int argc, char** argv) {
                         if (ld.armed) extra.push_back("--armed");
                         extra.push_back("--send"); extra.push_back("IntroAnim,enable:F");
                     }
-                    if (r == ui::R_RESTART) { extra.push_back("--boot"); extra.push_back("--menu-game"); }
+                    if (r == ui::R_RESTART) {
+                        if (level_path && boot_level.empty()) { extra.push_back("--level"); extra.push_back(level_path); }
+                        else extra.push_back("--boot");
+                        extra.push_back("--menu-game");
+                    }
                     relaunch(argc, argv, extra);
                     running = false;
             } while (false);
