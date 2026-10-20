@@ -2628,6 +2628,22 @@ int main(int argc, char** argv) {
             cam.pos[0] = w.translate[0] - std::sin(cam.yaw) * follow_dist;
             cam.pos[1] = w.translate[1] + follow_height;
             cam.pos[2] = w.translate[2] + std::cos(cam.yaw) * follow_dist;
+            // Keep the camera on the Prince's side of any wall: cast the arm
+            // from his head and stop short of the first surface it meets. A
+            // stand-in until CameraLogic / camera.dat are reversed.
+            if (!noclip) {
+                const float head[3] = { w.translate[0], w.translate[1] + 1.5f, w.translate[2] };
+                const float arm[3]  = { cam.pos[0] - head[0], cam.pos[1] - head[1], cam.pos[2] - head[2] };
+                const float len = std::sqrt(arm[0]*arm[0] + arm[1]*arm[1] + arm[2]*arm[2]);
+                k2::engine::pick_hit h;
+                if (len > 1e-4f && sc.coll.pick(head, arm, 1.0f, false, h)) {
+                    // Back off 0.25 units from the hit, but never closer than
+                    // half a unit to the head.
+                    float t = h.distance - 0.25f / len;
+                    if (t < 0.5f / len) t = 0.5f / len;
+                    for (int k = 0; k < 3; ++k) cam.pos[k] = head[k] + arm[k] * t;
+                }
+            }
             camera_basis(cam, fwd, right);
         } else {
             if (down[plat::KEY_E] || down[plat::KEY_SPACE]) mv[1] += 1.0f;
