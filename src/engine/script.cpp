@@ -173,6 +173,36 @@ void pressure_plate::update(double now, bool pressed) {
     }
 }
 
+action_trap::action_trap(script_world& w, const std::string& name, const trap_header& h,
+                         const std::vector<std::string>& argv, const trap_volume& volume)
+    : trap_object(w, name, h), m_argv(argv), m_volume(volume) {
+    m_center[0] = m_center[1] = m_center[2] = 0.0f;
+}
+
+std::string action_trap::pick(field f) const {
+    if (size_t(f) >= m_argv.size()) return std::string();
+    const std::string& a = m_argv[size_t(f)];
+    if (a.find('{') == std::string::npos) return a;
+    // "{state:...}" blocks: the one for this state, its body without braces.
+    std::string la = a, key = "{" + m_state + ":";
+    for (size_t i = 0; i < la.size(); ++i) la[i] = char(std::tolower(static_cast<unsigned char>(la[i])));
+    for (size_t i = 0; i < key.size(); ++i) key[i] = char(std::tolower(static_cast<unsigned char>(key[i])));
+    const size_t at = la.find(key);
+    if (at == std::string::npos) return std::string();
+    const size_t start = at + key.size();
+    const size_t end = a.find('}', start);
+    std::string body = a.substr(start, end == std::string::npos ? std::string::npos : end - start);
+    while (!body.empty() && (body[body.size() - 1] == ';' || body[body.size() - 1] == ' ')) body.erase(body.size() - 1);
+    return body;
+}
+
+bool action_trap::can_act() const {
+    if (!m_enabled) return false;
+    for (int f = PRINCE_REACH; f <= ACTION_FINISH; ++f)
+        if (!pick(field(f)).empty()) return true;
+    return false;
+}
+
 bool area_trap::can_act() const {
     if (!m_enabled || !m_inside || m_acted || m_exit_delay < 0.0 || m_action.empty()) return false;
     if (m_action.find('{') == std::string::npos) return true;

@@ -137,6 +137,45 @@ private:
     double      m_exit_time;        // +0x1E8
 };
 
+// An Action: something the Prince works with the action input - a lever, a
+// crane's control, a cart to push, the crusher, Assan's mouth. Traps.txt
+// names its arguments:
+//
+//   argv1  mPrinceReach   skill the Prince plays to reach it
+//   argv2  mActionReach   script, as he reaches
+//   argv3  mPrinceUse     skill as he works it
+//   argv4  mActionUse     script, as he works it
+//   argv5  mDoIt          script, once used
+//   argv6  mPrinceFinish  skill to finish
+//   argv7  mActionFinish  script, finished
+//
+// Any of them may be "{state:...};{state:...}" blocks, chosen by the
+// trap's state when that stage starts. The sequence itself is ours (the
+// class's update is not traced): main plays the skills one after another
+// and calls run() for each stage's script.
+class action_trap : public trap_object {
+public:
+    enum field { PRINCE_REACH = 1, ACTION_REACH, PRINCE_USE, ACTION_USE, DO_IT, PRINCE_FINISH, ACTION_FINISH };
+
+    action_trap(script_world& w, const std::string& name, const trap_header& h,
+                const std::vector<std::string>& argv, const trap_volume& volume);
+
+    bool contains(const float* p) const { return m_volume.contains(p); }
+    // The argument for the current state: its "{state:...}" block, or all
+    // of it when it has none. Empty when nothing applies.
+    std::string pick(field f) const;
+    // Something to do here in the current state.
+    bool can_act() const;
+    void run(field f) { const std::string s = pick(f); if (!s.empty()) execute(s); }
+    const float* center() const { return m_center; }
+    void set_center(const float* c) { for (int k = 0; k < 3; ++k) m_center[k] = c[k]; }
+
+private:
+    std::vector<std::string> m_argv;
+    trap_volume m_volume;
+    float m_center[3];
+};
+
 // A PressurePlate (0x483925 argv, states 0x483DD2 .. 0x483F04):
 //
 //   argv1  actor whose "On" / "Off" skills animate the plate (TRAP_PressurePlate)

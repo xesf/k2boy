@@ -807,6 +807,7 @@ struct scene {
     k2::engine::script_world               script;
     std::vector<k2::engine::trap_object*>  traps;   // owned
     std::vector<k2::engine::area_trap*>    areas;   // also in `traps`
+    std::vector<k2::engine::action_trap*>  actions; // also in `traps`
     std::vector<k2::engine::pressure_plate*> plates; // also in `traps`
     // Every room node's position, by lower-case name, for scripts that name
     // places: "camera,tripod,(@IntroNISCam01)", "SkillAt:...,IntroNISPH".
@@ -1603,6 +1604,7 @@ void scene_reset(scene& sc) {
     sc.waters.clear();
     g_effect_traps.clear();
     sc.areas.clear();
+    sc.actions.clear();
     sc.plates.clear();
     for (std::map<std::string, assets::skl_file*>::iterator it = sc.trap_skills.begin();
          it != sc.trap_skills.end(); ++it) delete it->second;
@@ -2601,6 +2603,12 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
                 k2::engine::area_trap* a = new k2::engine::area_trap(
                     sc.script, n.name, hdr, n.trap.argv, vol);
                 sc.areas.push_back(a);
+                t = a;
+            } else if (n.trap.name == "Action") {
+                k2::engine::action_trap* a = new k2::engine::action_trap(
+                    sc.script, n.name, hdr, n.trap.argv, vol);
+                a->set_center(n.trap.center);
+                sc.actions.push_back(a);
                 t = a;
             } else if (n.trap.name == "Audio") {
                 t = new audio_trap(sc.script, n.name, hdr, n.trap.argv, n.trap.bbox);
@@ -6651,6 +6659,8 @@ int main(int argc, char** argv) {
     hang_ctl  ledges;
     swim_ctl  swim;
     crouch_ctl crouch;
+    // The Action trap the Prince is working, and its next stage.
+    struct { k2::engine::action_trap* trap; int stage; } working = { 0, 0 };
     int       prince_last_dir = -1;
     double    prince_last_attack = -10.0;
     double    drown_tick = 0.0;
@@ -7266,10 +7276,44 @@ int main(int argc, char** argv) {
                     in_jump = false;
                 }
             }
+            // Action traps (levers, cranes, the cart, the crusher, Assan's
+            // mouth): the action input inside one plays its stages - reach,
+            // use, finish - each a Prince skill and a script, in turn.
+            bool action_started = false;
+            if (act_pressed && !scripted_now && !on_ledge && !in_jump && !in_swim && !dead &&
+                ledges.state == hang_ctl::NONE && crates.state == crate_ctl::NONE &&
+                crouch.state == crouch_ctl::NONE && !working.trap) {
+                for (size_t i = 0; i < sc.actions.size(); ++i) {
+                    k2::engine::action_trap* a = sc.actions[i];
+                    if (!a->contains(lt.translate) || !a->can_act()) continue;
+                    working.trap = a;
+                    working.stage = 0;
+                    const float* c = a->center();
+                    player_yaw = std::atan2(c[0] - lt.translate[0], c[2] - lt.translate[2]);
+                    action_started = true;
+                    std::printf("action: %s (state %s)\n", a->name().c_str(), a->state().c_str());
+                    break;
+                }
+            }
+            if (working.trap && player->scripted == 0) {
+                typedef k2::engine::action_trap at;
+                static const at::field skills[3] = { at::PRINCE_REACH, at::PRINCE_USE, at::PRINCE_FINISH };
+                static const at::field scripts[3] = { at::ACTION_REACH, at::ACTION_USE, at::ACTION_FINISH };
+                // The next stage with something in it; each stage's skill
+                // plays to its end before the next begins.
+                while (working.stage < 3) {
+                    const int st = working.stage++;
+                    if (st == 2) working.trap->run(at::DO_IT);
+                    const std::string skill = working.trap->pick(skills[st]);
+                    working.trap->run(scripts[st]);
+                    if (!skill.empty() && play_once(sc, *player, skill, game_time, player_yaw, false)) break;
+                }
+                if (working.stage >= 3 && player->scripted == 0) working.trap = 0;
+            }
             // Action at a ledge he can get onto climbs it (StStart1MClimb).
             // At a crate, action alone grabs it to push or pull; action
             // while pushing toward it climbs on top, when there is room.
-            if (act_pressed && !scripted_now && !on_ledge && !in_jump && !in_swim &&
+            if (act_pressed && !action_started && !working.trap && !scripted_now && !on_ledge && !in_jump && !in_swim &&
                 ledges.state == hang_ctl::NONE && crates.state == crate_ctl::NONE && !dead) {
                 float ax[3];
                 const float pfw[3] = { std::sin(player_yaw), 0.0f, std::cos(player_yaw) };
@@ -7283,7 +7327,8 @@ int main(int argc, char** argv) {
                 ledges.state == hang_ctl::NONE && crates.state == crate_ctl::NONE &&
                 crouch_update(crouch, sc, *player, sc.coll, lt.translate, player_yaw, crouch_key,
                               mv, ml, classic, in_x, in_y, game_time, dt);
-            const bool busy = on_ledge || ledges.state != hang_ctl::NONE || in_swim || crouched;
+            const bool busy = on_ledge || ledges.state != hang_ctl::NONE || in_swim || crouched ||
+                              working.trap != 0;
             const bool in_crate = !scripted_now && !in_jump && !busy &&
                                   update_crate(crates, sc, *player, lt.translate, player_yaw,
                                                game_time, act, push, pull);
@@ -7836,6 +7881,9 @@ int main(int argc, char** argv) {
                 // above the bottles, pulsing, until E is pressed.
                 bool can_act = false;
                 for (size_t i = 0; i < sc.areas.size() && !can_act; ++i) can_act = sc.areas[i]->can_act();
+                if (player && !working.trap)
+                    for (size_t i = 0; i < sc.actions.size() && !can_act; ++i)
+                        can_act = sc.actions[i]->contains(player->node->local.translate) && sc.actions[i]->can_act();
                 if (can_act && hud_tex[B_ACT] != gfx::INVALID_TEXTURE) {
                     const float side = 30.0f;
                     const float pulse = 0.7f + 0.3f * float(std::sin(game_time * 5.0));
