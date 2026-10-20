@@ -622,6 +622,8 @@ struct draw_item {
     float           tint[3];        // filled by assign_trap_colors once the scene is loaded
     bool            hidden;         // a trap made invisible (argv[0] or "visible:F")
     float           offset[3];      // a trap moved by script ("move,...")
+    bool            has_model;      // a trap posed by a skill: draw under `model`
+    float           model[16];
 };
 
 // A spawned actor's drawable form: where it is, and which items are its body.
@@ -693,6 +695,8 @@ struct scene {
     std::vector<k2::engine::trap_object*>  traps;   // owned
     std::vector<k2::engine::area_trap*>    areas;   // also in `traps`
     std::vector<k2::engine::pressure_plate*> plates; // also in `traps`
+    // Trap actors' skills, loaded on first use: "actor/skill" lower-case.
+    std::map<std::string, assets::skl_file*> trap_skills;
     float mn[3];
     float mx[3];
     bool  empty;
@@ -965,6 +969,7 @@ void pose_actor(actor_inst& a) {
 
 // Room geometry is world-space; a trap moved by script draws at its offset.
 void set_item_model(const draw_item& di) {
+    if (di.has_model) { gfx::set_model(di.model); return; }
     float m[16];
     mat4_identity(m);
     m[12] = di.offset[0];
@@ -1178,6 +1183,9 @@ void scene_reset(scene& sc) {
     sc.traps.clear();
     sc.areas.clear();
     sc.plates.clear();
+    for (std::map<std::string, assets::skl_file*>::iterator it = sc.trap_skills.begin();
+         it != sc.trap_skills.end(); ++it) delete it->second;
+    sc.trap_skills.clear();
     sc.empty = true;
     sc.mn[0] = sc.mn[1] = sc.mn[2] =  1e30f;
     sc.mx[0] = sc.mx[1] = sc.mx[2] = -1e30f;
@@ -1193,13 +1201,16 @@ public:
                const k2::engine::trap_header& h, scene& sc, int item, int32_t coll_node,
                const std::string& type, const float* bbox)
         : trap_object(w, name, h), type(type), m_sc(sc), m_item(item), m_node(coll_node),
-          m_moving(false) {
+          m_moving(false), m_skill(0), m_skill_start(0) {
         m_base[0] = m_base[1] = m_base[2] = 0.0f;
         for (int i = 0; i < 6; ++i) box[i] = bbox[i];
+        pivot[0] = pivot[1] = pivot[2] = 0.0f;
     }
 
     const std::string type;     // the K2_TRAP_NAME: "Crate", "Force", ...
     float             box[6];   // K2_TRAP_BBOX at rest, engine space
+    std::string       actor;    // whose skills a message can name (Door: argv1)
+    float             pivot[3]; // K2_TRAP_PIVOT: a skill's rotation is about this
 
     // Where the trap sits now, relative to rest.
     const float* offset() const { return m_base; }
@@ -1226,10 +1237,17 @@ public:
             m_moving = true;
             return true;
         }
+        // A Door plays the skill its message names ("openslow", "pivot90");
+        // the original reports "Doors can't handle message %s" otherwise.
+        if (!actor.empty()) {
+            const assets::skl_file* sk = find_skill(msg);
+            if (sk) { m_skill = sk; m_skill_start = m_world.now(); return true; }
+        }
         return trap_object::handle(msg, sender);
     }
 
     void update(double now) {
+        if (m_skill) pose_from_skill(now);
         if (!m_moving) return;
         const double f = m_motion.fraction(now);
         float off[3];
@@ -1242,6 +1260,65 @@ public:
     }
 
 private:
+    const assets::skl_file* find_skill(const std::string& name) {
+        std::string key = actor + "/" + name;
+        for (size_t i = 0; i < key.size(); ++i)
+            if (key[i] >= 'A' && key[i] <= 'Z') key[i] = char(key[i] - 'A' + 'a');
+        std::map<std::string, assets::skl_file*>::iterator it = m_sc.trap_skills.find(key);
+        if (it != m_sc.trap_skills.end()) return it->second;
+        const std::string slash = key.substr(0, key.find('/'));
+        const std::string path = "actors/" + slash + "/skills/" + key.substr(key.find('/') + 1) + ".skl";
+        size_t size = 0;
+        uint8_t* d = plat::fs_read(path.c_str(), size);
+        assets::skl_file* sk = 0;
+        if (d) {
+            sk = new assets::skl_file();
+            if (!assets::skl_parse(d, size, *sk)) { delete sk; sk = 0; }
+            plat::fs_free(d);
+        }
+        m_sc.trap_skills[key] = sk;     // remember misses too
+        return sk;
+    }
+
+    // The node takes the pose of the first joint the skill keys, relative to
+    // its rest position: rotation about the trap pivot, then translation.
+    void pose_from_skill(double now) {
+        const double ms = (now - m_skill_start) * 1000.0;
+        const uint32_t t = ms <= 0.0 ? 0u : uint32_t(ms);
+        for (size_t j = 0; j < m_skill->joints.size(); ++j) {
+            const assets::skl_joint& jt = m_skill->joints[j];
+            float pos[3], q[4];
+            bool ok;
+            if (!jt.keys.empty())       ok = assets::skl_sample_keys(jt.keys, t, pos, q);
+            else if (jt.present && !jt.path.pos.empty()) {
+                assets::skl_sample(jt.path, t, m_skill->interpolate != 0, pos, q);
+                ok = true;
+            } else continue;
+            if (!ok) continue;
+            k2::engine::transform r;
+            transform_from_pos_quat(pos, q, r);
+            float off[3];
+            for (int k = 0; k < 3; ++k) off[k] = m_base[k] + pos[k];
+            m_sc.coll.set_node_transform(m_node, r.rotate, pivot, off);
+            if (m_item >= 0) {
+                draw_item& di = m_sc.items[size_t(m_item)];
+                // world = R (p - pivot) + pivot + off, as a column-major 4x4.
+                float* m = di.model;
+                for (int c = 0; c < 3; ++c)
+                    for (int rr = 0; rr < 3; ++rr) m[c * 4 + rr] = r.rotate[rr * 3 + c];
+                m[3] = m[7] = m[11] = 0.0f;
+                for (int rr = 0; rr < 3; ++rr) {
+                    const float rp = r.rotate[rr * 3] * pivot[0] + r.rotate[rr * 3 + 1] * pivot[1]
+                                   + r.rotate[rr * 3 + 2] * pivot[2];
+                    m[12 + rr] = pivot[rr] - rp + off[rr];
+                }
+                m[15] = 1.0f;
+                di.has_model = true;
+            }
+            return;
+        }
+    }
+
     void apply(const float* off) {
         if (m_item >= 0)
             for (int k = 0; k < 3; ++k) m_sc.items[size_t(m_item)].offset[k] = off[k];
@@ -1254,6 +1331,8 @@ private:
     bool                          m_moving;
     float                         m_base[3];
     k2::engine::translate_motion  m_motion;
+    const assets::skl_file*       m_skill;
+    double                        m_skill_start;
 };
 
 // "prince": the messages the Prince takes from scripts. Only snooze (no input
@@ -1380,6 +1459,7 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
         it.is_trap   = is_volume;
         it.hidden    = hidden;
         it.offset[0] = it.offset[1] = it.offset[2] = 0.0f;
+        it.has_model = false;
         it.trap_type = -1;
         it.owner     = -1;
         it.joint     = -1;
@@ -1435,8 +1515,13 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
                 sc.plates.push_back(pp);
                 t = pp;
             } else {
-                t = new scene_trap(sc.script, n.name, hdr, sc,
+                scene_trap* st = new scene_trap(sc.script, n.name, hdr, sc,
                                    int(sc.items.size()) - 1, node, n.trap.name, n.trap.bbox);
+                for (int k = 0; k < 3; ++k) st->pivot[k] = n.trap.pivot[k];
+                if (n.trap.name == "Door")
+                    st->actor = (n.trap.argv.size() > 1 && !n.trap.argv[1].empty())
+                                ? n.trap.argv[1] : std::string("TRAP_Door");
+                t = st;
             }
             sc.traps.push_back(t);
             sc.script.add(t);
@@ -2465,6 +2550,7 @@ int main(int argc, char** argv) {
     bool noclip   = false;
     bool noscript = false;
     bool autopush = false;
+    std::vector<std::string> send_args;
     const char* place_arg = 0;
     bool trapmsg  = false;
     float fixed_dt = 0.0f;
@@ -2508,6 +2594,7 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--noclip") == 0) noclip = true;
         else if (std::strcmp(argv[i], "--noscript") == 0) noscript = true;
         else if (std::strcmp(argv[i], "--autopush") == 0) autopush = true;
+        else if (std::strcmp(argv[i], "--send") == 0 && i + 1 < argc) send_args.push_back(argv[++i]);
         else if (std::strcmp(argv[i], "--place") == 0 && i + 1 < argc) place_arg = argv[++i];
         else if (std::strcmp(argv[i], "--trapmsg") == 0) trapmsg = true;
         else if (std::strcmp(argv[i], "--fixeddt") == 0 && i + 1 < argc) fixed_dt = float(std::atof(argv[++i]));
@@ -2805,6 +2892,8 @@ int main(int argc, char** argv) {
     prince_target prince_msgs(sc.script);
     sc.script.add(&prince_msgs);
     sc.script.trace = trapmsg;
+    // --send "target,msg" delivers a message at start, as if a trap sent it.
+    for (size_t i = 0; i < send_args.size(); ++i) sc.script.send_item(send_args[i], 0);
     double game_time = 0.0;
     crate_ctl crates;
     std::printf("scripts: %zu traps, %zu areas, %zu plates%s\n", sc.traps.size(),

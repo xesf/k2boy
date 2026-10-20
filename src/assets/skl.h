@@ -145,6 +145,17 @@ bool skl_parse(const uint8_t* data, size_t size, skl_file& out,
 void skl_sample(const skl_joint_path& p, uint32_t time_ms, bool interpolate,
                 float pos[3], float quat[4]);
 
+// SklK playback: the pose a joint's keyframe list gives at `time_ms`. Port of
+// JKey::Interpolate (0x612278) for the transform joints use, xf[0]:
+//   * find the keys around t, u = (t - t0) / (t1 - t0)
+//   * ease u with the cubic 3s^2u*a.ease_out + 3su^2*b.ease_in + u^3 (s = 1-u);
+//     the shipped 1/3 and 2/3 make that exactly linear
+//   * mode 2 (+0xD0) holds key a; otherwise xf[0] is lerped and slerped
+// (xf[3], the Bezier channel, does not drive the node.) Clamps outside the
+// keys. False when the list is empty.
+bool skl_sample_keys(const std::vector<skl_joint_key>& keys, uint32_t time_ms,
+                     float pos[3], float quat[4]);
+
 // Port of the quaternion slerp at 0x612B97 with spin 0: shortest arc, falling
 // back to a linear blend when the keys are nearly equal, then renormalised.
 void skl_slerp(const float a[4], const float b[4], float t, float out[4]);

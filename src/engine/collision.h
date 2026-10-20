@@ -55,6 +55,9 @@ public:
     int32_t add_node();
     void set_node_enabled(int32_t node, bool enabled);
     void set_node_offset(int32_t node, const float offset[3]);
+    // Rotation (row-major 3x3) about `pivot`, then `offset`: world = R(p - pivot) + pivot + offset.
+    void set_node_transform(int32_t node, const float rot[9], const float pivot[3],
+                            const float offset[3]);
 
     // Buckets triangles into a uniform XZ grid. Call after the last add_mesh.
     void build();
@@ -73,7 +76,7 @@ private:
     void cell_range(float mnx, float mnz, float mxx, float mxz,
                     int32_t& x0, int32_t& z0, int32_t& x1, int32_t& z1) const;
 
-    struct node_state { bool enabled; float offset[3]; };
+    struct node_state { bool enabled; float offset[3]; float rot[9]; float pivot[3]; bool rotated; };
 
     std::vector<float>                  m_tris;     // 9 floats per triangle
     std::vector<int32_t>                m_tri_node; // per triangle, -1 for static

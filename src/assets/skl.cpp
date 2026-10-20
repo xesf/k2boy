@@ -391,5 +391,26 @@ void skl_sample(const skl_joint_path& p, uint32_t time_ms, bool interpolate,
     }
 }
 
+bool skl_sample_keys(const std::vector<skl_joint_key>& keys, uint32_t t,
+                     float pos[3], float quat[4]) {
+    if (keys.empty()) return false;
+    size_t k = 0;
+    while (k + 1 < keys.size() && keys[k + 1].time <= t) ++k;
+    const skl_joint_key& a = keys[k];
+    if (k + 1 >= keys.size() || t <= a.time || a.field_d0 == 2) {
+        std::memcpy(pos,  a.xf[0].pos,  3 * sizeof(float));
+        std::memcpy(quat, a.xf[0].quat, 4 * sizeof(float));
+        return true;
+    }
+    const skl_joint_key& b = keys[k + 1];
+    const float u0 = float(t - a.time) / float(b.time - a.time);
+    const float s  = 1.0f - u0;
+    const float u  = s * a.ease_out * s * u0 * 3.0f + s * b.ease_in * u0 * u0 * 3.0f
+                   + u0 * u0 * u0;
+    for (int i = 0; i < 3; ++i) pos[i] = (b.xf[0].pos[i] - a.xf[0].pos[i]) * u + a.xf[0].pos[i];
+    skl_slerp(a.xf[0].quat, b.xf[0].quat, u, quat);
+    return true;
+}
+
 } // namespace assets
 } // namespace k2

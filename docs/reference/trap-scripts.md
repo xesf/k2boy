@@ -111,6 +111,23 @@ Held --(nobody on it)--> wait `delay` --(stepped on again: back to Held)
 
 A disabled plate feels nothing (`0x483D53`).
 
+## Door: skill-name messages
+
+A Door's messages are the names of its actor's skills: `openslow`, `close`, `pivot90`, and so on.
+The actor is argv1, defaulting to `TRAP_Door`, which has 54 skills. The original rejects anything
+else with `"Doors can't handle message %s"`. The skills are `SklK` keyframe clips, sampled with
+`JKey::Interpolate` (`0x612278`):
+
+- The joint's pose is **`xf[0]`** (`+0x10`). It is absolute relative to the node's rest pose:
+  `Open` goes y 0 → 4, `Close` 4 → 0, and `Pivot90` turns 90° about y.
+- `u` is eased by `3s²u·a.ease_out + 3su²·b.ease_in + u³` (s = 1 − u), which is linear for the
+  shipped 1/3 and 2/3.
+- Mode `+0xD0` = 2 holds the key. Otherwise `xf[0]` is lerped and slerped. `xf[3]` is a separate
+  Bézier channel (`0x613F05`, with tangent constants 2/3 and 1/3 in `0x611D00`) that doesn't
+  drive the node.
+
+The rotation is about the trap's `K2_TRAP_PIVOT`.
+
 ## `move` (Force, Mover; TranslateMotion)
 
 ```
@@ -133,10 +150,10 @@ otherwise       s = D − v/Td · (T−t)²/2
 ## Status of the port
 
 Working: the grammar, state blocks, every base message, `delay`, Area, PressurePlate, the
-trigger-volume test, TranslateMotion on any
+trigger-volume test, Door skills, TranslateMotion on any
 trap with geometry, and `prince,snooze`. `--trapmsg` prints each delivery in the original's
 debug format, `TRAP MSG [<sender> to <target>]: <msg>`, and the exit summary lists what nothing
 acted on.
 
-Not yet: camera messages, `SkillAt`, audio, Door/Mover/Action behaviour, the plate's own animation,
+Not yet: camera messages, `SkillAt`, audio, Mover/Action behaviour, Water `raise`, the plate's own animation,
 Rotate, Oscillate and the other motion types, and testing enemies against Areas.

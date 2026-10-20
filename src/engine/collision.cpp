@@ -21,6 +21,9 @@ int32_t collision_world::add_node() {
     node_state n;
     n.enabled = true;
     n.offset[0] = n.offset[1] = n.offset[2] = 0.0f;
+    n.pivot[0] = n.pivot[1] = n.pivot[2] = 0.0f;
+    for (int i = 0; i < 9; ++i) n.rot[i] = (i % 4 == 0) ? 1.0f : 0.0f;
+    n.rotated = false;
     m_nodes.push_back(n);
     return int32_t(m_nodes.size() - 1);
 }
@@ -32,6 +35,15 @@ void collision_world::set_node_enabled(int32_t node, bool enabled) {
 void collision_world::set_node_offset(int32_t node, const float offset[3]) {
     if (node < 0 || size_t(node) >= m_nodes.size()) return;
     for (int k = 0; k < 3; ++k) m_nodes[size_t(node)].offset[k] = offset[k];
+}
+
+void collision_world::set_node_transform(int32_t node, const float rot[9], const float pivot[3],
+                                         const float offset[3]) {
+    if (node < 0 || size_t(node) >= m_nodes.size()) return;
+    node_state& n = m_nodes[size_t(node)];
+    for (int i = 0; i < 9; ++i) n.rot[i] = rot[i];
+    for (int k = 0; k < 3; ++k) { n.pivot[k] = pivot[k]; n.offset[k] = offset[k]; }
+    n.rotated = !(rot[0] == 1.0f && rot[4] == 1.0f && rot[8] == 1.0f);
 }
 
 void collision_world::add_mesh(const float* xyz, size_t stride, size_t vcount,
@@ -157,9 +169,20 @@ bool collision_world::pick(const float o[3], const float d[3], float max_t,
         const uint32_t t = m_dynamic[i];
         const node_state& ns = m_nodes[size_t(m_tri_node[t])];
         if (!ns.enabled) continue;
-        const float lo[3] = { o[0] - ns.offset[0], o[1] - ns.offset[1], o[2] - ns.offset[2] };
+        // Into the node's rest frame: p_local = R^T (p - pivot - offset) + pivot.
+        float lo[3], ld[3];
+        if (ns.rotated) {
+            const float q[3] = { o[0] - ns.pivot[0] - ns.offset[0], o[1] - ns.pivot[1] - ns.offset[1],
+                                 o[2] - ns.pivot[2] - ns.offset[2] };
+            for (int r = 0; r < 3; ++r) {
+                lo[r] = ns.rot[0 + r] * q[0] + ns.rot[3 + r] * q[1] + ns.rot[6 + r] * q[2] + ns.pivot[r];
+                ld[r] = ns.rot[0 + r] * d[0] + ns.rot[3 + r] * d[1] + ns.rot[6 + r] * d[2];
+            }
+        } else {
+            for (int r = 0; r < 3; ++r) { lo[r] = o[r] - ns.offset[r]; ld[r] = d[r]; }
+        }
         float tt;
-        if (ray_triangle(t, lo, d, max_t, front_only, tt) && tt < best) {
+        if (ray_triangle(t, lo, ld, max_t, front_only, tt) && tt < best) {
             best = tt;
             best_tri = int32_t(t);
         }
@@ -175,6 +198,14 @@ bool collision_world::pick(const float o[3], const float d[3], float max_t,
                    e1[0] * e2[1] - e1[1] * e2[0] };
     const float len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
     if (len > 0.0f) { n[0] /= len; n[1] /= len; n[2] /= len; }
+    if (m_tri_node[size_t(best_tri)] >= 0) {
+        const node_state& ns = m_nodes[size_t(m_tri_node[size_t(best_tri)])];
+        if (ns.rotated) {
+            const float r[3] = { n[0], n[1], n[2] };
+            for (int k = 0; k < 3; ++k)
+                n[k] = ns.rot[k * 3] * r[0] + ns.rot[k * 3 + 1] * r[1] + ns.rot[k * 3 + 2] * r[2];
+        }
+    }
     if (n[0] * d[0] + n[1] * d[1] + n[2] * d[2] > 0.0f) { n[0] = -n[0]; n[1] = -n[1]; n[2] = -n[2]; }
 
     for (int k = 0; k < 3; ++k) {
