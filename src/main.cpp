@@ -2189,6 +2189,7 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
         bool solid;
         if (!n.has_trap)                 solid = !it.transparent;
         else if (n.trap.name == "Generic") solid = hdr.collideable;
+        else if (n.trap.name == "Water")   solid = false;   // swum in, not stood on
         else                             solid = hdr.collideable && !is_volume;
         // Trap geometry gets its own collision node, so scripts can switch it
         // on and off and move it; it is added even when it starts non-solid.
@@ -3719,6 +3720,102 @@ bool hang_try_climb(hang_ctl& hc, actor_inst& a, const k2::engine::collision_wor
     return true;
 }
 
+// --- swimming -----------------------------------------------------------------
+//
+// Water is a Water trap: a flat sheet at the surface (its box has no height)
+// over the area it covers; below it is water. The Prince swims once his feet
+// are more than SWIM_ENTER under the surface (StStartSwimming, 0x4B8A7B):
+// on the surface (SwimOnSurface_G / SwimAmbientOnSurface_G) or, after a dive
+// (StStartSubmerging, 0x4B8FB0, SwimAmbientDive_G), under it
+// (SwimUnderWater_G / SwimAmbientUnderWater_G) on one bottle of air.
+// Depths, speeds and the air time are ours; the K2SwimActivity that holds
+// the original's is not traced.
+namespace swim_tuning {
+const float  SWIM_ENTER = 1.0f;     // feet this far under the surface: swim
+const float  FLOAT      = 1.3f;     // feet under the surface while on it
+const float  SPEED      = 1.6f;     // m/s when the clip carries no travel
+const float  VSPEED     = 1.6f;     // m/s up or down, under water
+const double AIR        = 20.0;     // seconds of air; the bottle shows 4 steps
+}
+
+struct swim_ctl {
+    enum state_t { NONE, SURFACE, UNDER } state;
+    double air;                     // seconds left
+    swim_ctl() : state(NONE), air(swim_tuning::AIR) {}
+};
+
+// The surface over `p`, if it is in water: the highest Water sheet above the
+// feet whose area holds p.
+bool water_surface(scene& sc, const float* p, float& surf) {
+    bool found = false;
+    for (size_t i = 0; i < sc.traps.size(); ++i) {
+        const scene_trap* t = dynamic_cast<const scene_trap*>(sc.traps[i]);
+        if (!t || t->type != "Water") continue;
+        const float* o = t->offset();
+        if (p[0] < t->box[0] + o[0] || p[0] > t->box[3] + o[0] ||
+            p[2] < t->box[2] + o[2] || p[2] > t->box[5] + o[2]) continue;
+        const float y = t->box[4] + o[1];
+        if (y < p[1] - 0.05f) continue;
+        if (!found || y > surf) surf = y;
+        found = true;
+    }
+    return found;
+}
+
+// One frame in the water. `mv` is the world move direction (length `ml`),
+// `up`/`down` held (jump, action), `jump` pressed. Returns false when he has
+// left the water. `drowning` is set while out of air.
+bool swim_update(swim_ctl& sw, scene& sc, actor_inst& a, float* pos, float& yaw, float surf,
+                 const float* mv, float ml, bool up, bool down, bool dive, bool classic, float dt,
+                 bool& drowning) {
+    drowning = false;
+    const bool under = sw.state == swim_ctl::UNDER;
+    const char* clip = under ? (ml > 1e-3f ? "SwimUnderWater_G" : "SwimAmbientUnderWater_G")
+                             : (ml > 1e-3f ? "SwimOnSurface_G" : "SwimAmbientOnSurface_G");
+    a.stance = find_actor_skill(sc, a, clip);
+    if (ml > 1e-3f) {
+        float speed = swim_tuning::SPEED;
+        if (a.stance) { const float cs = clip_speed(*a.stance); if (cs > 0.2f) speed = cs; }
+        const float step = speed * dt * std::min(1.0f, ml);
+        move_horizontal(sc.coll, pos, mv[0] / ml * step, mv[2] / ml * step);
+        if (!classic) yaw = std::atan2(mv[0], mv[2]);
+    }
+    float gy = -1.0e9f;
+    const float probe[3] = { pos[0], surf, pos[2] };
+    k2::engine::pick_hit h;
+    const float dn[3] = { 0.0f, -1.0f, 0.0f };
+    if (sc.coll.pick(probe, dn, 100.0f, true, h)) gy = h.point[1];
+    // Shallow enough to stand: walk out.
+    if (gy > surf - swim_tuning::SWIM_ENTER) {
+        sw.state = swim_ctl::NONE;
+        a.stance = 0;
+        pos[1] = gy;
+        return false;
+    }
+    if (!under) {
+        pos[1] = surf - swim_tuning::FLOAT;
+        sw.air = swim_tuning::AIR;
+        if (dive && gy < surf - swim_tuning::FLOAT - 1.0f) {
+            sw.state = swim_ctl::UNDER;
+            std::printf("swim: dive\n");
+        }
+        return true;
+    }
+    float vy = (up ? swim_tuning::VSPEED : 0.0f) - (down ? swim_tuning::VSPEED : 0.0f);
+    if (!up && !down) vy = 0.3f;                    // drifts up
+    pos[1] += vy * dt;
+    if (pos[1] < gy + 0.2f) pos[1] = gy + 0.2f;
+    if (pos[1] >= surf - swim_tuning::FLOAT) {
+        pos[1] = surf - swim_tuning::FLOAT;
+        sw.state = swim_ctl::SURFACE;
+        std::printf("swim: surfaced\n");
+        return true;
+    }
+    sw.air -= dt;
+    if (sw.air <= 0.0) { sw.air = 0.0; drowning = true; }
+    return true;
+}
+
 // In the air: catch a ledge the hands can reach. True when it grabbed.
 bool hang_try_grab(hang_ctl& hc, actor_inst& a, const k2::engine::collision_world& w,
                    const float* pos, float yaw, float vy, float horiz_speed, double now) {
@@ -4797,6 +4894,8 @@ int main(int argc, char** argv) {
     crate_ctl crates;
     jump_ctl  jumps;
     hang_ctl  ledges;
+    swim_ctl  swim;
+    double    drown_tick = 0.0;
     bool      draw_was_down = false, atk_was_down = false;
     bool      jump_was_down = false;
     bool      pad_act_down = false;   // pad X last frame; areas run before the pad is read
@@ -5213,7 +5312,7 @@ int main(int argc, char** argv) {
                 jump_begin(jumps, *player, FALL_VERT, game_time, lt.translate);
             }
             if (!on_ledge && jump_pressed && !scripted_now && crates.state == crate_ctl::NONE &&
-                jumps.state == jump_ctl::NONE && player_vy == 0.0f) {
+                jumps.state == jump_ctl::NONE && player_vy == 0.0f && swim.state == swim_ctl::NONE) {
                 // A ledge in front decides what the jump button does: climb a
                 // low one, jump up to catch a high one, else an ordinary jump.
                 if (!hang_try_climb(ledges, *player, sc.coll, lt.translate, player_yaw, game_time)) {
@@ -5238,7 +5337,39 @@ int main(int argc, char** argv) {
                     jump_start(jumps, *player, running, jl, game_time, lt.translate);
                 }
             }
-            bool in_jump = !scripted_now && !on_ledge && ledges.state == hang_ctl::NONE &&
+            // Water: deep enough and he swims; that owns the body until he
+            // climbs or walks out.
+            float surf = 0.0f;
+            const bool water = !noclip && !scripted_now && !on_ledge && ledges.state == hang_ctl::NONE &&
+                               !dead && water_surface(sc, lt.translate, surf);
+            if (swim.state == swim_ctl::NONE && water && lt.translate[1] < surf - swim_tuning::SWIM_ENTER) {
+                swim.state = swim_ctl::SURFACE;
+                jumps.state = jump_ctl::NONE;
+                player_vy = 0.0f;
+                set_clip(*player, LOCO_BASE);
+                play_sound("prnUnderwater", lt.translate, 14.0f, false);
+                std::printf("swim: in the water (surface %.2f)\n", surf);
+            }
+            if (swim.state != swim_ctl::NONE && !water) { swim.state = swim_ctl::NONE; player->stance = 0; }
+            bool in_swim = false;
+            if (swim.state != swim_ctl::NONE) {
+                // Out over a low edge: the jump climbs, as on land.
+                if (swim.state == swim_ctl::SURFACE && jump_pressed &&
+                    hang_try_climb(ledges, *player, sc.coll, lt.translate, player_yaw, game_time)) {
+                    swim.state = swim_ctl::NONE;
+                    player->stance = 0;
+                } else {
+                    bool drowning = false;
+                    in_swim = swim_update(swim, sc, *player, lt.translate, player_yaw, surf, mv, ml,
+                                          jump_key, act, act && swim.state == swim_ctl::SURFACE,
+                                          classic, dt, drowning);
+                    if (drowning && game_time >= drown_tick) {
+                        drown_tick = game_time + 1.0;
+                        prince_damage(combat, sc, *player, combat_tuning::BOTTLE / 3, 0, game_time);
+                    }
+                }
+            }
+            bool in_jump = !in_swim && !scripted_now && !on_ledge && ledges.state == hang_ctl::NONE &&
                 jump_update(jumps, *player, sc.coll, lt.translate, player_yaw, game_time, dt);
             // In the air, the hands catch any ledge in reach.
             if (in_jump && jumps.state == jump_ctl::AIR) {
@@ -5249,7 +5380,7 @@ int main(int argc, char** argv) {
                     in_jump = false;
                 }
             }
-            const bool busy = on_ledge || ledges.state != hang_ctl::NONE;
+            const bool busy = on_ledge || ledges.state != hang_ctl::NONE || in_swim;
             const bool in_crate = !scripted_now && !in_jump && !busy &&
                                   update_crate(crates, sc, *player, lt.translate, player_yaw,
                                                game_time, act, push, pull);
@@ -5603,7 +5734,7 @@ int main(int argc, char** argv) {
                     const uint16_t ix[6] = { 0, 1, 2, 0, 2, 3 };
                     quad = gfx::create_mesh(v, 4, ix, 6);
                 }
-                enum { B_FULL, B_HALF, B_THIRD, B_EMPTY, B_SWORD, B_ACT, B_COUNT };
+                enum { B_FULL, B_HALF, B_THIRD, B_EMPTY, B_SWORD, B_ACT, B_AIR0, B_AIR1, B_AIR2, B_AIR3, B_AIR4, B_COUNT };
                 static gfx::texture_id hud_tex[B_COUNT];
                 static int hud_w[B_COUNT], hud_h[B_COUNT];
                 static bool hud_loaded = false;
@@ -5612,7 +5743,9 @@ int main(int argc, char** argv) {
                     const char* files[B_COUNT] = {
                         "2D/health bottles/redFull.BMP", "2D/health bottles/REDHALF.BMP",
                         "2D/health bottles/REDTHIRD.BMP", "2D/health bottles/empty.bmp",
-                        "2D/interface icons/sword icon.bmp", 0 };
+                        "2D/interface icons/sword icon.bmp", 0,
+                        "2D/air bottles/air0.bmp", "2D/air bottles/air1.bmp", "2D/air bottles/air2.bmp",
+                        "2D/air bottles/air3.bmp", "2D/air bottles/air4.bmp" };
                     for (int k = 0; k < B_COUNT; ++k) {
                         hud_tex[k] = gfx::INVALID_TEXTURE;
                         hud_w[k] = hud_h[k] = 0;
@@ -5689,6 +5822,18 @@ int main(int argc, char** argv) {
                     gfx::set_model(m);
                     gfx::set_texture(hud_tex[B_SWORD]);
                     gfx::draw(quad);
+                }
+                // Under water: the air bottle, full to empty in four steps.
+                if (swim.state == swim_ctl::UNDER) {
+                    const int step = std::max(0, std::min(4, int(std::ceil(swim.air / swim_tuning::AIR * 4.0))));
+                    const int k = B_AIR0 + step;
+                    if (hud_tex[k] != gfx::INVALID_TEXTURE) {
+                        m[0] = 40.0f * sx; m[5] = 40.0f * sy;
+                        m[12] = x + (pa->armed ? 56.0f : 8.0f) * sx; m[13] = y;
+                        gfx::set_model(m);
+                        gfx::set_texture(hud_tex[k]);
+                        gfx::draw(quad);
+                    }
                 }
                 // Something to do here (talk, pull, use): the highlight icon
                 // above the bottles, pulsing, until E is pressed.
