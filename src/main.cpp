@@ -693,6 +693,12 @@ struct actor_inst {
     // script names. `home` is where it stands between them.
     bool                              is_fixture;
     bool                              start_flag;     // "Start" received (0x1000 at +0xD8)
+    // The weapon in his hand: master.dat [Weapons] names it and the hand
+    // node with an offset into it. Drawn while `weapon_shown`.
+    std::string                       weapon;
+    int                               hand_joint;
+    float                             hand_off[3];
+    bool                              weapon_shown;
     std::vector<std::string>          ambient;
     float                             home[3];
     float                             home_yaw;
@@ -701,7 +707,8 @@ struct actor_inst {
                    skinned(false), clip(-1), clip_ms(0.0), clip_once(false), scripted(0), scripted_start(0),
                    scripted_yaw(0), remove_after(false), hidden(false), stance(0),
                    hold_last(false), posed_hold(false), health(100), max_health(100), armed(false),
-                   is_fixture(false), start_flag(false), home_yaw(0) {
+                   is_fixture(false), start_flag(false), hand_joint(-1), weapon_shown(false), home_yaw(0) {
+        hand_off[0] = hand_off[1] = hand_off[2] = 0.0f;
         scripted_origin[0] = scripted_origin[1] = scripted_origin[2] = 0.0f;
         home[0] = home[1] = home[2] = 0.0f;
     }
@@ -783,11 +790,15 @@ struct scene {
     std::vector<pickup_def> pickups;
     // Trap actors' skills, loaded on first use: "actor/skill" lower-case.
     std::map<std::string, assets::skl_file*> trap_skills;
+    // Hand-held weapons (Geometry/Utils/WEAPONS.K2A, OtherWeapons.K2A), by
+    // node name: draw items kept out of the world passes, drawn in a hand.
+    std::map<std::string, std::vector<size_t> > weapons;
+    bool weapons_loaded;
     float mn[3];
     float mx[3];
     bool  empty;
 
-    scene() : root(0), empty(true) { mn[0]=mn[1]=mn[2]=0; mx[0]=mx[1]=mx[2]=0; }
+    scene() : weapons_loaded(false), root(0), empty(true) { mn[0]=mn[1]=mn[2]=0; mx[0]=mx[1]=mx[2]=0; }
 };
 
 // Trigger volumes carry no material, so they used to render as solid black
@@ -1391,6 +1402,37 @@ bool bind_actor_skeleton(const assets::master_file& m, actor_inst& inst, scene& 
     return inst.skinned;
 }
 
+bool append_scene(const char* path, scene& sc, bool collide);
+
+// Loads the weapon meshes once and puts master.dat's first weapon (or
+// `which`, its index) in the actor's hand.
+void bind_actor_weapon(const assets::master_file& m, actor_inst& inst, scene& sc, int which) {
+    if (!sc.weapons_loaded) {
+        sc.weapons_loaded = true;
+        const char* files[2] = { "geometry\\utils\\WEAPONS.K2A", "geometry\\utils\\OtherWeapons.K2A" };
+        for (int f = 0; f < 2; ++f) {
+            const size_t before = sc.items.size();
+            const float mn[3] = { sc.mn[0], sc.mn[1], sc.mn[2] }, mx[3] = { sc.mx[0], sc.mx[1], sc.mx[2] };
+            if (!append_scene(files[f], sc, false)) continue;
+            for (int k = 0; k < 3; ++k) { sc.mn[k] = mn[k]; sc.mx[k] = mx[k]; }
+            for (size_t k = before; k < sc.items.size(); ++k) {
+                sc.items[k].hidden = true;          // not part of the world
+                std::vector<size_t>& v = sc.weapons[sc.item_names[k]];
+                if (v.empty() || f == 0) v.push_back(k);
+            }
+        }
+    }
+    if (m.weapons.empty() || m.hands.empty()) return;
+    const size_t w = which >= 0 && size_t(which) < m.weapons.size() ? size_t(which) : 0;
+    inst.weapon = m.weapons[w].name;
+    for (size_t j = 0; j < inst.joint_names.size(); ++j)
+        if (inst.joint_names[j] == m.hands[0].node) { inst.hand_joint = int(j); break; }
+    for (int k = 0; k < 3; ++k) inst.hand_off[k] = m.hands[0].offset[k];
+    if (inst.hand_joint < 0 || !sc.weapons.count(inst.weapon))
+        std::printf("  %s: weapon %s / hand %s not found\n", inst.name.c_str(), inst.weapon.c_str(),
+                    m.hands[0].node.c_str());
+}
+
 void scene_reset(scene& sc) {
     sc.items.clear();
     sc.item_names.clear();
@@ -1414,6 +1456,8 @@ void scene_reset(scene& sc) {
     for (std::map<std::string, assets::skl_file*>::iterator it = sc.trap_skills.begin();
          it != sc.trap_skills.end(); ++it) delete it->second;
     sc.trap_skills.clear();
+    sc.weapons.clear();
+    sc.weapons_loaded = false;
     sc.empty = true;
     sc.mn[0] = sc.mn[1] = sc.mn[2] =  1e30f;
     sc.mx[0] = sc.mx[1] = sc.mx[2] = -1e30f;
@@ -2447,6 +2491,8 @@ void spawn_level_actors(scene& sc, k2::engine::body_table& bodies,
             sc.items[inst.first_item + k].owner = owner;
         inst.script_name = is_enemy ? t.node : std::string("prince");
         bind_actor_skeleton(b->master, inst, sc);
+        bind_actor_weapon(b->master, inst, sc, -1);
+        inst.weapon_shown = is_enemy;           // guards hold theirs; the Prince draws his
         sc.actors.push_back(inst);
 
         sc.root->update_world();
@@ -2617,6 +2663,7 @@ size_t spawn_prince_from_level(const assets::lvl_file& lv, scene& sc,
             for (size_t k = 0; k < inst.item_count; ++k)
                 sc.items[inst.first_item + k].owner = owner;
             bind_actor_skeleton(b->master, inst, sc);
+            bind_actor_weapon(b->master, inst, sc, -1);
             sc.actors.push_back(inst);
             sc.root->update_world();
 
@@ -5333,6 +5380,7 @@ int main(int argc, char** argv) {
                 if (!combat.prince_drawn) player->stance = 0;
             }
             combat.prince_blocking = combat.prince_drawn && blk_key && free_body;
+            player->weapon_shown = combat.prince_drawn;
             if (combat.prince_drawn && free_body) {
                 // Face the nearest guard; stand ready, or block.
                 const int ne = nearest_enemy(combat, sc, lt.translate, 6.0f);
@@ -5738,6 +5786,28 @@ int main(int argc, char** argv) {
                     }
                     gfx::set_texture(di.tex);
                     gfx::draw(di.mesh);
+                }
+                // The weapon, in the hand: actor * hand joint * grip offset.
+                if (ai.weapon_shown && ai.hand_joint >= 0 && ai.skinned) {
+                    std::map<std::string, std::vector<size_t> >::const_iterator wi = sc.weapons.find(ai.weapon);
+                    if (wi != sc.weapons.end()) {
+                        k2::engine::transform grip, t0, t1;
+                        grip = ai.cur[size_t(ai.hand_joint)];
+                        k2::engine::transform off;
+                        for (int k = 0; k < 9; ++k) off.rotate[k] = (k % 4 == 0) ? 1.0f : 0.0f;
+                        for (int k = 0; k < 3; ++k) off.translate[k] = ai.hand_off[k];
+                        off.scale = 1.0f;
+                        k2::engine::transform_compose(grip, off, t0);
+                        k2::engine::transform_compose(aw, t0, t1);
+                        float wm[16];
+                        t1.to_matrix(wm);
+                        gfx::set_model(wm);
+                        for (size_t k = 0; k < wi->second.size(); ++k) {
+                            const draw_item& wd = sc.items[wi->second[k]];
+                            gfx::set_texture(wd.tex);
+                            gfx::draw(wd.mesh);
+                        }
+                    }
                 }
             }
             gfx::set_model(model);   // room geometry is world-space; restore identity
