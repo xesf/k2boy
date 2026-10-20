@@ -3742,17 +3742,24 @@ bool hang_update(hang_ctl& hc, actor_inst& a, const k2::engine::collision_world&
     switch (hc.state) {
     case hang_ctl::CLIMB:
     case hang_ctl::PULL_UP: {
-        // Up first, then over: the body rises through the first 60% of the
-        // clip and only then steps onto the top, so it never passes through
-        // the lip.
-        const double up = std::min(1.0, u / 0.6);
-        const double ov = u < 0.6 ? 0.0 : (u - 0.6) / 0.4;
-        const double su = up * up * (3.0 - 2.0 * up);
-        pos[1] = float(hc.from[1] + (hc.to[1] - hc.from[1]) * su);
-        pos[0] = float(hc.from[0] + (hc.to[0] - hc.from[0]) * ov);
-        pos[2] = float(hc.from[2] + (hc.to[2] - hc.from[2]) * ov);
+        // The clip does the climbing: its Prime joint rises the 0.75 .. 1.93
+        // of the hop (or pull-up), so the body stays at its starting height
+        // and only follows the root's travel forward. When the clip ends the
+        // rise moves into the position - standing on the top - as the pose
+        // returns to base.
+        float d[3];
+        const assets::skl_file& sk = a.loco[size_t(hc.clip)];
+        root_delta(sk, uint32_t(std::min(len, el) * 1000.0), hc.ledge.facing, d);
+        pos[0] = float(hc.from[0]) + d[0];
+        pos[1] = float(hc.from[1]);
+        pos[2] = float(hc.from[2]) + d[2];
         yaw = hc.ledge.facing;
-        if (u >= 1.0) { hc.state = hang_ctl::NONE; set_clip(a, LOCO_BASE); return false; }
+        if (u >= 1.0) {
+            pos[1] = float(hc.to[1]);
+            hc.state = hang_ctl::NONE;
+            set_clip(a, LOCO_BASE);
+            return false;
+        }
         return true;
     }
     case hang_ctl::GRAB:
