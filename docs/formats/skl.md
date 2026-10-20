@@ -4,8 +4,10 @@ Location: `data/Actors/<Name>/Skills/*.skl` — 2363 files. `data/Actors/Prince/
 Owning classes: `MfSkill`, `MfProtoSkill`, `MfPoSkill`, `MfLocoSkill`, `MfManipSkill`,
 `MfJointKeyframe`, `MfJointKeyList`, `MfSoundKeyframe`, `MfTextureKeyframe`, `MfKeyList`.
 
-**Status: `JKey` fully decoded — framing from the writer, field layout from the constructor,
-validated at 99.89% across every record in the install.**
+**Status: the whole file is decoded as the object graph the readers build, and all 2363 files
+parse to exactly EOF.** The one exception is the manipulation block at the end of the 135 `MSkl`
+files, which playback does not need. See [Object graph](#object-graph--the-real-structure).
+`JKey` field layout validated at 99.89%; `MfJointPath` rotations at 100% (1 942 461 keys).
 
 A "skill" in Motivate is an animation clip plus its attached event tracks (sound triggers,
 visibility toggles, texture swaps). It is the unit the locomotion planner schedules.
@@ -38,12 +40,104 @@ locomotion skills (`_L2`, `_L3`, `_L4`) tracks combat stance level.
 
 ### `chunk` — first chunk tag
 
-`SklK` (309 of 638) or `SklS` (329 of 638). Correlation with `kind` is not 1:1, so treat this as an
-independent variant field. **Unresolved — resolve in IDA.**
+**Resolved.** The tag picks how joints are stored, read into `MfSkill +0x08`:
 
-## Chunk stream
+| tag | joints stored as | files |
+|---|---|---:|
+| `SklK` | `MfJointKeyList` per joint: `JKey` spline keyframes | 318 |
+| `SklS` | `MfJointPath` per joint: one sampled key per frame | 2045 |
 
-After the name, the file is a flat sequence of 4CC-tagged records. Tags observed across all
+Every Prince locomotion clip is `SklS`. `SklK` is used by props and traps.
+
+## Object graph — the real structure
+
+The file is not a flat chunk stream. It is one `MfStream` object, read field by field, and the
+4CC tags only appear where a reader calls `MfStream__get_object_maybe` (`0x60541F`). Reading it as
+a tag scan cannot see `SklS` joint data at all, because `MfJointPath` records carry no tag.
+
+```
+"kSFM"                              file magic
+"Skil" | "LSkl" | "MSkl"            object tag -> creator
+
+MfSkill base  (0x60C1ED)
+  u32   version                     into MfStream +0x04; gates every later field
+  4cc   chunk                       "SklK" | "SklS"                       +0x08
+  u32                               +0x14
+  str   name                        u32 length + bytes                    +0x10
+  u32                               v >= 0x66                             +0x0C
+  u32   joint_count                 = the actor's .act node count         +0x18
+  SklK: joint_count x { u32 present; if present: MfJointKeyList }
+  28 B  root transform              pos[3] + quat[4], v > 0x24            +0x20
+  u32   interpolate                 v > 0x25; the sampler's blend flag     +0x44
+  u32                               v > 0x25                              +0x48
+  u32   has_refs                    v >= 0x66; 0 in every shipped file
+  16 B                              v >= 0x67                             +0x4C
+
+Skil  (0x623CE6)
+  SklS: joint_count x { u32 present; if present: MfJointPath }           +0x7C
+  u32 present; MfKeyList                          sound keys              +0x60
+  u32 present; MfKeyList                          v > 40, event keys      +0x68
+  u32 n; n x MfTextureKeyList                     str, u32, u32, MfKeyList
+  u32   duration_ms                 v > 25                                +0x80
+  u32                               v >= 34, else 1                       +0x84
+
+LSkl  (0x63D3A0) — after Skil
+  v >= 0x17: f32 x5 (+0x98..+0xA8), u32 n (+0xAC), n x 8 bytes (+0xB0)
+  u32 n2; v >= 0x11: u32 (+0xB4), u32 (+0xB8)
+  n2 x record: 0x14C bytes (v > 0x17), 0xFC (v 0x11..0x17), 0x0C (older)
+
+MSkl  (0x63F4DD) — after Skil: manipulation targets. Not decoded.
+```
+
+`MfKeyList` (`0x61196A`): `u32 count`, then `count` tagged objects. A tag of `-2`, or any tag
+without a registered creator (`0` in practice), is a null entry and consumes only the tag. `-1`
+escapes to a real tag followed by a size word.
+
+### `MfJointPath` — the `SklS` joint ("`JPat`", reader `0x640E59`)
+
+```
+u32  interval_ms     +0x04   33 in 13 676 of 14 555 paths (the ctor default 0x21)
+u32  npos            +0x08   position keys
+u32  nrot            +0x0C   rotation keys
+u32  frames          +0x10   clip length in frames
+npos  keys, run-length encoded: { i16 repeat; f32 pos[3]  }
+nrot  keys, run-length encoded: { i16 repeat; f32 quat[4] }   w first
+```
+
+Before version `0x20` a single `frames` word stands for all three counts.
+
+The writer runs a compaction pass first (`0x640CF8`): it drops trailing keys equal to the last
+one (positions within a squared distance, rotations by `sub_6128D4`). So a track can be shorter
+than `frames`, and a track of one key is a constant. Six paths in the install are longer than
+their clip.
+
+The joint index is the actor's `.act` node index. For the Prince that is 31 slots; joint 0, the
+`Prince` root node, carries the root motion — `Running_L` travels 3.6 units along +Z in 24
+frames, `Walk_L` 1.77 units in 34.
+
+### Sampling (`0x640B01`)
+
+```c
+frame = time_ms / interval_ms;                   // unsigned
+ri = min(frame, nrot - 1);  pi = min(frame, npos - 1);
+if (!interpolate) return { pos[pi], rot[ri] };
+t = (float)(time_ms % interval_ms) / interval_ms;
+rot = (t != 0 && ri != nrot - 1) ? slerp(rot[ri], rot[ri + 1], t) : rot[ri];
+pos = (t != 0 && pi != npos - 1) ? lerp(pos[pi], pos[pi + 1], t)  : pos[pi];
+```
+
+`time_ms == 0` returns key 0. The slerp (`0x612B97`) takes the short arc (negating the second
+key when the dot product is below 0), falls back to a linear blend when `1 - cos <= 1e-11`, and
+renormalises. Every caller passes the skill's `+0x44` as the `interpolate` flag. A joint with no
+path keeps its own node transform (`MfNode +0x28`, see `0x63BA81`).
+
+The locomotion set is named in a table at `0x749C30`: `BasePose_L`, `Running_L`, `Walk_L`,
+`AmbientType_G`. The last is a stem that gets a random suffix (guards use 1..6, `0x4BDDA4`).
+
+## Chunk stream (historical tag survey)
+
+Kept for the counts. The framing described here was a tag scan and is superseded by the object
+graph above. Tags observed across all
 2363 files (counts over a 638-file sample):
 
 | tag | count | meaning |
@@ -101,9 +195,15 @@ repacker.
 0x02F0  00000001
 ```
 
-So `vKey` binds a named scene node to a time-tagged state change. 2640 in the same units as the
-`JKey` time field; if that unit is milliseconds the clip is 2.64 s, which is plausible for an ice
-block melting. **Unit unconfirmed.**
+**Correction.** The reader (`0x6407E9`) is the `MfKeyframe` base (time, flag), then a `u32` value
+and the target name, and nothing more. The record ends at the name. The `0, 0x0A50, 1` that follow
+belong to the enclosing `Skil`: an empty texture-key-list count, then **`duration_ms` = 2640**, then
+`+0x84`. An earlier revision read 2640 as the event's time. The unit is milliseconds: `SklS` clips
+confirm it: `duration_ms == (frames - 1) * interval_ms` in 2021 of 2045 `SklS` skills (for example
+`Running_L`: 24 x 33 = 792). The 24 exceptions are short clips whose paths use 8 or 16 ms intervals.
+
+The `00000001 00000001` after the `SKey` name likewise belongs to `Skil`: the "event list present"
+flag, then that list's count.
 
 ### `JKey` — joint keyframe
 
@@ -240,20 +340,10 @@ Not established. The constructor groups them as *(standalone, array[2])* twice �
 as spline control data, but which set is which, and what the trailing `vec3` at `+0xB8` is, are
 open.
 
-### The 8-byte trailer
+### The 8-byte trailer — resolved
 
-1796 of the 11 275 inter-record gaps are 220 rather than 212, and a handful are 228/236/244/252/276
-— always 212 + a multiple of 8. The extra bytes are pairs of `uint32`:
-
-```
-(1, 1) x353   (1, 2) x312   (1, 4) x204   (1, 6) x200
-(1, 5) x141   (1, 3) x131   (1, 7) x67    (1, 8) x53
-```
-
-Always `(1, N)` with small `N`. This is a count-prefixed list — almost certainly a joint or
-channel index emitted by the owning `MfJointKeyList` between keyframes, not a field of `JKey`
-itself. It does **not** correlate with the `flag` at +0xD0 (gap 220 occurs with flag 0 and flag 1
-in the same proportion as gap 212).
+The `(1, N)` pairs between `JKey` records are `SklK` framing: the next joint's `present` flag,
+then its `MfJointKeyList` count. They belong to the per-joint loop in `0x60C1ED`, not to `JKey`.
 
 ## How to confirm in IDA
 

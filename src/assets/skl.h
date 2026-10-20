@@ -1,8 +1,19 @@
 // skl.h — parser for Motivate skills (.skl): animation clips plus event tracks.
 //
-// Record layouts were recovered from the writers in pop3dreal.exe rather than
-// guessed from data; see docs/formats/skl.md. The JKey layout is validated at
-// 99.89% across all 69 396 channels in the install.
+// The file is read the way the original reads it: as an MfStream object graph,
+// field by field, following the readers in pop3dreal.exe. It used to be found
+// by scanning for 4CC tags, which could not see the SklS joint data at all and
+// mistook the skill's duration for an event-key field. See docs/formats/skl.md.
+//
+//   MfSkill base          0x60C1ED   header, joint count, SklK key lists, root
+//   Skil                  0x623CE6   SklS joint paths, key lists, duration
+//   LSkl  (MfLocoSkill)   0x63D3A0   locomotion block after Skil
+//   MSkl  (MfManipSkill)  0x63F4DD   manipulation block after Skil (not decoded)
+//   MfJointPath ("JPat")  0x640E59   one SklS joint: RLE position + rotation
+//   MfKeyList             0x61196A   count, then tagged keyframe objects
+//
+// Validated: all 2363 .skl files in the install parse to exactly EOF (Skil and
+// LSkl), or to the start of the undecoded MSkl block.
 //
 // No dependency on gfx or platform.
 //
@@ -27,7 +38,7 @@ struct skl_transform {
     float quat[4];      // w, x, y, z
 };
 
-// "JKey" — 212 bytes, matching sizeof(MfJointKeyframe).
+// "JKey" — 212 bytes, matching sizeof(MfJointKeyframe). Only SklK skills use it.
 struct skl_joint_key {
     uint32_t      time;
     uint32_t      flag;         // 0 or 1
@@ -40,18 +51,47 @@ struct skl_joint_key {
     uint32_t      field_d0;
 };
 
-// "SKey" — 44 bytes. Fires a sound. The payload carries a ".wav" name even
-// though the files on disk are .sfx, so lookups must ignore the extension.
+// "SKey" — MfSoundKeyframe, read by 0x64058A. Fires a sound. The name is a
+// ".wav" even though the files on disk are .sfx, so lookups must ignore the
+// extension.
 struct skl_sound_key {
     uint32_t    time;
     std::string sound;
 };
 
-// "vKey" — 20 bytes. Binds a named node to a timed state change.
+// "vKey" — MfEventKeyframe, read by 0x6407E9: time, flag, value, target name.
 struct skl_event_key {
     uint32_t    time;
     uint32_t    value;
     std::string target;
+};
+
+// "JPat" — MfJointPath, one per joint in an SklS skill. A sampled clip: one key
+// per frame, `interval_ms` apart, run-length encoded on disk. The writer's
+// compaction pass (0x640CF8) drops trailing keys equal to the last one, so a
+// track can be shorter than `frames`; the sampler clamps to its last key, and a
+// track of length 1 is a constant.
+struct skl_joint_path {
+    uint32_t           interval_ms;   // +0x04, 33 by default (the ctor's 0x21)
+    uint32_t           frames;        // +0x10, clip length in frames
+    std::vector<float> pos;           // +0x14, 3 floats per key
+    std::vector<float> rot;           // +0x18, 4 floats per key, w first
+
+    skl_joint_path() : interval_ms(33), frames(0) {}
+
+    size_t pos_keys() const { return pos.size() / 3; }
+    size_t rot_keys() const { return rot.size() / 4; }
+};
+
+// One joint slot of a skill, indexed like the actor's .act nodes. A slot with
+// `present == false` is not driven by the skill; the original then keeps the
+// node's own transform (MfNode +0x28), see 0x63BA81.
+struct skl_joint {
+    bool                       present;
+    skl_joint_path             path;    // SklS
+    std::vector<skl_joint_key> keys;    // SklK
+
+    skl_joint() : present(false) {}
 };
 
 enum skl_kind {
@@ -63,29 +103,51 @@ enum skl_kind {
 struct skl_file {
     std::string kind_tag;       // "Skil" | "MSkl" | "LSkl"
     skl_kind    kind;
-    int32_t     version;        // 105 or 106
-    std::string chunk_tag;      // "SklK" | "SklS"
+    int32_t     version;        // 105 or 106; gates fields as in the readers
+    std::string chunk_tag;      // "SklK" (keyframe splines) | "SklS" (sampled)
     std::string name;
 
+    std::vector<skl_joint> joints;      // MfSkill +0x18 count, +0x1C array
+    skl_transform root;                 // +0x20
+    int32_t       interpolate;          // +0x44, passed to the sampler as its flag
+    int32_t       field_48;
+    float         field_4c[4];          // v >= 0x67
+    uint32_t      duration_ms;          // Skil +0x80
+    int32_t       field_84;             // Skil +0x84, 1 before v34
+
+    // LSkl only (0x63D3A0). Meanings not yet established.
+    float         loco[5];              // +0x98 .. +0xA8
+
+    // MSkl only: bytes left after the Skil part, i.e. the manipulation block.
+    size_t        manip_bytes;
+
+    // Flattened for statistics; the per-joint lists are in `joints`.
     std::vector<skl_joint_key> joint_keys;
     std::vector<skl_sound_key> sound_keys;
     std::vector<skl_event_key> event_keys;
 
-    // Longest `time` seen. Units unresolved, but consistent across chunk types.
-    uint32_t duration() const {
-        uint32_t d = 0;
-        for (size_t i = 0; i < joint_keys.size(); ++i)
-            if (joint_keys[i].time > d) d = joint_keys[i].time;
-        for (size_t i = 0; i < sound_keys.size(); ++i)
-            if (sound_keys[i].time > d) d = sound_keys[i].time;
-        for (size_t i = 0; i < event_keys.size(); ++i)
-            if (event_keys[i].time > d) d = event_keys[i].time;
-        return d;
+    skl_file() : kind(SKL_GENERIC), version(0), interpolate(0), field_48(0),
+                 duration_ms(0), field_84(0), manip_bytes(0) {
+        for (int i = 0; i < 4; ++i) field_4c[i] = 0.0f;
+        for (int i = 0; i < 5; ++i) loco[i] = 0.0f;
     }
+
+    // Clip length in milliseconds, as the skill stores it.
+    uint32_t duration() const { return duration_ms; }
 };
 
 bool skl_parse(const uint8_t* data, size_t size, skl_file& out,
                std::string* error = 0);
+
+// Port of MfJointPath's sampler (0x640B01). Writes the joint's local transform
+// at `time_ms`. With `interpolate` set, blends toward the next key: positions
+// linearly, rotations by the original's slerp (0x612B97).
+void skl_sample(const skl_joint_path& p, uint32_t time_ms, bool interpolate,
+                float pos[3], float quat[4]);
+
+// Port of the quaternion slerp at 0x612B97 with spin 0: shortest arc, falling
+// back to a linear blend when the keys are nearly equal, then renormalised.
+void skl_slerp(const float a[4], const float b[4], float t, float out[4]);
 
 } // namespace assets
 } // namespace k2
