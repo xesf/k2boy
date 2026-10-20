@@ -52,6 +52,7 @@ if(APPLE)
         PROPERTIES COMPILE_FLAGS "-fobjc-arc")
     target_link_libraries(k2boy
         "-framework Cocoa"
+        "-framework GameController"
         "-framework OpenGL"
         "-framework AudioToolbox"
         "-framework AudioUnit"

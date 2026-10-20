@@ -9,6 +9,7 @@
 #include "platform/platform.h"
 
 #import <Cocoa/Cocoa.h>
+#import <GameController/GameController.h>
 #import <OpenGL/OpenGL.h>
 #import <AudioUnit/AudioUnit.h>
 
@@ -252,6 +253,45 @@ void shutdown() {
             g_window = nil;
         }
         g_k2_delegate = nil;
+    }
+}
+
+// GameController framework: Xbox, PlayStation and MFi pads, with the
+// extended (two-stick) profile.
+void pad_poll(pad_state& out) {
+    std::memset(&out, 0, sizeof(out));
+    @autoreleasepool {
+        NSArray<GCController*>* pads = [GCController controllers];
+        for (GCController* c in pads) {
+            GCExtendedGamepad* g = [c extendedGamepad];
+            if (!g) continue;
+            out.connected = true;
+            out.axis[PAD_AXIS_LX] = g.leftThumbstick.xAxis.value;
+            out.axis[PAD_AXIS_LY] = g.leftThumbstick.yAxis.value;
+            out.axis[PAD_AXIS_RX] = g.rightThumbstick.xAxis.value;
+            out.axis[PAD_AXIS_RY] = g.rightThumbstick.yAxis.value;
+            out.axis[PAD_AXIS_LTRIGGER] = g.leftTrigger.value;
+            out.axis[PAD_AXIS_RTRIGGER] = g.rightTrigger.value;
+            out.button[PAD_A] = g.buttonA.pressed;
+            out.button[PAD_B] = g.buttonB.pressed;
+            out.button[PAD_X] = g.buttonX.pressed;
+            out.button[PAD_Y] = g.buttonY.pressed;
+            out.button[PAD_LSHOULDER] = g.leftShoulder.pressed;
+            out.button[PAD_RSHOULDER] = g.rightShoulder.pressed;
+            out.button[PAD_DPAD_UP] = g.dpad.up.pressed;
+            out.button[PAD_DPAD_DOWN] = g.dpad.down.pressed;
+            out.button[PAD_DPAD_LEFT] = g.dpad.left.pressed;
+            out.button[PAD_DPAD_RIGHT] = g.dpad.right.pressed;
+            if (@available(macOS 10.15, *)) {
+                out.button[PAD_START]  = g.buttonMenu.pressed;
+                out.button[PAD_SELECT] = g.buttonOptions ? g.buttonOptions.pressed : false;
+            }
+            if (@available(macOS 10.14.1, *)) {
+                out.button[PAD_LSTICK] = g.leftThumbstickButton ? g.leftThumbstickButton.pressed : false;
+                out.button[PAD_RSTICK] = g.rightThumbstickButton ? g.rightThumbstickButton.pressed : false;
+            }
+            break;
+        }
     }
 }
 

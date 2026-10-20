@@ -59,3 +59,42 @@ A forward jump while walking crosses about 1.8 units.
 How the original detects the landing: it uses a predictive planner (`StStartPredictiveStandJump`,
 `StIdlePredictJump`). In the port, the floor probe ends the flight. Ledge grabs, hanging and
 fall damage are also not traced.
+
+## Ledges
+
+From the binary: `StStart1MClimb` (`0x4B46C2`) chooses the climb by the ledge's height above
+the Prince:
+
+| height | clip |
+|---|---|
+| > 1.75 (`flt_7461A4`) | `HopUpOnto2m_M` |
+| > 1.3 (`flt_74AB68`) | `HopUpOnto1point5m_M` |
+| > 0.9 (`flt_743F9C`) | `HopUpOnto1m_M` |
+| otherwise | `HopUpOntoSmall_M` |
+
+The climb and hang clips carry no vertical root motion either: the engine moves the body.
+`"Reachable Ledge YAHOO! Start Hanging!"` (`0x4B4CC8`) gates the hang through two probes
+(`0x4CF65C`, `0x4D0980`). They cast with mask 6 from points near the hands, using offsets 0.17 and
+0.37 ahead, 0.15 up, and a height tolerance of 1.525. Those probes are not fully traced.
+
+The port finds a ledge with the pick primitive: a downward cast a little ahead finds an
+up-facing top, a horizontal cast finds its face (and the yaw to square up), and an upward cast
+from the top checks for headroom. The hang pose is placed from the skeleton:
+`LedgeHangBase_M` is posed at t = 0, and its `LGrip` / `RGrip` joints (1.83 above the root for
+the Prince) are put on the edge.
+
+| action | how |
+|---|---|
+| climb | jump facing a ledge 0.3–2.25 above the feet |
+| catch | jump under a ledge within grip reach of the jump's peak (stand-jump up peaks at 2.2, so about 4 units), or reach it in any jump |
+| hang | `LedgeHangBase_M`. Forward or jump pulls up (`LedgePullUpOnto_M1`, or `LedgeHangPullUpFail_M` without headroom), back drops, left/right shimmy 0.6 per step (the clips' root motion) while the ledge continues |
+
+Measured in prisonfix region 0:
+
+- At (−69.07, 20.25, 26.25), a 1.40 ledge is climbed with `HopUpOnto1point5m_M` and the Prince
+  ends on top at 21.65.
+- At (−66.07, 20.25, 29.25), a jump catches a beam at 24.23. The Prince hangs at root height
+  22.40, pulls up to 24.23, and walks on along it. Holding left shimmies him from x −66.07 to
+  −64.67.
+
+`--findledges` lists standing spots that face a climbable ledge.

@@ -3,16 +3,24 @@
 #   make play       build optimised and play the game: boots like the original
 #                   (startup module -> prisonfix), with every feature on —
 #                   animation, collision, trap scripts, crates, doors, plates.
-#                   Options: REGION=n  start region (default 0)
+#                   Options: CONTROLS=modern|classic (default modern)
+#                            REGION=n  start region (default 0)
 #                            TRACE=1   print every trap message
 #                            ARGS=...  extra flags passed straight through
 #   make play-debug same, from the Debug build
 #
-#   Playing: WASD move (relative to the camera), Shift run, Space jump
-#   (up, or toward the direction held; while running: a running jump),
-#   E act / grab a crate (hold), then W push, S pull; drag LMB to look; F free-fly camera,
-#   T show trigger volumes (off in play), Esc quit. Cutscenes take all
-#   control until they end.
+#   Controls (C switches scheme in game):
+#     Modern   WASD / left stick move relative to the camera; mouse drag or
+#              right stick turns the camera. A full stick push runs.
+#     Classic  the original's tank controls: W/S walk forward/back along his
+#              facing, A/D turn him; the camera stays behind him.
+#     Both     Shift / RB / RT run, Space / A jump, E / X act (grab a crate and
+#              hold: then forward pushes, back pulls).
+#     Ledges   jump facing a low ledge to climb it; jump under a high one to
+#              catch it, then forward pulls up, back drops, left/right shimmy.
+#     Also     F free-fly camera, T trigger volumes, Esc quit. Cutscenes take
+#              all control until they end. A gamepad (Xbox / PlayStation / MFi)
+#              is picked up when connected.
 #
 #   make            build (Debug)
 #   make run        build and launch the default room
@@ -62,9 +70,10 @@ RBIN       = $(RBUILD)/k2boy
 JOBS      ?= $(shell sysctl -n hw.ncpu 2>/dev/null || echo 4)
 
 REGION    ?= 0
+CONTROLS  ?= modern
 TRACE     ?= 0
 ARGS      ?=
-PLAY_FLAGS = --boot --notrig --region $(REGION) $(if $(filter 1,$(TRACE)),--trapmsg) $(ARGS)
+PLAY_FLAGS = --boot --notrig --controls $(CONTROLS) --region $(REGION) $(if $(filter 1,$(TRACE)),--trapmsg) $(ARGS)
 
 # Configures a build directory, or reconfigures it when its cache points at a
 # CMake that no longer exists (a CMake upgrade otherwise breaks every target

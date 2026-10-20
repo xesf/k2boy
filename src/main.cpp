@@ -701,6 +701,9 @@ enum loco_clip { LOCO_BASE = 0, LOCO_RUN, LOCO_WALK,
                  JUMP_LEFT_ANTIC, JUMP_LEFT, JUMP_RIGHT_ANTIC, JUMP_RIGHT,
                  LAND_VERT, LAND_FWD, LAND_BACK, LAND_LEFT, LAND_RIGHT, LAND_PAINFUL,
                  RUN_JUMP_ANTIC, RUN_JUMPING, RUN_JUMP_LAND, FALL_VERT,
+                 HOP_SMALL, HOP_1M, HOP_1_5M, HOP_2M,
+                 LEDGE_GRAB_VERT, LEDGE_GRAB_HORIZ, LEDGE_HANG, LEDGE_PULL_UP, LEDGE_PULL_FAIL,
+                 LEDGE_MOVE_LEFT, LEDGE_MOVE_RIGHT, WALK_BACK,
                  LOCO_COUNT };
 const char* const k_loco_names[LOCO_COUNT] = { "BasePose_L", "Running_L", "Walk_L",
     "PushOrPullFinish_M", "PushOrPullBase_M", "Push_M", "PushFail_M",
@@ -710,7 +713,11 @@ const char* const k_loco_names[LOCO_COUNT] = { "BasePose_L", "Running_L", "Walk_
     "JumpRightAntic_G", "JumpingRight_G",
     "LandVertSafe_G", "LandJumpForward_G", "LandBackSafe_G", "LandLeftSafe_G",
     "LandRightSafe_G", "LandVertPainful_G",
-    "RunJumpAnticLeft_L", "RunJumpingLeft_G", "RunJumpLand_L", "FallVertUncontrolled_G" };
+    "RunJumpAnticLeft_L", "RunJumpingLeft_G", "RunJumpLand_L", "FallVertUncontrolled_G",
+    "HopUpOntoSmall_M", "HopUpOnto1m_M", "HopUpOnto1point5m_M", "HopUpOnto2m_M",
+    "LedgeGrabVert_M", "LedgeGrabHoriz_M", "LedgeHangBase_M", "LedgePullUpOnto_M1",
+    "LedgeHangPullUpFail_M", "LedgeHangMovingLeft_M", "LedgeHangMovingRight_M",
+    "WalkBackwards_L1" };
 
 
 struct scene {
@@ -2636,7 +2643,7 @@ namespace move_tuning {
 const float STEP_UP      = 0.45f;   // highest ledge walked up without climbing
 const float PROBE_DOWN   = 0.6f;    // below the feet still counts as standing
 const float RADIUS       = 0.35f;   // body radius for wall probes
-const float GRAVITY      = 9.8f;
+const float GRAVITY      = 17.0f;   // FallGravity (0x4F8547), as a magnitude
 const float FLOOR_MIN_NY = 0.7f;    // up-facing enough to stand on (~45 deg)
 const float PROBE_HEIGHTS[3] = { 0.5f, 1.0f, 1.6f };
 }
@@ -2875,7 +2882,7 @@ void crate_input(crate_ctl& cc, scene& sc, actor_inst& a, const float* pos, floa
 // MinFallHeight (6.25). How the original detects the landing (the predictive
 // planner) is not traced; here the floor probe ends the flight.
 namespace jump_tuning {
-const float GRAVITY = -17.0f;
+const float GRAVITY = -17.0f;           // FallGravity
 const float MIN_FALL_HEIGHT = 6.25f;
 }
 
@@ -3011,6 +3018,258 @@ bool jump_update(jump_ctl& jc, actor_inst& a, const k2::engine::collision_world&
     return true;
 }
 
+// --- ledges -------------------------------------------------------------------
+//
+// Climbing onto, hanging from, shimmying along and pulling up over ledges.
+//
+// From the binary: StStart1MClimb (0x4B46C2) chooses the climb clip by the
+// ledge's height above the Prince - HopUpOnto2m_M above 1.75, 1point5m above
+// 1.3, 1m above 0.9, else HopUpOntoSmall_M (flt_7461A4 / flt_74AB68 /
+// flt_743F9C). The clips carry no vertical root motion; the engine raises the
+// body. "Reachable Ledge YAHOO! Start Hanging!" (0x4B4CC8) goes through two
+// probe functions (0x4CF65C, 0x4D0980) that cast with mask 6 from the hand
+// nodes; those are not traced, so finding the ledge is ours: a downward pick
+// a little ahead for an up-facing top, a horizontal one for its face.
+// The hang is placed from the skeleton: the LGrip/RGrip joints of
+// LedgeHangBase_M are put on the edge.
+struct ledge_hit {
+    float top;          // y of the ledge's upper surface
+    float edge[3];      // a point on the edge, at `top`
+    float facing;       // yaw that faces the wall
+    bool  can_stand;    // headroom on top to stand up
+};
+
+// A ledge ahead of `pos` along `yaw`, whose top is between min_h and max_h
+// above pos[1].
+bool find_ledge(const k2::engine::collision_world& w, const float* pos, float yaw,
+                float min_h, float max_h, ledge_hit& out) {
+    const float f[3] = { std::sin(yaw), 0.0f, std::cos(yaw) };
+    const float ds[3] = { 0.35f, 0.6f, 0.9f };
+    for (int i = 0; i < 3; ++i) {
+        const float o[3] = { pos[0] + f[0] * ds[i], pos[1] + max_h + 0.25f, pos[2] + f[2] * ds[i] };
+        const float down[3] = { 0.0f, -1.0f, 0.0f };
+        k2::engine::pick_hit h;
+        if (!w.pick(o, down, max_h + 0.25f - min_h, true, h)) continue;
+        if (h.normal[1] < move_tuning::FLOOR_MIN_NY) continue;
+        const float top = h.point[1];
+        // The face: a horizontal ray just under the top.
+        const float fo[3] = { pos[0], top - 0.1f, pos[2] };
+        k2::engine::pick_hit fh;
+        float edge_d = ds[i] - 0.15f, yaw_face = yaw;
+        if (w.pick(fo, f, ds[i] + 0.3f, false, fh) && std::fabs(fh.normal[1]) < 0.5f) {
+            edge_d = fh.distance;
+            yaw_face = std::atan2(-fh.normal[0], -fh.normal[2]);
+        }
+        // Nothing solid between him and the face at his own height.
+        const float wo[3] = { pos[0], pos[1] + 0.3f, pos[2] };
+        k2::engine::pick_hit wh;
+        if (top - pos[1] > 0.6f && w.pick(wo, f, edge_d - 0.05f, false, wh)) continue;
+        out.top = top;
+        out.facing = yaw_face;
+        const float ff[3] = { std::sin(yaw_face), 0.0f, std::cos(yaw_face) };
+        out.edge[0] = pos[0] + f[0] * edge_d;
+        out.edge[1] = top;
+        out.edge[2] = pos[2] + f[2] * edge_d;
+        // Headroom to stand on top, a little past the edge.
+        const float so[3] = { out.edge[0] + ff[0] * 0.35f, top + 0.05f, out.edge[2] + ff[2] * 0.35f };
+        const float up[3] = { 0.0f, 1.0f, 0.0f };
+        k2::engine::pick_hit sh;
+        out.can_stand = !w.pick(so, up, 1.9f, false, sh);
+        return true;
+    }
+    return false;
+}
+
+struct hang_ctl {
+    enum state_t { NONE, CLIMB, GRAB, HANG, SHIMMY, PULL_UP, PULL_FAIL } state;
+    ledge_hit ledge;
+    int       clip;
+    double    t0;
+    float     from[3], to[3];
+    float     grip[3];      // grip point in the Prince's frame (x left, y up, z fwd)
+    bool      have_grip;
+
+    hang_ctl() : state(NONE), clip(-1), t0(0), have_grip(false) {
+        for (int k = 0; k < 3; ++k) from[k] = to[k] = grip[k] = 0.0f;
+    }
+};
+
+// Where the grip joints sit in the hang pose, relative to the root: pose
+// LedgeHangBase_M at t = 0 and read LGrip/RGrip. Cached in `hc`.
+void hang_measure_grip(hang_ctl& hc, actor_inst& a) {
+    if (hc.have_grip || !a.loco_ok[LEDGE_HANG]) return;
+    const assets::skl_file& s = a.loco[LEDGE_HANG];
+    std::vector<k2::engine::transform> keep = a.joint_local_cur;
+    const size_t n = std::min(a.joint_local_cur.size(), s.joints.size());
+    for (size_t j = 0; j < n; ++j) {
+        if (!s.joints[j].present) continue;
+        float pos[3], q[4];
+        assets::skl_sample(s.joints[j].path, 0, true, pos, q);
+        if (j == 0) for (int k = 0; k < 3; ++k) pos[k] = a.joint_local_bind[0].translate[k];
+        transform_from_pos_quat(pos, q, a.joint_local_cur[j]);
+    }
+    pose_actor(a);
+    float sum[3] = { 0, 0, 0 };
+    int cnt = 0;
+    for (size_t j = 0; j < a.joint_names.size(); ++j)
+        if (a.joint_names[j] == "LGrip" || a.joint_names[j] == "RGrip") {
+            for (int k = 0; k < 3; ++k) sum[k] += a.cur[j].translate[k];
+            ++cnt;
+        }
+    a.joint_local_cur = keep;
+    pose_actor(a);
+    if (!cnt) return;
+    for (int k = 0; k < 3; ++k) hc.grip[k] = sum[k] / float(cnt);
+    hc.have_grip = true;
+}
+
+// Root position that puts the grip on the ledge edge, facing the wall.
+void hang_root(const hang_ctl& hc, float* out) {
+    const float yaw = hc.ledge.facing;
+    const float c = std::cos(yaw), s = std::sin(yaw);
+    // set_yaw: model x -> (c, 0, -s), model z -> (s, 0, c)
+    const float gx = c * hc.grip[0] + s * hc.grip[2];
+    const float gz = -s * hc.grip[0] + c * hc.grip[2];
+    out[0] = hc.ledge.edge[0] - gx;
+    out[1] = hc.ledge.top - hc.grip[1];
+    out[2] = hc.ledge.edge[2] - gz;
+}
+
+void hang_play(hang_ctl& hc, actor_inst& a, int c, double now, bool once) {
+    hc.clip = c;
+    set_clip(a, c);
+    a.clip_once = once;
+    a.clip_ms = 0.0;
+    hc.t0 = now;
+}
+
+double hang_len(const actor_inst& a, int c) {
+    return (c >= 0 && a.loco_ok[size_t(c)]) ? clip_length_ms(a.loco[size_t(c)]) / 1000.0 : 0.5;
+}
+
+// From standing: climb a low ledge (HopUpOnto*). True when it started.
+bool hang_try_climb(hang_ctl& hc, actor_inst& a, const k2::engine::collision_world& w,
+                    const float* pos, float& yaw, double now) {
+    if (!a.loco_ok[HOP_SMALL]) return false;
+    ledge_hit l;
+    if (!find_ledge(w, pos, yaw, 0.3f, 2.25f, l) || !l.can_stand) return false;
+    const float dh = l.top - pos[1];
+    const int c = dh > 1.75f ? HOP_2M : dh > 1.3f ? HOP_1_5M : dh > 0.9f ? HOP_1M : HOP_SMALL;
+    hc.ledge = l;
+    yaw = l.facing;
+    const float ff[3] = { std::sin(yaw), 0.0f, std::cos(yaw) };
+    for (int k = 0; k < 3; ++k) hc.from[k] = pos[k];
+    hc.to[0] = l.edge[0] + ff[0] * 0.35f;
+    hc.to[1] = l.top;
+    hc.to[2] = l.edge[2] + ff[2] * 0.35f;
+    hc.state = hang_ctl::CLIMB;
+    hang_play(hc, a, c, now, true);
+    std::printf("ledge: climb %.2f (%s)\n", dh, k_loco_names[c]);
+    return true;
+}
+
+// In the air: catch a ledge the hands can reach. True when it grabbed.
+bool hang_try_grab(hang_ctl& hc, actor_inst& a, const k2::engine::collision_world& w,
+                   const float* pos, float yaw, float vy, float horiz_speed, double now) {
+    hang_measure_grip(hc, a);
+    if (!hc.have_grip || vy > 1.5f) return false;
+    ledge_hit l;
+    // Hands reach about grip[1] above the feet; take ledges near that height.
+    if (!find_ledge(w, pos, yaw, hc.grip[1] - 0.6f, hc.grip[1] + 0.35f, l)) return false;
+    hc.ledge = l;
+    hc.state = hang_ctl::GRAB;
+    hang_play(hc, a, horiz_speed > 1.0f ? LEDGE_GRAB_HORIZ : LEDGE_GRAB_VERT, now, true);
+    std::printf("ledge: grab at %.2f\n", l.top);
+    return true;
+}
+
+// One frame while on a ledge. `local` is the input in the Prince's frame
+// (x left, z toward the wall). Returns true while it owns the body.
+// `drop` is set when he lets go.
+bool hang_update(hang_ctl& hc, actor_inst& a, const k2::engine::collision_world& w,
+                 float* pos, float& yaw, double now, const float* local, bool jump, bool& drop) {
+    drop = false;
+    if (hc.state == hang_ctl::NONE) return false;
+    const double el = now - hc.t0;
+    const double len = hang_len(a, hc.clip);
+    const double u = len > 0 ? std::min(1.0, el / len) : 1.0;
+
+    switch (hc.state) {
+    case hang_ctl::CLIMB:
+    case hang_ctl::PULL_UP: {
+        // Up first, then over: the body rises through the first two thirds
+        // of the clip and steps onto the top in the last third.
+        const double up = std::min(1.0, u / 0.66);
+        const double ov = u < 0.5 ? 0.0 : (u - 0.5) / 0.5;
+        const double su = up * up * (3.0 - 2.0 * up);
+        pos[1] = float(hc.from[1] + (hc.to[1] - hc.from[1]) * su);
+        pos[0] = float(hc.from[0] + (hc.to[0] - hc.from[0]) * ov);
+        pos[2] = float(hc.from[2] + (hc.to[2] - hc.from[2]) * ov);
+        yaw = hc.ledge.facing;
+        if (u >= 1.0) { hc.state = hang_ctl::NONE; set_clip(a, LOCO_BASE); return false; }
+        return true;
+    }
+    case hang_ctl::GRAB:
+    case hang_ctl::PULL_FAIL:
+        hang_root(hc, pos);
+        yaw = hc.ledge.facing;
+        if (u >= 1.0) { hc.state = hang_ctl::HANG; hang_play(hc, a, LEDGE_HANG, now, false); }
+        return true;
+    case hang_ctl::SHIMMY: {
+        float r[3];
+        hang_root(hc, r);
+        pos[0] = float(hc.from[0] + (r[0] - hc.from[0]) * u);
+        pos[1] = r[1];
+        pos[2] = float(hc.from[2] + (r[2] - hc.from[2]) * u);
+        yaw = hc.ledge.facing;
+        if (u >= 1.0) { hc.state = hang_ctl::HANG; hang_play(hc, a, LEDGE_HANG, now, false); }
+        return true;
+    }
+    case hang_ctl::HANG: {
+        hang_root(hc, pos);
+        yaw = hc.ledge.facing;
+        if (local[2] > 0.5f || jump) {
+            if (hc.ledge.can_stand) {
+                const float ff[3] = { std::sin(yaw), 0.0f, std::cos(yaw) };
+                for (int k = 0; k < 3; ++k) hc.from[k] = pos[k];
+                hc.to[0] = hc.ledge.edge[0] + ff[0] * 0.35f;
+                hc.to[1] = hc.ledge.top;
+                hc.to[2] = hc.ledge.edge[2] + ff[2] * 0.35f;
+                hc.state = hang_ctl::PULL_UP;
+                hang_play(hc, a, LEDGE_PULL_UP, now, true);
+            } else {
+                hc.state = hang_ctl::PULL_FAIL;
+                hang_play(hc, a, LEDGE_PULL_FAIL, now, true);
+            }
+        } else if (local[2] < -0.5f) {
+            hc.state = hang_ctl::NONE;
+            drop = true;
+            return false;
+        } else if (std::fabs(local[0]) > 0.5f) {
+            // Shimmy 0.6 (the clips' root motion) if the ledge goes on there.
+            const float sgn = local[0] > 0 ? 1.0f : -1.0f;     // + is his left
+            const float side[3] = { std::cos(yaw), 0.0f, -std::sin(yaw) };
+            float probe[3];
+            for (int k = 0; k < 3; ++k) probe[k] = pos[k] + side[k] * sgn * 0.6f;
+            const float back[3] = { -std::sin(yaw) * 0.5f, 0.0f, -std::cos(yaw) * 0.5f };
+            for (int k = 0; k < 3; ++k) probe[k] += back[k];
+            ledge_hit l;
+            const float rel = hc.ledge.top - probe[1];
+            if (find_ledge(w, probe, yaw, rel - 0.15f, rel + 0.15f, l)) {
+                for (int k = 0; k < 3; ++k) hc.from[k] = pos[k];
+                hc.ledge = l;
+                hc.ledge.facing = yaw;
+                hc.state = hang_ctl::SHIMMY;
+                hang_play(hc, a, sgn > 0 ? LEDGE_MOVE_LEFT : LEDGE_MOVE_RIGHT, now, true);
+            }
+        }
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
 // The game module, as the original structures it: `gameModule` owns a level and
 // is entered through the module manager rather than being loaded inline.
 //
@@ -3084,6 +3343,9 @@ int main(int argc, char** argv) {
     bool noscript = false;
     bool autopush = false;
     bool autojump = false;
+    bool classic  = false;
+    bool find_ledges = false;
+    std::vector<std::pair<std::string, double> > holds;   // --hold KEYS@T
     std::vector<std::string> send_args;
     const char* place_arg = 0;
     bool trapmsg  = false;
@@ -3129,6 +3391,15 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--noscript") == 0) noscript = true;
         else if (std::strcmp(argv[i], "--autopush") == 0) autopush = true;
         else if (std::strcmp(argv[i], "--autojump") == 0) autojump = true;
+        else if (std::strcmp(argv[i], "--findledges") == 0) find_ledges = true;
+        else if (std::strcmp(argv[i], "--hold") == 0 && i + 1 < argc) {
+            const std::string h = argv[++i];
+            const size_t at = h.find('@');
+            holds.push_back(std::make_pair(h.substr(0, at),
+                            at == std::string::npos ? 0.0 : std::atof(h.c_str() + at + 1)));
+        }
+        else if (std::strcmp(argv[i], "--controls") == 0 && i + 1 < argc)
+            classic = std::strcmp(argv[++i], "classic") == 0;
         else if (std::strcmp(argv[i], "--send") == 0 && i + 1 < argc) send_args.push_back(argv[++i]);
         else if (std::strcmp(argv[i], "--place") == 0 && i + 1 < argc) place_arg = argv[++i];
         else if (std::strcmp(argv[i], "--trapmsg") == 0) trapmsg = true;
@@ -3423,6 +3694,29 @@ int main(int argc, char** argv) {
                 std::printf("  no ground under the Prince within reach (spawn y %.3f)\n", p[1]);
         }
     }
+    // --findledges: list standing spots with a ledge ahead, for testing.
+    if (find_ledges) {
+        int found = 0;
+        for (float x = sc.mn[0]; x < sc.mx[0] && found < 40; x += 1.0f)
+            for (float z = sc.mn[2]; z < sc.mx[2] && found < 40; z += 1.0f) {
+                const float o[3] = { x, sc.mx[1], z };
+                const float dn[3] = { 0.0f, -1.0f, 0.0f };
+                k2::engine::pick_hit h;
+                if (!sc.coll.pick(o, dn, sc.mx[1] - sc.mn[1] + 1.0f, true, h)) continue;
+                for (int d = 0; d < 4; ++d) {
+                    const float yaw = d * 1.5707963f;
+                    ledge_hit l;
+                    if (find_ledge(sc.coll, h.point, yaw, 0.6f, 4.0f, l) && l.can_stand) {
+                        std::printf("ledge: stand (%.2f, %.2f, %.2f) yaw %d deg -> top %.2f (+%.2f)\n",
+                                    h.point[0], h.point[1], h.point[2], d * 90, l.top, l.top - h.point[1]);
+                        ++found;
+                        break;
+                    }
+                }
+            }
+        return 0;
+    }
+
     // Scripts run on game time, which starts at zero with the level.
     // Every actor answers to its spawn node's name; the Prince to "prince".
     std::vector<actor_target*> actor_msgs;
@@ -3446,6 +3740,7 @@ int main(int argc, char** argv) {
     double game_time = 0.0;
     crate_ctl crates;
     jump_ctl  jumps;
+    hang_ctl  ledges;
     bool      jump_was_down = false;
     std::printf("scripts: %zu traps, %zu areas, %zu plates%s\n", sc.traps.size(),
                 sc.areas.size(), sc.plates.size(),
@@ -3509,6 +3804,11 @@ int main(int argc, char** argv) {
                     if (e.k == plat::KEY_F && !input_locked) {
                         follow_mode = !follow_mode;
                         std::printf("camera: %s\n", follow_mode ? "follow" : "free-fly");
+                        std::fflush(stdout);
+                    }
+                    if (e.k == plat::KEY_C) {
+                        classic = !classic;
+                        std::printf("controls: %s\n", classic ? "classic" : "modern");
                         std::fflush(stdout);
                     }
                     if (e.k == plat::KEY_T) {
@@ -3602,12 +3902,80 @@ int main(int argc, char** argv) {
                 if (!sc.actors[i].is_enemy) { player = &sc.actors[i]; break; }
         }
 
-        float mv[3] = {0.0f, 0.0f, 0.0f};
+        // --hold KEYS@T: headless input. Letters, or ' ' for Space, held from
+        // game time T on.
+        for (size_t i = 0; i < holds.size(); ++i) {
+            if (game_time < holds[i].second) continue;
+            for (size_t c = 0; c < holds[i].first.size(); ++c) {
+                const char ch = holds[i].first[c];
+                if (ch >= 'A' && ch <= 'Z') down[plat::KEY_A + (ch - 'A')] = true;
+                if (ch == '_') down[plat::KEY_SPACE] = true;
+            }
+        }
+
+        // --- input -------------------------------------------------------
+        // Keyboard and the first gamepad, folded into one stick, buttons and a
+        // camera look. Two schemes map the stick onto the Prince:
+        //   Modern (default): the stick moves him relative to the camera, and
+        //     the camera is the player's own - mouse drag or right stick.
+        //   Classic: the original's tank controls - up walks the way he faces,
+        //     down walks backwards, left/right turn him - and the camera stays
+        //     behind him.
+        plat::pad_state pad;
+        plat::pad_poll(pad);
+        float in_x = 0.0f, in_y = 0.0f;                 // stick: x right, y forward
+        bool  pad_run = false;
         if (!(player && snoozed)) {
-        if (down[plat::KEY_W] || autowalk) for (int a = 0; a < 3; ++a) mv[a] += fwd[a];
-        if (down[plat::KEY_S]) for (int a = 0; a < 3; ++a) mv[a] -= fwd[a];
-        if (down[plat::KEY_D]) for (int a = 0; a < 3; ++a) mv[a] += right[a];
-        if (down[plat::KEY_A]) for (int a = 0; a < 3; ++a) mv[a] -= right[a];
+            if (down[plat::KEY_W] || down[plat::KEY_UP] || autowalk) in_y += 1.0f;
+            if (down[plat::KEY_S] || down[plat::KEY_DOWN])           in_y -= 1.0f;
+            if (down[plat::KEY_D] || down[plat::KEY_RIGHT])          in_x += 1.0f;
+            if (down[plat::KEY_A] || down[plat::KEY_LEFT])           in_x -= 1.0f;
+            if (pad.connected) {
+                float lx = pad.axis[plat::PAD_AXIS_LX], ly = pad.axis[plat::PAD_AXIS_LY];
+                const float lm = std::sqrt(lx * lx + ly * ly);
+                if (lm > 0.2f) {
+                    in_x += lx; in_y += ly;
+                    pad_run = lm > 0.85f;           // a full push runs, part walks
+                }
+                if (pad.button[plat::PAD_DPAD_UP])    in_y += 1.0f;
+                if (pad.button[plat::PAD_DPAD_DOWN])  in_y -= 1.0f;
+                if (pad.button[plat::PAD_DPAD_RIGHT]) in_x += 1.0f;
+                if (pad.button[plat::PAD_DPAD_LEFT])  in_x -= 1.0f;
+            }
+        }
+        {
+            const float m = std::sqrt(in_x * in_x + in_y * in_y);
+            if (m > 1.0f) { in_x /= m; in_y /= m; }
+        }
+        // Right stick: the camera, unless a cutscene holds it.
+        if (pad.connected && !input_locked) {
+            const float rx = pad.axis[plat::PAD_AXIS_RX], ry = pad.axis[plat::PAD_AXIS_RY];
+            if (std::fabs(rx) > 0.15f) cam.yaw   += rx * 2.6f * dt;
+            if (std::fabs(ry) > 0.15f) cam.pitch += ry * 1.6f * dt;
+            if (cam.pitch >  1.2f) cam.pitch =  1.2f;
+            if (cam.pitch < -1.2f) cam.pitch = -1.2f;
+        }
+
+        float mv[3] = {0.0f, 0.0f, 0.0f};
+        bool  walk_back = false;                        // Classic: S walks backwards
+        if (player && classic) {
+            // Tank controls: left/right turn, up/down along his facing.
+            if (std::fabs(in_x) > 0.2f && player->scripted == 0 && crates.state == crate_ctl::NONE &&
+                ledges.state == hang_ctl::NONE && jumps.state == jump_ctl::NONE)
+                player_yaw -= in_x * 2.6f * dt;
+            const float pf[3] = { std::sin(player_yaw), 0.0f, std::cos(player_yaw) };
+            if (in_y > 0.2f)       for (int a = 0; a < 3; ++a) mv[a] = pf[a] * in_y;
+            else if (in_y < -0.2f) { for (int a = 0; a < 3; ++a) mv[a] = pf[a] * in_y; walk_back = true; }
+        } else {
+            // Camera-relative, on the ground plane.
+            float fl[3] = { fwd[0], 0.0f, fwd[2] };
+            const float fm = std::sqrt(fl[0] * fl[0] + fl[2] * fl[2]);
+            if (fm > 1e-5f) { fl[0] /= fm; fl[2] /= fm; }
+            for (int a = 0; a < 3; ++a) mv[a] = fl[a] * in_y + right[a] * in_x;
+            if (!player) {
+                // Free-fly keeps the camera's own pitch.
+                for (int a = 0; a < 3; ++a) mv[a] = fwd[a] * in_y + right[a] * in_x;
+            }
         }
 
         if (player) {
@@ -3616,69 +3984,113 @@ int main(int argc, char** argv) {
             mv[1] = 0.0f;
             const float ml = std::sqrt(mv[0]*mv[0] + mv[2]*mv[2]);
             k2::engine::transform& lt = player->node->local;
-            const bool run = autorun || down[plat::KEY_LSHIFT] || down[plat::KEY_RSHIFT];
-            // Crates take over the body while one is held: E grabs and holds,
-            // W pushes, S pulls (see update_crate). Space jumps.
-            const bool act  = !snoozed && (down[plat::KEY_E] || autopush);
-            const bool push = !snoozed && (down[plat::KEY_W] || autopush);
-            const bool pull = !snoozed && down[plat::KEY_S];
-            const bool scripted_now = player->scripted != 0;
-            // Jump: Space, edge-triggered, from the ground and not mid-crate.
-            const bool jump_key = !snoozed && (down[plat::KEY_SPACE] || autojump);
-            if (jump_key && !jump_was_down && !scripted_now && crates.state == crate_ctl::NONE &&
-                jumps.state == jump_ctl::NONE && player_vy == 0.0f) {
-                const float pf[3] = { std::sin(player_yaw), 0.0f, std::cos(player_yaw) };
-                const float ps[3] = { std::cos(player_yaw), 0.0f, -std::sin(player_yaw) };
-                float local[3] = { 0.0f, 0.0f, 0.0f };
-                if (ml > 1e-6f) {
-                    local[0] = (mv[0] * ps[0] + mv[2] * ps[2]) / ml;
-                    local[2] = (mv[0] * pf[0] + mv[2] * pf[2]) / ml;
-                }
-                const bool running = run && ml > 1e-6f && player->clip == LOCO_RUN;
-                jump_start(jumps, *player, running, local, game_time, lt.translate);
+            const bool run = autorun || down[plat::KEY_LSHIFT] || down[plat::KEY_RSHIFT] || pad_run ||
+                             (pad.connected && (pad.button[plat::PAD_RSHOULDER] ||
+                                                pad.axis[plat::PAD_AXIS_RTRIGGER] > 0.5f));
+            // The input in the Prince's own frame: x his left, z ahead.
+            const float pf[3] = { std::sin(player_yaw), 0.0f, std::cos(player_yaw) };
+            const float ps[3] = { std::cos(player_yaw), 0.0f, -std::sin(player_yaw) };
+            float local[3] = { 0.0f, 0.0f, 0.0f };
+            if (classic) { local[0] = -in_x; local[2] = in_y; }
+            else if (ml > 1e-6f) {
+                local[0] = (mv[0] * ps[0] + mv[2] * ps[2]) / std::max(ml, 1.0f);
+                local[2] = (mv[0] * pf[0] + mv[2] * pf[2]) / std::max(ml, 1.0f);
             }
+            // E / pad X acts (grab a crate and hold, talk); Space / pad A jumps.
+            const bool act  = !snoozed && (down[plat::KEY_E] || autopush ||
+                                           (pad.connected && pad.button[plat::PAD_X]));
+            const bool push = !snoozed && (local[2] > 0.5f || autopush);
+            const bool pull = !snoozed && local[2] < -0.5f;
+            const bool scripted_now = player->scripted != 0;
+            const bool jump_key = !snoozed && (down[plat::KEY_SPACE] || autojump ||
+                                               (pad.connected && pad.button[plat::PAD_A]));
+            const bool jump_pressed = jump_key && !jump_was_down;
             jump_was_down = jump_key;
-            const bool in_jump = !scripted_now &&
+
+            // Ledges first: hanging and climbing own the body.
+            bool dropped = false;
+            const bool on_ledge = !scripted_now &&
+                hang_update(ledges, *player, sc.coll, lt.translate, player_yaw, game_time,
+                            local, jump_pressed, dropped);
+            if (dropped) {
+                // Let go: fall from the hang, landing as from a jump up.
+                jumps.state = jump_ctl::AIR;
+                jumps.dir = 0;
+                jumps.vel[0] = jumps.vel[1] = jumps.vel[2] = 0.0f;
+                jumps.peak_y = lt.translate[1];
+                jump_begin(jumps, *player, FALL_VERT, game_time, lt.translate);
+            }
+            if (!on_ledge && jump_pressed && !scripted_now && crates.state == crate_ctl::NONE &&
+                jumps.state == jump_ctl::NONE && player_vy == 0.0f) {
+                // A ledge in front decides what the jump button does: climb a
+                // low one, jump up to catch a high one, else an ordinary jump.
+                if (!hang_try_climb(ledges, *player, sc.coll, lt.translate, player_yaw, game_time)) {
+                    const bool running = run && ml > 1e-6f && player->clip == LOCO_RUN;
+                    float jl[3] = { local[0], 0.0f, local[2] };
+                    hang_measure_grip(ledges, *player);
+                    ledge_hit high;
+                    if (!running && ledges.have_grip &&
+                        find_ledge(sc.coll, lt.translate, player_yaw, 2.0f, ledges.grip[1] + 2.4f, high)) {
+                        player_yaw = high.facing;
+                        jl[0] = jl[2] = 0.0f;                       // straight up, toward it
+                    }
+                    jump_start(jumps, *player, running, jl, game_time, lt.translate);
+                }
+            }
+            bool in_jump = !scripted_now && !on_ledge && ledges.state == hang_ctl::NONE &&
                 jump_update(jumps, *player, sc.coll, lt.translate, player_yaw, game_time, dt);
-            const bool in_crate = !scripted_now && !in_jump &&
+            // In the air, the hands catch any ledge in reach.
+            if (in_jump && jumps.state == jump_ctl::AIR) {
+                const float hs = std::sqrt(jumps.vel[0] * jumps.vel[0] + jumps.vel[2] * jumps.vel[2]);
+                if (hang_try_grab(ledges, *player, sc.coll, lt.translate, player_yaw,
+                                  jumps.vel[1], hs, game_time)) {
+                    jumps.state = jump_ctl::NONE;
+                    in_jump = false;
+                }
+            }
+            const bool busy = on_ledge || ledges.state != hang_ctl::NONE;
+            const bool in_crate = !scripted_now && !in_jump && !busy &&
                                   update_crate(crates, sc, *player, lt.translate, player_yaw,
                                                game_time, act, push, pull);
-            if (scripted_now || in_jump) {
-                // A scripted skill or a jump owns the body: no walking, no gravity.
+            if (scripted_now || in_jump || busy) {
+                // A scripted skill, a jump or a ledge owns the body.
             } else if (in_crate) {
                 crate_input(crates, sc, *player, lt.translate, player_yaw, game_time, act, push, pull);
             } else if (ml > 1e-6f) {
                 // Walk_L or Running_L, moved at the speed its own root motion
-                // covers, so the feet do not slide. Without the clip, the old
-                // fixed speeds stand in.
-                const int clip = run ? LOCO_RUN : LOCO_WALK;
+                // covers, so the feet do not slide. Classic's back step plays
+                // WalkBackwards_L1 and keeps his facing.
+                const int clip = walk_back ? WALK_BACK : (run ? LOCO_RUN : LOCO_WALK);
                 set_clip(*player, clip);
                 float speed = walk_speed * (run ? 2.5f : 1.0f);
+                if (walk_back) speed = walk_speed * 0.6f;
                 float fwd_model[3] = {0.0f, 0.0f, 1.0f};
                 if (player->clip == clip) {
                     const assets::skl_file& s = player->loco[size_t(clip)];
                     const float cs = clip_speed(s);
                     if (cs > 0.0f) speed = cs;
                     float d[3];
-                    if (clip_root_motion(s, d) && (d[0]*d[0] + d[2]*d[2]) > 1e-8f)
+                    if (!walk_back && clip_root_motion(s, d) && (d[0]*d[0] + d[2]*d[2]) > 1e-8f)
                         { fwd_model[0] = d[0]; fwd_model[2] = d[2]; }
                 }
+                // A partly pushed stick walks slower.
+                const float amount = std::min(1.0f, ml);
+                const float step = speed * dt * (run ? 1.0f : std::max(0.35f, amount));
                 if (noclip) {
-                    lt.translate[0] += mv[0] / ml * speed * dt;
-                    lt.translate[2] += mv[2] / ml * speed * dt;
+                    lt.translate[0] += mv[0] / ml * step;
+                    lt.translate[2] += mv[2] / ml * step;
                 } else {
-                    move_horizontal(sc.coll, lt.translate,
-                                    mv[0] / ml * speed * dt, mv[2] / ml * speed * dt);
+                    move_horizontal(sc.coll, lt.translate, mv[0] / ml * step, mv[2] / ml * step);
                 }
-                // Face the way he is going: choose yaw so that set_yaw carries
-                // the model's forward axis onto the travel direction. set_yaw
-                // adds yaw to atan2(x, z), hence the difference of two angles.
-                player_yaw = std::atan2(mv[0], mv[2]) - std::atan2(fwd_model[0], fwd_model[2]);
+                // Modern: face the way he is going. set_yaw adds yaw to
+                // atan2(x, z), hence the difference of two angles.
+                if (!classic)
+                    player_yaw = std::atan2(mv[0], mv[2]) - std::atan2(fwd_model[0], fwd_model[2]);
             } else {
                 set_clip(*player, LOCO_BASE);
             }
             // Stand on the floor, step up small ledges, fall off edges.
-            if (!noclip && !scripted_now && !in_jump) {
+            if (!noclip && !scripted_now && !in_jump && !busy) {
                 float gy;
                 if (player_vy <= 0.0f && ground_under(sc.coll, lt.translate, gy)) {
                     lt.translate[1] = gy;
@@ -3696,6 +4108,14 @@ int main(int argc, char** argv) {
                         lt.translate[1] -= drop;
                     }
                 }
+            }
+            // Classic: the camera keeps behind him.
+            if (classic && !input_locked) {
+                const float want = 3.14159265f - player_yaw;
+                float dyw = std::fmod(want - cam.yaw + 3.14159265f, 6.2831853f);
+                if (dyw < 0) dyw += 6.2831853f;
+                dyw -= 3.14159265f;
+                cam.yaw += dyw * std::min(1.0f, dt * 3.0f);
             }
             lt.set_yaw(player_yaw);
             sc.root->update_world();

@@ -113,6 +113,16 @@ void shutdown();
 // Pops one queued event. Returns false when the queue is empty this frame.
 bool poll_event(event& out);
 
+// The first connected gamepad, polled. Sticks are -1..1 with y up, triggers
+// 0..1; `connected` is false when there is none. Polling rather than events:
+// a game reads sticks every frame anyway.
+struct pad_state {
+    bool  connected;
+    float axis[PAD_AXIS_COUNT];
+    bool  button[PAD_BUTTON_COUNT];
+};
+void pad_poll(pad_state& out);
+
 // Present. Blocks for vsync when config::vsync was set.
 void swap_buffers();
 
