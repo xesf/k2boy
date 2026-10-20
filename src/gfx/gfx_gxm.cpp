@@ -526,10 +526,31 @@ bool init(gl_proc_loader) {
     ip.parameterBufferSize = SCE_GXM_DEFAULT_PARAMETER_BUFFER_SIZE;
     if (sceGxmInitialize(&ip) < 0) { std::printf("gxm: initialize failed\n"); return false; }
 
-    if (!g_vram.init(SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW, 96 * 1024 * 1024) ||
-        !g_ram.init(SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE, 64 * 1024 * 1024)) {
-        std::printf("gxm: could not reserve GPU memory\n");
-        return false;
+    // As much as the system will give, within these limits: what is free
+    // depends on the firmware, plugins and the newlib heap.
+    {
+        SceKernelFreeMemorySizeInfo fm;
+        std::memset(&fm, 0, sizeof(fm));
+        fm.size = sizeof(fm);
+        sceKernelGetFreeMemorySize(&fm);
+        std::printf("gxm: free memory: main %d MB, CDRAM %d MB, phycont %d MB\n",
+                    fm.size_user >> 20, fm.size_cdram >> 20, fm.size_phycont >> 20);
+        const size_t MB = 1024 * 1024;
+        // Leave room for what GXM and the shader patcher still allocate as
+        // their own memblocks (USSE code, the render target's driver data).
+        size_t v = 96 * MB, r = 64 * MB;
+        if (fm.size_cdram > 0 && size_t(fm.size_cdram) < v + 8 * MB)
+            v = fm.size_cdram > int(24 * MB) ? (size_t(fm.size_cdram) - 8 * MB) & ~(MB - 1) : 16 * MB;
+        if (fm.size_user > 0 && size_t(fm.size_user) < r + 16 * MB)
+            r = fm.size_user > int(32 * MB) ? (size_t(fm.size_user) - 16 * MB) & ~(MB - 1) : 16 * MB;
+        while (v >= 16 * MB && !g_vram.init(SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW, v)) v -= 8 * MB;
+        while (r >= 16 * MB && !g_ram.init(SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE, r)) r -= 8 * MB;
+        if (!g_vram.base || !g_ram.base) {
+            std::printf("gxm: could not reserve GPU memory (CDRAM %s, main %s)\n",
+                        g_vram.base ? "ok" : "none", g_ram.base ? "ok" : "none");
+            return false;
+        }
+        std::printf("gxm: GPU heaps: CDRAM %u MB, main %u MB\n", unsigned(v / MB), unsigned(r / MB));
     }
 
     // Context and its rings.
