@@ -1851,7 +1851,10 @@ public:
     }
 
     void start_ambient() {
-        if (m_sound.empty() || !ensure_sound(m_sound)) return;
+        // Only positional loops are ambiences (TortureAmbients). A non-
+        // positional one (piss_sound) waits for its script's "play"; started
+        // with the level it played everywhere, all the time.
+        if (!m_positional || m_sound.empty() || !ensure_sound(m_sound)) return;
         m_voice = play_sound(m_sound, m_positional ? m_pos : 0, m_radius, true);
     }
 
@@ -3368,17 +3371,15 @@ struct hang_ctl {
     }
 };
 
-// Where the grip joints sit in the hang pose, relative to the root: pose
-// LedgeHangBase_M at t = 0 and read LGrip/RGrip. Cached in `hc`.
-void hang_measure_grip(hang_ctl& hc, actor_inst& a) {
-    if (hc.have_grip || !a.loco_ok[LEDGE_HANG]) return;
-    const assets::skl_file& s = a.loco[LEDGE_HANG];
+// Where the hands (LGrip/RGrip, averaged) are in a clip's pose at time t,
+// in the actor's own frame. False without grip joints.
+bool clip_grip(actor_inst& a, const assets::skl_file& s, uint32_t t, float* out) {
     std::vector<k2::engine::transform> keep = a.joint_local_cur;
     const size_t n = std::min(a.joint_local_cur.size(), s.joints.size());
     for (size_t j = 0; j < n; ++j) {
         if (!s.joints[j].present) continue;
         float pos[3], q[4];
-        assets::skl_sample(s.joints[j].path, 0, true, pos, q);
+        assets::skl_sample(s.joints[j].path, t, true, pos, q);
         if (j == 0) for (int k = 0; k < 3; ++k) pos[k] = a.joint_local_bind[0].translate[k];
         transform_from_pos_quat(pos, q, a.joint_local_cur[j]);
     }
@@ -3392,9 +3393,16 @@ void hang_measure_grip(hang_ctl& hc, actor_inst& a) {
         }
     a.joint_local_cur = keep;
     pose_actor(a);
-    if (!cnt) return;
-    for (int k = 0; k < 3; ++k) hc.grip[k] = sum[k] / float(cnt);
-    hc.have_grip = true;
+    if (!cnt) return false;
+    for (int k = 0; k < 3; ++k) out[k] = sum[k] / float(cnt);
+    return true;
+}
+
+// Where the grip joints sit in the hang pose, relative to the root: pose
+// LedgeHangBase_M at t = 0 and read LGrip/RGrip. Cached in `hc`.
+void hang_measure_grip(hang_ctl& hc, actor_inst& a) {
+    if (hc.have_grip || !a.loco_ok[LEDGE_HANG]) return;
+    hc.have_grip = clip_grip(a, a.loco[LEDGE_HANG], 0, hc.grip);
 }
 
 // Root position that puts the grip on the ledge edge, facing the wall.
@@ -3426,13 +3434,24 @@ bool hang_try_climb(hang_ctl& hc, actor_inst& a, const k2::engine::collision_wor
                     const float* pos, float& yaw, double now) {
     if (!a.loco_ok[HOP_SMALL]) return false;
     ledge_hit l;
-    if (!find_ledge(w, pos, yaw, 0.3f, 2.25f, l) || !l.can_stand) return false;
+    // The original hops onto anything up to 2 m (0x4B46C2); higher ledges
+    // are jumped at and caught.
+    if (!find_ledge(w, pos, yaw, 0.3f, 2.0f, l) || !l.can_stand) return false;
     const float dh = l.top - pos[1];
     const int c = dh > 1.75f ? HOP_2M : dh > 1.3f ? HOP_1_5M : dh > 0.9f ? HOP_1M : HOP_SMALL;
     hc.ledge = l;
     yaw = l.facing;
     const float ff[3] = { std::sin(yaw), 0.0f, std::cos(yaw) };
-    for (int k = 0; k < 3; ++k) hc.from[k] = pos[k];
+    // Start where the clip expects him: its root travel ends him 0.35 past
+    // the edge, so he begins that travel short of it.
+    float travel = 0.5f;
+    if (a.loco_ok[size_t(c)]) {
+        float d[3];
+        if (clip_root_motion(a.loco[size_t(c)], d)) travel = std::sqrt(d[0] * d[0] + d[2] * d[2]);
+    }
+    hc.from[0] = l.edge[0] - ff[0] * (travel - 0.35f);
+    hc.from[1] = pos[1];
+    hc.from[2] = l.edge[2] - ff[2] * (travel - 0.35f);
     hc.to[0] = l.edge[0] + ff[0] * 0.35f;
     hc.to[1] = l.top;
     hc.to[2] = l.edge[2] + ff[2] * 0.35f;
@@ -3451,6 +3470,7 @@ bool hang_try_grab(hang_ctl& hc, actor_inst& a, const k2::engine::collision_worl
     // Hands reach about grip[1] above the feet; take ledges near that height.
     if (!find_ledge(w, pos, yaw, hc.grip[1] - 0.6f, hc.grip[1] + 0.35f, l)) return false;
     hc.ledge = l;
+    for (int k = 0; k < 3; ++k) hc.from[k] = pos[k];
     hc.state = hang_ctl::GRAB;
     hang_play(hc, a, horiz_speed > 1.0f ? LEDGE_GRAB_HORIZ : LEDGE_GRAB_VERT, now, true);
     std::printf("ledge: grab at %.2f\n", l.top);
@@ -3471,10 +3491,11 @@ bool hang_update(hang_ctl& hc, actor_inst& a, const k2::engine::collision_world&
     switch (hc.state) {
     case hang_ctl::CLIMB:
     case hang_ctl::PULL_UP: {
-        // Up first, then over: the body rises through the first two thirds
-        // of the clip and steps onto the top in the last third.
-        const double up = std::min(1.0, u / 0.66);
-        const double ov = u < 0.5 ? 0.0 : (u - 0.5) / 0.5;
+        // Up first, then over: the body rises through the first 60% of the
+        // clip and only then steps onto the top, so it never passes through
+        // the lip.
+        const double up = std::min(1.0, u / 0.6);
+        const double ov = u < 0.6 ? 0.0 : (u - 0.6) / 0.4;
         const double su = up * up * (3.0 - 2.0 * up);
         pos[1] = float(hc.from[1] + (hc.to[1] - hc.from[1]) * su);
         pos[0] = float(hc.from[0] + (hc.to[0] - hc.from[0]) * ov);
@@ -3484,11 +3505,17 @@ bool hang_update(hang_ctl& hc, actor_inst& a, const k2::engine::collision_world&
         return true;
     }
     case hang_ctl::GRAB:
-    case hang_ctl::PULL_FAIL:
-        hang_root(hc, pos);
+    case hang_ctl::PULL_FAIL: {
+        // Catching: blend from where the hands met the edge into the hang
+        // over the first fifth of the clip.
+        float r[3];
+        hang_root(hc, r);
+        const double b = std::min(1.0, u / 0.2);
+        for (int k = 0; k < 3; ++k) pos[k] = float(hc.from[k] + (r[k] - hc.from[k]) * b);
         yaw = hc.ledge.facing;
         if (u >= 1.0) { hc.state = hang_ctl::HANG; hang_play(hc, a, LEDGE_HANG, now, false); }
         return true;
+    }
     case hang_ctl::SHIMMY: {
         float r[3];
         hang_root(hc, r);
@@ -4800,8 +4827,17 @@ int main(int argc, char** argv) {
                     ledge_hit high;
                     if (!running && ledges.have_grip &&
                         find_ledge(sc.coll, lt.translate, player_yaw, 2.0f, ledges.grip[1] + 2.4f, high)) {
+                        // Line up under where he will hang, square to the
+                        // wall, and jump straight up: the hands then meet the
+                        // edge where the hang puts them.
                         player_yaw = high.facing;
-                        jl[0] = jl[2] = 0.0f;                       // straight up, toward it
+                        hang_ctl probe = ledges;
+                        probe.ledge = high;
+                        float hr[3];
+                        hang_root(probe, hr);
+                        float dx = hr[0] - lt.translate[0], dz = hr[2] - lt.translate[2];
+                        if (dx * dx + dz * dz < 1.0f) move_horizontal(sc.coll, lt.translate, dx, dz);
+                        jl[0] = jl[2] = 0.0f;
                     }
                     jump_start(jumps, *player, running, jl, game_time, lt.translate);
                 }
