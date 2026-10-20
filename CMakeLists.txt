@@ -28,6 +28,7 @@ set(K2_SOURCES
     src/assets/act.cpp
     src/assets/skl.cpp
     src/assets/sfx.cpp
+    src/assets/nif.cpp
     src/engine/module.cpp
     src/engine/nirtti.cpp
     src/engine/actor.cpp

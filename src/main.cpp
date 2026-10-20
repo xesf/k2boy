@@ -20,6 +20,7 @@
 #include "engine/mixer.h"
 #include "engine/fight.h"
 #include "assets/sfx.h"
+#include "assets/nif.h"
 
 #include <cstdio>
 #include <cstring>
@@ -4650,6 +4651,7 @@ int main(int argc, char** argv) {
     bool autorun  = false;
     bool noanim   = false;
     bool noclip   = false;
+    bool nif_check = false;      // parse every .nif in the install and report
     bool noscript = false;
     bool autopush = false;
     bool autojump = false;
@@ -4703,6 +4705,7 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--noanim") == 0) noanim = true;
         else if (std::strcmp(argv[i], "--noclip") == 0) noclip = true;
         else if (std::strcmp(argv[i], "--noscript") == 0) noscript = true;
+        else if (std::strcmp(argv[i], "--nifcheck") == 0) nif_check = true;
         else if (std::strcmp(argv[i], "--autopush") == 0) autopush = true;
         else if (std::strcmp(argv[i], "--autojump") == 0) autojump = true;
         else if (std::strcmp(argv[i], "--findledges") == 0) find_ledges = true;
@@ -4755,6 +4758,32 @@ int main(int argc, char** argv) {
                      "usage: k2boy [--verify] [path-to-retail-install]\n",
                      data_root);
         return 1;
+    }
+    if (nif_check) {
+        std::vector<std::string> nifs;
+        plat::fs_list_paths_by_extension(".nif", nifs);
+        int whole = 0;
+        for (size_t i = 0; i < nifs.size(); ++i) {
+            size_t size = 0;
+            uint8_t* d = plat::fs_read(nifs[i].c_str(), size);
+            if (!d) continue;
+            assets::nif_file nf;
+            std::string err;
+            assets::nif_parse(d, size, nf, &err);
+            plat::fs_free(d);
+            size_t psys = 0, shapes = 0, images = 0;
+            for (size_t k = 0; k < nf.blocks.size(); ++k) {
+                psys += nf.blocks[k].kind == assets::nif_block::PSYS;
+                shapes += nf.blocks[k].kind == assets::nif_block::SHAPE;
+                images += nf.blocks[k].kind == assets::nif_block::RAW_IMAGE;
+            }
+            whole += nf.complete;
+            std::printf("nif %-48s %4zu blocks %2zu psys %2zu shapes %2zu images %s%s\n", nifs[i].c_str(),
+                        nf.blocks.size(), psys, shapes, images, nf.complete ? "ok" : "stopped at ",
+                        nf.complete ? "" : nf.stopped_at.c_str());
+        }
+        std::printf("nif: %d of %zu read whole\n", whole, nifs.size());
+        return 0;
     }
     verify_data();
     verify_rtti();
