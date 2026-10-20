@@ -30,6 +30,9 @@ set(K2_SOURCES
     src/assets/sfx.cpp
     src/assets/nif.cpp
     src/gfx/ttf.cpp
+    src/media/xf_compat.cpp
+    src/media/inflate.cpp
+    src/media/mov.cpp
     src/engine/module.cpp
     src/engine/nirtti.cpp
     src/engine/actor.cpp

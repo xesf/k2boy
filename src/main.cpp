@@ -22,6 +22,7 @@
 #include "assets/sfx.h"
 #include "assets/nif.h"
 #include "gfx/ttf.h"
+#include "media/mov.h"
 
 #include <cstdio>
 #include <cstring>
@@ -5109,6 +5110,7 @@ int main(int argc, char** argv) {
     bool noanim   = false;
     bool noclip   = false;
     bool nif_check = false;
+    bool mov_info = false;       // list every movie's tracks and codecs
     const char* text_test = 0;   // render a string in Tsunami.ttf to a .bmp      // parse every .nif in the install and report
     bool noscript = false;
     bool autopush = false;
@@ -5164,6 +5166,7 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--noclip") == 0) noclip = true;
         else if (std::strcmp(argv[i], "--noscript") == 0) noscript = true;
         else if (std::strcmp(argv[i], "--nifcheck") == 0) nif_check = true;
+        else if (std::strcmp(argv[i], "--movinfo") == 0) mov_info = true;
         else if (std::strcmp(argv[i], "--texttest") == 0 && i + 1 < argc) text_test = argv[++i];
         else if (std::strcmp(argv[i], "--autopush") == 0) autopush = true;
         else if (std::strcmp(argv[i], "--autojump") == 0) autojump = true;
@@ -5246,6 +5249,27 @@ int main(int argc, char** argv) {
         }
         write_bmp(text_test, w, h, &img[0]);
         std::printf("text: wrote %s\n", text_test);
+        return 0;
+    }
+    if (mov_info) {
+        std::vector<std::string> movs;
+        plat::fs_list_paths_by_extension(".mov", movs);
+        for (size_t i = 0; i < movs.size(); ++i) {
+            media::xf_mov mv;
+            std::memset(&mv, 0, sizeof(mv));
+            if (media::xf_mov_open(&mv, movs[i].c_str()) != 0) { std::printf("mov %s: unreadable\n", movs[i].c_str()); continue; }
+            std::printf("mov %-24s %u tracks, %.1f s\n", movs[i].c_str(), mv.track_count,
+                        mv.timescale ? double(mv.duration) / mv.timescale : 0.0);
+            for (uint32_t t = 0; t < mv.track_count; ++t) {
+                const media::xf_mov_track& tr = mv.tracks[t];
+                char cc[5];
+                std::printf("    %s %s %ux%u %u Hz %uch, %u samples\n",
+                            tr.kind == media::XF_TRACK_VIDEO ? "video" : tr.kind == media::XF_TRACK_AUDIO ? "audio" : "other",
+                            media::xf_fourcc_str(tr.codec, cc), tr.width, tr.height, tr.sample_rate, tr.channels,
+                            tr.sample_count);
+            }
+            media::xf_mov_close(&mv);
+        }
         return 0;
     }
     if (nif_check) {
