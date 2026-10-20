@@ -2928,9 +2928,14 @@ void spawn_level_actors(scene& sc, k2::engine::body_table& bodies,
         }
 
         std::string err;
+        // The trap's pivot - its node's position - is where he stands. The
+        // box can be much larger than the body: an EnemyStart's volume is
+        // the ground he covers (P4G1's spans 18 units, its centre 7 from his
+        // bed), and its centre is not him.
+        const float* at = t.pivot;
         const int32_t id = k2::engine::spawn_actor(
             bodies, spawns, is_enemy, body,
-            t.center[0], t.center[1], t.center[2], t.pivot_angle,
+            at[0], at[1], at[2], t.pivot_angle,
             is_enemy ? want : std::string("Prince"), &err);
         if (id < 0) { std::printf("  spawn refused (%s): %s\n", want.c_str(), err.c_str()); continue; }
 
@@ -2943,9 +2948,9 @@ void spawn_level_actors(scene& sc, k2::engine::body_table& bodies,
         an->body = body;
         an->is_enemy = is_enemy;
         an->local.set_yaw(t.pivot_angle);
-        an->local.translate[0] = t.center[0];
-        an->local.translate[1] = t.center[1];
-        an->local.translate[2] = t.center[2];
+        an->local.translate[0] = at[0];
+        an->local.translate[1] = at[1];
+        an->local.translate[2] = at[2];
         sc.root->add_child(an);
 
         actor_inst inst;
