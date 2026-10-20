@@ -14,6 +14,7 @@
 #include "engine/config.h"
 #include "engine/module_table.h"
 #include "engine/module.h"
+#include "engine/collision.h"
 
 #include <cstdio>
 #include <cstring>
@@ -641,9 +642,22 @@ struct actor_inst {
     std::vector<k2::engine::transform> cur;
     bool                              skinned;
 
+    // Locomotion clips, indexed by loco_clip. `clip` is the one playing, -1 for
+    // none; `clip_ms` is its play head.
+    std::vector<assets::skl_file>     loco;
+    std::vector<bool>                 loco_ok;
+    int                               clip;
+    double                            clip_ms;
+
     actor_inst() : node(0), is_enemy(false), first_item(0), item_count(0),
-                   skinned(false) {}
+                   skinned(false), clip(-1), clip_ms(0.0) {}
 };
+
+// The original's locomotion set, in the order of its name table at 0x749C30:
+// { "BasePose_L", "Running_L", "Walk_L", "AmbientType_G" }. AmbientType_G is a
+// stem that gets a random 1..6 suffix (see 0x4BDDA4), so it is not loaded here.
+enum loco_clip { LOCO_BASE = 0, LOCO_RUN, LOCO_WALK, LOCO_COUNT };
+const char* const k_loco_names[LOCO_COUNT] = { "BasePose_L", "Running_L", "Walk_L" };
 
 
 struct scene {
@@ -659,6 +673,9 @@ struct scene {
     // PrinceStart / EnemyStart trap blocks found in the rooms. argv[0] is the
     // body name (Traps.txt); centre and pivot angle give the placement.
     std::vector<assets::k2a_trap> spawn_points;
+    // Static room triangles, for the pick primitive (0x512183). Actor bodies
+    // and trigger volumes are not in it.
+    k2::engine::collision_world coll;
     float mn[3];
     float mx[3];
     bool  empty;
@@ -929,6 +946,134 @@ void pose_actor(actor_inst& a) {
     }
 }
 
+void transform_from_pos_quat(const float* pos, const float* q, k2::engine::transform& t) {
+    const float w = q[0], x = q[1], y = q[2], z = q[3];
+    t.rotate[0]=1-2*(y*y+z*z); t.rotate[1]=  2*(x*y-w*z); t.rotate[2]=  2*(x*z+w*y);
+    t.rotate[3]=  2*(x*y+w*z); t.rotate[4]=1-2*(x*x+z*z); t.rotate[5]=  2*(y*z-w*x);
+    t.rotate[6]=  2*(x*z-w*y); t.rotate[7]=  2*(y*z+w*x); t.rotate[8]=1-2*(x*x+y*y);
+    for (int k = 0; k < 3; ++k) t.translate[k] = pos[k];
+    t.scale = 1.0f;
+}
+
+// Length of one cycle in ms. The skill stores it (Skil +0x80); a clip without
+// it falls back to its longest joint path.
+uint32_t clip_length_ms(const assets::skl_file& s) {
+    if (s.duration_ms) return s.duration_ms;
+    uint32_t len = 0;
+    for (size_t j = 0; j < s.joints.size(); ++j) {
+        const assets::skl_joint_path& p = s.joints[j].path;
+        if (s.joints[j].present && p.frames * p.interval_ms > len) len = p.frames * p.interval_ms;
+    }
+    return len;
+}
+
+// Root motion: how far joint 0 travels in one cycle, in its parent's space.
+// Locomotion clips carry the actor's travel in the root's track, so this is
+// both the walk direction in model space and, over the clip length, its speed.
+bool clip_root_motion(const assets::skl_file& s, float* delta) {
+    if (s.joints.empty() || !s.joints[0].present) return false;
+    const assets::skl_joint_path& p = s.joints[0].path;
+    if (p.pos_keys() < 2) return false;
+    const float* a = &p.pos[0];
+    const float* b = &p.pos[(p.pos_keys() - 1) * 3];
+    for (int k = 0; k < 3; ++k) delta[k] = b[k] - a[k];
+    return true;
+}
+
+// Speed of a locomotion clip in units per second, from its root motion.
+float clip_speed(const assets::skl_file& s) {
+    float d[3];
+    const uint32_t len = clip_length_ms(s);
+    if (!clip_root_motion(s, d) || !len) return 0.0f;
+    // The track's last key is one interval short of the loop point.
+    const assets::skl_joint_path& p = s.joints[0].path;
+    const float span_ms = float((p.pos_keys() - 1) * p.interval_ms);
+    if (span_ms <= 0.0f) return 0.0f;
+    return std::sqrt(d[0]*d[0] + d[2]*d[2]) / (span_ms / 1000.0f);
+}
+
+void set_clip(actor_inst& a, int clip) {
+    if (clip == a.clip) return;
+    if (clip >= 0 && (clip >= int(a.loco_ok.size()) || !a.loco_ok[size_t(clip)])) clip = -1;
+    a.clip = clip;
+    a.clip_ms = 0.0;
+}
+
+// Plays the current clip: samples every driven joint through the original's
+// sampler and re-poses the skeleton. Joints the clip does not drive keep their
+// own transform, as 0x63BA81 does. The root's translation is the clip's root
+// motion; the caller moves the actor node instead, so it is held at bind here.
+void animate_actor(actor_inst& a, float dt) {
+    if (!a.skinned || a.clip < 0) return;
+    const assets::skl_file& s = a.loco[size_t(a.clip)];
+    const uint32_t len = clip_length_ms(s);
+    a.clip_ms += double(dt) * 1000.0;
+    if (len) a.clip_ms = std::fmod(a.clip_ms, double(len));
+    const uint32_t t = uint32_t(a.clip_ms);
+
+    const size_t n = std::min(a.joint_local_cur.size(), s.joints.size());
+    for (size_t j = 0; j < n; ++j) {
+        if (!s.joints[j].present) { a.joint_local_cur[j] = a.joint_local_bind[j]; continue; }
+        float pos[3], q[4];
+        assets::skl_sample(s.joints[j].path, t, s.interpolate != 0, pos, q);
+        if (j == 0)
+            for (int k = 0; k < 3; ++k) pos[k] = a.joint_local_bind[0].translate[k];
+        transform_from_pos_quat(pos, q, a.joint_local_cur[j]);
+    }
+    pose_actor(a);
+}
+
+// The .act's directory inside the VFS, e.g. "actors/prince/". Skills live in its
+// "skills" subdirectory. Found by matching the .act's basename against every
+// indexed .act path, because the master.dat names it by basename only.
+std::string actor_dir_for(const std::string& act_name) {
+    std::string base = act_name;
+    const size_t cut = base.find_last_of("/\\");
+    if (cut != std::string::npos) base = base.substr(cut + 1);
+    for (size_t i = 0; i < base.size(); ++i)
+        if (base[i] >= 'A' && base[i] <= 'Z') base[i] = char(base[i] - 'A' + 'a');
+
+    std::vector<std::string> acts;
+    plat::fs_list_paths_by_extension(".act", acts);
+    for (size_t i = 0; i < acts.size(); ++i) {
+        const std::string& p = acts[i];
+        if (p.size() >= base.size() + 1 &&
+            p.compare(p.size() - base.size(), base.size(), base) == 0 &&
+            p[p.size() - base.size() - 1] == '/')
+            return p.substr(0, p.size() - base.size());
+    }
+    return std::string();
+}
+
+void load_loco_clips(const std::string& act_name, actor_inst& a) {
+    a.loco.assign(LOCO_COUNT, assets::skl_file());
+    a.loco_ok.assign(LOCO_COUNT, false);
+    const std::string dir = actor_dir_for(act_name);
+    if (dir.empty()) return;
+    for (int c = 0; c < LOCO_COUNT; ++c) {
+        const std::string path = dir + "skills/" + k_loco_names[c] + ".skl";
+        size_t size = 0;
+        uint8_t* d = plat::fs_read(path.c_str(), size);
+        if (!d) continue;
+        std::string err;
+        a.loco_ok[size_t(c)] = assets::skl_parse(d, size, a.loco[size_t(c)], &err);
+        plat::fs_free(d);
+        if (!a.loco_ok[size_t(c)])
+            std::printf("  skill %s: %s\n", path.c_str(), err.c_str());
+        else if (a.loco[size_t(c)].chunk_tag != "SklS")
+            // SklK skills are keyframe splines; their evaluator is not ported.
+            std::printf("  skill %s: SklK playback not implemented, ignored\n", path.c_str()),
+            a.loco_ok[size_t(c)] = false;
+        if (!a.loco_ok[size_t(c)]) continue;
+        const assets::skl_file& s = a.loco[size_t(c)];
+        float rm[3] = {0, 0, 0};
+        clip_root_motion(s, rm);
+        std::printf("  skill %-11s %u ms, %zu joints, interp %d, root motion (%.3f, %.3f, %.3f) -> %.2f u/s\n",
+                    k_loco_names[c], clip_length_ms(s), s.joints.size(), s.interpolate,
+                    rm[0], rm[1], rm[2], clip_speed(s));
+    }
+}
+
 // Fills an actor's skeleton from its .act and binds each body part to a joint by
 // name. Every .K2A geometry node has a matching .act node (zero orphans across
 // the shipped actors), so the match is by name and nothing else.
@@ -983,6 +1128,10 @@ bool bind_actor_skeleton(const assets::master_file& m, actor_inst& inst, scene& 
             if (inst.joint_names[j] == mesh_name) { di.joint = int(j); ++bound; break; }
     }
     inst.skinned = bound > 0;
+    if (inst.skinned) {
+        load_loco_clips(act_path, inst);
+        set_clip(inst, LOCO_BASE);
+    }
     return inst.skinned;
 }
 
@@ -996,13 +1145,14 @@ void scene_reset(scene& sc) {
     sc.root = new k2::engine::level_group();
     sc.root->name = "LevelRoot";
     sc.spawn_points.clear();
+    sc.coll.clear();
     sc.empty = true;
     sc.mn[0] = sc.mn[1] = sc.mn[2] =  1e30f;
     sc.mx[0] = sc.mx[1] = sc.mx[2] = -1e30f;
 }
 
 // Parses one .K2A and appends its meshes to `sc`, growing the bounds.
-bool append_scene(const char* path, scene& sc) {
+bool append_scene(const char* path, scene& sc, bool collide = true) {
     size_t size = 0;
     uint8_t* data = plat::fs_read_basename(path, size);
     if (!data) data = plat::fs_read(path, size);
@@ -1100,7 +1250,15 @@ bool append_scene(const char* path, scene& sc) {
         }
         sc.items.push_back(it);
         sc.item_names.push_back(n.name);
+
+        // Room geometry is solid. Blended materials (flame sheets, water,
+        // grates) are left out: which nodes the original picks against is
+        // decided per category at room load, and that rule is not traced yet.
+        if (collide && !it.is_trap && !it.transparent)
+            sc.coll.add_mesh(&vb[0].x, sizeof(assets::k2a_vertex) / sizeof(float),
+                             vb.size(), &ib[0], ib.size());
     }
+    if (collide) sc.coll.build();
 
     {
         size_t op = 0, tr = 0, tv = 0;
@@ -1217,7 +1375,7 @@ bool append_actor_geometry(const std::string& geometry, scene& sc,
     const float  mx[3] = {sc.mx[0], sc.mx[1], sc.mx[2]};
 
     for (int a = 0; a < 3; ++a) { sc.mn[a] =  1e30f; sc.mx[a] = -1e30f; }
-    if (!append_scene(geometry.c_str(), sc)) {
+    if (!append_scene(geometry.c_str(), sc, false)) {
         for (int a = 0; a < 3; ++a) { sc.mn[a] = mn[a]; sc.mx[a] = mx[a]; }
         return false;
     }
@@ -1758,6 +1916,8 @@ int dump_skills() {
     size_t jkeys = 0, skeys = 0, vkeys = 0;
     size_t chan = 0, unit = 0;
     size_t named_sounds = 0;
+    int    sampled = 0, manip = 0;
+    size_t paths = 0, overlong = 0, path_rot = 0, path_unit = 0;
 
     for (size_t i = 0; i < names.size(); ++i) {
         size_t size = 0;
@@ -1786,6 +1946,24 @@ int dump_skills() {
                 if (n2 > 0.998f && n2 < 1.002f) ++unit;
             }
         }
+
+        // SklS: every rotation key of every joint path should be a unit
+        // quaternion, and no track may be longer than the clip it belongs to.
+        if (sk.chunk_tag == "SklS") ++sampled;
+        for (size_t j = 0; j < sk.joints.size(); ++j) {
+            const assets::skl_joint& jt = sk.joints[j];
+            if (!jt.present || sk.chunk_tag != "SklS") continue;
+            const assets::skl_joint_path& p = jt.path;
+            ++paths;
+            if (p.pos_keys() > p.frames || p.rot_keys() > p.frames) ++overlong;
+            for (size_t r = 0; r < p.rot_keys(); ++r) {
+                const float* q = &p.rot[r * 4];
+                const float n2 = q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3];
+                ++path_rot;
+                if (n2 > 0.998f && n2 < 1.002f) ++path_unit;
+            }
+        }
+        if (sk.kind == assets::SKL_MANIP) ++manip;
     }
 
     std::printf("skills: %d parsed, %d failed\n", files, bad);
@@ -1793,7 +1971,69 @@ int dump_skills() {
                 jkeys, skeys, named_sounds, vkeys);
     std::printf("  quaternions unit-norm: %zu / %zu  (%.2f%%)\n",
                 unit, chan, chan ? 100.0 * double(unit) / double(chan) : 0.0);
+    std::printf("  SklS skills %d: %zu joint paths, %zu longer than their clip\n",
+                sampled, paths, overlong);
+    std::printf("  joint path rotations unit-norm: %zu / %zu  (%.2f%%)\n",
+                path_unit, path_rot, path_rot ? 100.0 * double(path_unit) / double(path_rot) : 0.0);
+    std::printf("  MSkl %d (manipulation block not decoded)\n", manip);
     return bad == 0 ? 0 : 1;
+}
+
+// --- player movement over the pick primitive ---------------------------------
+//
+// The original's PrinceMotion is animation-driven and far larger; this is a
+// stand-in built on the same primitive it uses (0x512183): a down probe for the
+// floor, horizontal probes for walls, and the hit normal to tell them apart.
+// The constants are ours, not the game's.
+namespace move_tuning {
+const float STEP_UP      = 0.45f;   // highest ledge walked up without climbing
+const float PROBE_DOWN   = 0.6f;    // below the feet still counts as standing
+const float RADIUS       = 0.35f;   // body radius for wall probes
+const float GRAVITY      = 9.8f;
+const float FLOOR_MIN_NY = 0.7f;    // up-facing enough to stand on (~45 deg)
+const float PROBE_HEIGHTS[3] = { 0.5f, 1.0f, 1.6f };
+}
+
+// Height of the floor under `p`, searched from STEP_UP above it down to
+// PROBE_DOWN below. False when there is none in range.
+bool ground_under(const k2::engine::collision_world& w, const float* p, float& y) {
+    const float o[3] = { p[0], p[1] + move_tuning::STEP_UP, p[2] };
+    const float d[3] = { 0.0f, -1.0f, 0.0f };
+    k2::engine::pick_hit h;
+    if (!w.pick(o, d, move_tuning::STEP_UP + move_tuning::PROBE_DOWN, true, h)) return false;
+    if (h.normal[1] < move_tuning::FLOOR_MIN_NY) return false;
+    y = h.point[1];
+    return true;
+}
+
+// Moves the body by (dx, dz), sliding along walls. Each probe height casts
+// along the move from the body's centre; a hit inside RADIUS of the new
+// position removes the component of the move that points into the wall.
+void move_horizontal(const k2::engine::collision_world& w, float* p, float dx, float dz) {
+    for (int pass = 0; pass < 2; ++pass) {
+        const float len = std::sqrt(dx * dx + dz * dz);
+        if (len < 1e-6f) return;
+        const float d[3] = { dx / len, 0.0f, dz / len };
+        bool blocked = false;
+        for (int k = 0; k < 3 && !blocked; ++k) {
+            const float o[3] = { p[0], p[1] + move_tuning::PROBE_HEIGHTS[k], p[2] };
+            k2::engine::pick_hit h;
+            if (!w.pick(o, d, len + move_tuning::RADIUS, false, h)) continue;
+            if (h.normal[1] >= move_tuning::FLOOR_MIN_NY) continue;   // a slope, not a wall
+            // Horizontal part of the normal, then cancel motion into it.
+            float nx = h.normal[0], nz = h.normal[2];
+            const float nl = std::sqrt(nx * nx + nz * nz);
+            if (nl < 1e-6f) continue;
+            nx /= nl; nz /= nl;
+            const float into = dx * nx + dz * nz;
+            if (into < 0.0f) { dx -= into * nx; dz -= into * nz; }
+            blocked = true;
+        }
+        if (!blocked) break;
+        if (pass == 1) return;           // still blocked after one slide: stop
+    }
+    p[0] += dx;
+    p[2] += dz;
 }
 
 // The game module, as the original structures it: `gameModule` owns a level and
@@ -1863,6 +2103,9 @@ int main(int argc, char** argv) {
     bool materials_only = false;
     bool winding_only = false;
     bool autowalk = false;
+    bool autorun  = false;
+    bool noanim   = false;
+    bool noclip   = false;
     bool noskin = false;
     const char* pose_arg = 0;   // "Joint:degrees" - proves a joint drives its part        // draw parts at the actor transform, unbound
     bool skeletons_only = false;      // headless: hold forward, to test movement
@@ -1898,6 +2141,9 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--materials") == 0) materials_only = true;
         else if (std::strcmp(argv[i], "--winding") == 0) winding_only = true;
         else if (std::strcmp(argv[i], "--autowalk") == 0) autowalk = true;
+        else if (std::strcmp(argv[i], "--autorun") == 0) autowalk = autorun = true;
+        else if (std::strcmp(argv[i], "--noanim") == 0) noanim = true;
+        else if (std::strcmp(argv[i], "--noclip") == 0) noclip = true;
         else if (std::strcmp(argv[i], "--noskin") == 0) noskin = true;
         else if (std::strcmp(argv[i], "--pose") == 0 && i + 1 < argc) pose_arg = argv[++i];
         else if (std::strcmp(argv[i], "--skeletons") == 0) skeletons_only = true;
@@ -2147,6 +2393,7 @@ int main(int argc, char** argv) {
     // fallback and stays available on F.
     bool  follow_mode  = (k2::engine::find_prince(spawns) >= 0);
     float player_yaw   = 0.0f;
+    float player_vy    = 0.0f;          // vertical speed while falling
     const float walk_speed   = 3.2f;    // metres/second, eyeballed
     const float follow_dist  = 4.5f;
     const float follow_height = 2.2f;
@@ -2160,6 +2407,18 @@ int main(int argc, char** argv) {
             }
         (void)pi;
         cam.pitch = -0.22f;
+    }
+    {
+        std::printf("collision: %zu triangles\n", sc.coll.triangle_count());
+        for (size_t i = 0; i < sc.actors.size(); ++i) {
+            if (sc.actors[i].is_enemy) continue;
+            float gy;
+            const float* p = sc.actors[i].node->local.translate;
+            if (ground_under(sc.coll, p, gy))
+                std::printf("  ground under the Prince at y %.3f (spawn y %.3f)\n", gy, p[1]);
+            else
+                std::printf("  no ground under the Prince within reach (spawn y %.3f)\n", p[1]);
+        }
     }
     bool   looking   = false;
     double last_time = plat::time_seconds();
@@ -2297,14 +2556,56 @@ int main(int argc, char** argv) {
             mv[1] = 0.0f;
             const float ml = std::sqrt(mv[0]*mv[0] + mv[2]*mv[2]);
             k2::engine::transform& lt = player->node->local;
+            const bool run = autorun || down[plat::KEY_LSHIFT] || down[plat::KEY_RSHIFT];
             if (ml > 1e-6f) {
-                float sp = walk_speed * dt;
-                if (down[plat::KEY_LSHIFT] || down[plat::KEY_RSHIFT]) sp *= 2.5f;  // run
-                lt.translate[0] += mv[0] / ml * sp;
-                lt.translate[2] += mv[2] / ml * sp;
-                // Face the way he is going. Matches camera_basis: forward is
-                // (sin yaw, 0, -cos yaw), so yaw = atan2(dx, -dz).
-                player_yaw = std::atan2(mv[0] / ml, -(mv[2] / ml));
+                // Walk_L or Running_L, moved at the speed its own root motion
+                // covers, so the feet do not slide. Without the clip, the old
+                // fixed speeds stand in.
+                const int clip = run ? LOCO_RUN : LOCO_WALK;
+                set_clip(*player, clip);
+                float speed = walk_speed * (run ? 2.5f : 1.0f);
+                float fwd_model[3] = {0.0f, 0.0f, 1.0f};
+                if (player->clip == clip) {
+                    const assets::skl_file& s = player->loco[size_t(clip)];
+                    const float cs = clip_speed(s);
+                    if (cs > 0.0f) speed = cs;
+                    float d[3];
+                    if (clip_root_motion(s, d) && (d[0]*d[0] + d[2]*d[2]) > 1e-8f)
+                        { fwd_model[0] = d[0]; fwd_model[2] = d[2]; }
+                }
+                if (noclip) {
+                    lt.translate[0] += mv[0] / ml * speed * dt;
+                    lt.translate[2] += mv[2] / ml * speed * dt;
+                } else {
+                    move_horizontal(sc.coll, lt.translate,
+                                    mv[0] / ml * speed * dt, mv[2] / ml * speed * dt);
+                }
+                // Face the way he is going: choose yaw so that set_yaw carries
+                // the model's forward axis onto the travel direction. set_yaw
+                // adds yaw to atan2(x, z), hence the difference of two angles.
+                player_yaw = std::atan2(mv[0], mv[2]) - std::atan2(fwd_model[0], fwd_model[2]);
+            } else {
+                set_clip(*player, LOCO_BASE);
+            }
+            // Stand on the floor, step up small ledges, fall off edges.
+            if (!noclip) {
+                float gy;
+                if (player_vy <= 0.0f && ground_under(sc.coll, lt.translate, gy)) {
+                    lt.translate[1] = gy;
+                    player_vy = 0.0f;
+                } else {
+                    player_vy -= move_tuning::GRAVITY * dt;
+                    const float o[3] = { lt.translate[0], lt.translate[1], lt.translate[2] };
+                    const float d[3] = { 0.0f, -1.0f, 0.0f };
+                    const float drop = -player_vy * dt;
+                    k2::engine::pick_hit h;
+                    if (sc.coll.pick(o, d, drop, true, h) && h.normal[1] >= move_tuning::FLOOR_MIN_NY) {
+                        lt.translate[1] = h.point[1];
+                        player_vy = 0.0f;
+                    } else {
+                        lt.translate[1] -= drop;
+                    }
+                }
             }
             lt.set_yaw(player_yaw);
             sc.root->update_world();
@@ -2326,6 +2627,12 @@ int main(int argc, char** argv) {
                 for (int a = 0; a < 3; ++a) cam.pos[a] += mv[a] / ml * sp;
             }
         }
+
+        // Every actor plays its clip; enemies and an undriven Prince stand in
+        // BasePose_L. --pose and --noanim hold the pose instead, so the bind
+        // pose and a single posed joint can still be checked.
+        if (!pose_arg && !noanim)
+            for (size_t i = 0; i < sc.actors.size(); ++i) animate_actor(sc.actors[i], dt);
 
         const float at[3] = {cam.pos[0] + fwd[0], cam.pos[1] + fwd[1], cam.pos[2] + fwd[2]};
         const float up[3] = {0.0f, 1.0f, 0.0f};

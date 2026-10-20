@@ -9,6 +9,8 @@
 #   make level L=... launch a whole level (.lvl)
 #   make actor A=... render a character from its master.dat
 #   make prince     render the Prince (shortcut)
+#   --autowalk / --autorun drive the Prince headlessly (with --frames N --shot)
+#   --noclip disables collision, --noanim holds the bind pose
 #
 #   In the viewer: F toggles follow-the-Prince vs free-fly.
 #   In the viewer: WASD move, Q/E or Space up/down, drag LMB to look,

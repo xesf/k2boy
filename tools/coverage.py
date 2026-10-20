@@ -89,7 +89,7 @@ SUBSYSTEMS = [
     ('Piccolo VM',                40, 'dispatch + machine model; operator mnemonics open'),
     ('Command-line dispatcher',   35, 'tree mapped, ~6 of 18 handlers decoded'),
     ('Savegame',                  45, 'framing + 5 sections'),
-    ('Animation (.skl)',          95, 'loader done: 2363 files, 0 failures, 99.89% quats valid'),
+    ('Animation (.skl)',          98, 'object graph read as the original does: 2363/2363 to EOF; SklS joint paths + sampler ported, Prince plays BasePose/Walk/Running; SklK spline eval and MSkl tail open'),
     ('CharacterStateTable',       20, 'placed in the hierarchy; base of Prince, camera and Trap. '
                                       'Only 7 of its 51 slots are overridden - 51 slots are the '
                                       'inherited NiNode interface, not states'),
@@ -101,6 +101,9 @@ SUBSYSTEMS = [
                                       'and drives the boot load, GOTO log matches the original'),
     ('Scene graph (NiNode)',      60, 'transform layout measured from NiAVObject__LoadBinary; 8/8 self-test'),
     ('Actor spawn / New Game',    70, 'chain traced; ported and validated: 134/142 spawn points resolve'),
+    ('Collision / pick',          40, 'one masked raycast (0x512183) serves every floor and wall test; '
+                                      'chain, nearest-hit rule, face normal and mask->category table recovered '
+                                      'and ported; the room-load rule assigning nodes to categories is open'),
     ('K2*Activity family',         5, 'identified and named only'),
     ('Motivate planner',           0, 'MfLocoPlanner / MfManipActivity - not started'),
 

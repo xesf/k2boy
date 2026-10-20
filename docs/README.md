@@ -61,6 +61,7 @@ form (`geometry\rooms\prisonfix\prison3.k2a`) because that is what the binary co
 - [`reference/`](reference/)
   - [`coverage.md`](reference/coverage.md) — what is reversed, by format and subsystem
   - [`class-hierarchy.md`](reference/class-hierarchy.md) — 909 vtables with recovered inheritance
+  - [`collision.md`](reference/collision.md) — the pick primitive behind every floor and wall test
   - [`trap-factory.md`](reference/trap-factory.md) — the 33 trap registry keys + registration mechanism
   - [`script-api.md`](reference/script-api.md) — the Piccolo scripting API: 29 classes, 250 methods
   - [`vm-isa.md`](reference/vm-isa.md) — the Piccolo VM: interpreter, machine model, 89-opcode map
