@@ -3849,7 +3849,13 @@ bool hang_update(hang_ctl& hc, actor_inst& a, const k2::engine::collision_world&
 namespace combat_tuning {
 const float REACH         = 2.2f;   // a swing connects within this
 const float FIGHT_DIST    = 1.6f;   // guards stop and fight here
-const int   HIT_DAMAGE    = 12;
+const int   HIT_DAMAGE    = 12;       // a bottle; Arrow::kArrowNormalDamage is 12 too
+// Health is counted in thirds of a bottle, 4 each (sub_422A5F scales
+// thirds by 4: 30 thirds, ten bottles, make 120), so a bottle is 12.
+const int   BOTTLE        = 12;
+const int   PRINCE_BOTTLES = 3;     // what the Prince starts the game with
+// Guards' bottles by skill (argv1 "skill,weapon,bottles"), word_7C5820.
+const int   SKILL_BOTTLES[11] = { 2, 3, 3, 4, 5, 5, 6, 7, 8, 10, 10 };
 const float GUARD_BLOCK   = 0.35f;  // chance a guard blocks the Prince
 const double RESPAWN_TIME = 3.5;
 }
@@ -3927,6 +3933,7 @@ void combat_init(combat_state& cs, scene& sc, const k2::engine::fight_params& fp
         actor_inst& a = sc.actors[i];
         if (a.is_fixture) continue;
         if (!a.is_enemy) {
+            a.max_health = a.health = combat_tuning::PRINCE_BOTTLES * combat_tuning::BOTTLE;
             for (int k = 0; k < 3; ++k) cs.spawn[k] = a.node->local.translate[k];
             cs.spawn_yaw = actor_yaw(a);
             continue;
@@ -3947,7 +3954,19 @@ void combat_init(combat_state& cs, scene& sc, const k2::engine::fight_params& fp
         for (size_t t = 0; t < sc.spawn_points.size(); ++t) {
             const assets::k2a_trap& sp = sc.spawn_points[t];
             if (sp.node != a.script_name) continue;
-            if (sp.argv.size() > 1) a.max_health = a.health = 50 + 25 * std::atoi(sp.argv[1].c_str());
+            if (sp.argv.size() > 1) {
+                // EnemyStart argv1, read at 0x4A92D7: skill (0..10, else 4),
+                // weapon, bottles (else by skill). Normal difficulty.
+                const std::string& a1 = sp.argv[1];
+                int skill = std::atoi(a1.c_str());
+                if (skill < 0 || skill > 10) skill = 4;
+                int bottles = combat_tuning::SKILL_BOTTLES[skill];
+                size_t c1 = a1.find(',');
+                size_t c2 = c1 == std::string::npos ? c1 : a1.find(',', c1 + 1);
+                if (c2 != std::string::npos && std::atoi(a1.c_str() + c2 + 1) > 0)
+                    bottles = std::atoi(a1.c_str() + c2 + 1);
+                a.max_health = a.health = bottles * combat_tuning::BOTTLE;
+            }
             if (sp.argv.size() > 4) e.on_death = sp.argv[4];
             if (sp.argv.size() > 5 && !sp.argv[5].empty()) {
                 e.start_loops = sp.argv[5][0] == '*';
@@ -4090,7 +4109,9 @@ void enemy_update(combat_state& cs, scene& sc, enemy_ai& e, actor_inst& prince,
     const float watch  = float(fp.enemy("distFarFromEnemy", 10.0));
     const float charge = float(fp.enemy("distApproachEnemy", 5.0));
     const float periph = float(fp.enemy("peripheral", 30.0)) * 3.14159265f / 180.0f;
-    const bool  camo = potion_state::on(g_potions.camo_until, now) && e.state == enemy_ai::PATROL;
+    // Camouflaged, he is seen only from distCamoflauge (1.5).
+    const bool  camo = potion_state::on(g_potions.camo_until, now) && e.state == enemy_ai::PATROL &&
+                       d > float(fp.enemy("distCamoflauge", 1.5));
     const bool  sees = !camo && prince_available && same_floor && d < watch &&
                        (d < charge || angle_diff(yaw_toward(p, pp), actor_yaw(a)) < periph);
 
@@ -4179,7 +4200,7 @@ void prince_hit_resolve(combat_state& cs, scene& sc, actor_inst& p, double now) 
         best->busy_until = now + 0.5;
         return;
     }
-    const int dmg = 25 + (potion_state::on(g_potions.strength_until, now) ? int(g_potions.strength) : 0);
+    const int dmg = combat_tuning::HIT_DAMAGE + (potion_state::on(g_potions.strength_until, now) ? int(g_potions.strength) : 0);
     enemy_damage(cs, sc, *best, dmg, cs.prince_hit.dir, now);
 }
 
@@ -4243,7 +4264,8 @@ void pickup_apply(combat_state& cs, scene& sc, actor_inst& p, const scene::picku
     switch (type) {
     case 1:  what = "Heal";       p.health = std::min(p.max_health, p.health + int(v0)); break;
     case 9:  what = "FullHeal";   p.health = p.max_health; break;
-    case 2:  what = "ExtraLife";  p.max_health = std::min(240, p.max_health + 24); p.health = p.max_health; break;
+    case 2:  what = "ExtraLife";  p.max_health = std::min(10 * combat_tuning::BOTTLE, p.max_health + combat_tuning::BOTTLE);
+                                  p.health = p.max_health; break;
     case 10: what = "Poison";     prince_damage(cs, sc, p, int(v0), 0, now); break;
     case 3:  what = "Strength";   g_potions.strength = float(v0);
                                   g_potions.strength_until = until::at(comma == std::string::npos ? -1 : v1, now); break;
@@ -5560,8 +5582,8 @@ int main(int argc, char** argv) {
 
         // HUD: the Prince's health as potion bottles along the bottom left,
         // as the game draws it (data/2D/health bottles, black keyed out).
-        // One bottle holds 24 health, what a full potion gives back; each
-        // shows full, half, a third or empty. The sword icon sits beside
+        // One bottle holds 12 health (three thirds of 4); each shows full,
+        // two thirds (the "half" art), a third or empty. The sword icon sits beside
         // them while it is drawn.
         {
             actor_inst* pa = 0;
@@ -5645,7 +5667,7 @@ int main(int argc, char** argv) {
                 // against the game's 480-line screen.
                 const float px = float(h ? h : 1) / 480.0f;
                 const float sx = 2.0f * px / float(w ? w : 1), sy = 2.0f * px / float(h ? h : 1);
-                const float per = 24.0f;
+                const float per = float(combat_tuning::BOTTLE);
                 const int bottles = std::max(1, int(std::ceil(float(pa->max_health) / per)));
                 float x = -1.0f + 12.0f * sx;
                 const float y = -1.0f + 10.0f * sy;
