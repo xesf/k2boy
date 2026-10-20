@@ -3,7 +3,8 @@
 Location: `data/Audio/sfx/*.sfx` (1255 files, ~150 MB).
 Owning class: `SFXFile` (`C:\k2\K2boy\Source\K2Audio\SFX.cpp`).
 
-**Status: confirmed.** Header size and the data-length field were validated against every
+**Status: confirmed.** All 1271 files parse (`k2boy --sounds`). The tag at 0x12 is not a fixed
+magic: five files say `MA` and one has binary bytes there, with the same layout. Header size and the data-length field were validated against every
 sampled file (`fileSize - 0x20 == dataSize` held for 100% of samples).
 
 ## Layout
@@ -19,7 +20,7 @@ struct SFXHeader {          // 0x20 bytes
     uint16_t wBitsPerSample;    // 0x000E  16
     uint16_t cbSize;            // 0x0010  0
     // --- POP3D extension ---
-    char     magic[2];          // 0x0012  "WI"
+    char     magic[2];          // 0x0012  "WI" (1264 files), "MA" (5), binary (1)
     uint32_t dataSize;          // 0x0014  == fileSize - 0x20
     uint32_t loopStart;         // 0x0018  byte offset into data, 0 = no loop
     uint32_t loopEnd;           // 0x001C  byte offset into data, 0 = no loop

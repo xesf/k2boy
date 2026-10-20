@@ -27,6 +27,7 @@ set(K2_SOURCES
     src/assets/master.cpp
     src/assets/act.cpp
     src/assets/skl.cpp
+    src/assets/sfx.cpp
     src/engine/module.cpp
     src/engine/nirtti.cpp
     src/engine/actor.cpp
@@ -36,6 +37,7 @@ set(K2_SOURCES
     src/engine/collision.cpp
     src/engine/trap.cpp
     src/engine/script.cpp
+    src/engine/mixer.cpp
 )
 
 if(APPLE)

@@ -17,6 +17,8 @@
 #include "engine/collision.h"
 #include "engine/trap.h"
 #include "engine/script.h"
+#include "engine/mixer.h"
+#include "assets/sfx.h"
 
 #include <cstdio>
 #include <cstring>
@@ -1141,6 +1143,17 @@ float clip_speed(const assets::skl_file& s) {
     return std::sqrt(d[0]*d[0] + d[2]*d[2]) / (span_ms / 1000.0f);
 }
 
+int32_t play_sound(const std::string& raw, const float* pos, float radius, bool loop);
+
+// A clip's sound keys (SKey) between two play-head times fire at the actor.
+void fire_sound_keys(const assets::skl_file& s, double from_ms, double to_ms, const float* at) {
+    for (size_t i = 0; i < s.sound_keys.size(); ++i) {
+        const double t = s.sound_keys[i].time;
+        if (t > from_ms && t <= to_ms) play_sound(s.sound_keys[i].sound, at, 14.0f, false);
+        else if (from_ms == 0.0 && t == 0.0 && to_ms > 0.0) play_sound(s.sound_keys[i].sound, at, 14.0f, false);
+    }
+}
+
 void set_clip(actor_inst& a, int clip) {
     a.clip_once = false;
     if (clip == a.clip) return;
@@ -1157,7 +1170,17 @@ void animate_actor(actor_inst& a, float dt) {
     if (!a.skinned || a.clip < 0) return;
     const assets::skl_file& s = a.loco[size_t(a.clip)];
     const uint32_t len = clip_length_ms(s);
+    const double before = a.clip_ms;
     a.clip_ms += double(dt) * 1000.0;
+    if (!s.sound_keys.empty() && a.node) {
+        const float* at = a.node->local.translate;
+        if (len && !a.clip_once && a.clip_ms >= double(len)) {
+            fire_sound_keys(s, before, double(len), at);       // the end of this cycle
+            fire_sound_keys(s, -1.0, a.clip_ms - double(len), at);
+        } else {
+            fire_sound_keys(s, before, a.clip_ms, at);
+        }
+    }
     if (len) a.clip_ms = a.clip_once ? std::min(a.clip_ms, double(len))
                                      : std::fmod(a.clip_ms, double(len));
     const uint32_t t = uint32_t(a.clip_ms);
@@ -1534,6 +1557,7 @@ private:
         a.remove_after = f.size() > 2 && (f[2] == "REMOVE" || f[2] == "remove");
         a.scripted = sk;
         a.scripted_start = m_world.now();
+        a.clip_ms = 0.0;               // the play head, for its sound keys
         a.hidden = false;
         return true;
     }
@@ -1553,6 +1577,8 @@ bool update_scripted(actor_inst& a, double now) {
     const double el = (now - a.scripted_start) * 1000.0;
     const bool done = el >= double(len);
     const uint32_t t = done ? len : uint32_t(el < 0 ? 0 : el);
+    fire_sound_keys(s, a.clip_ms, double(t), a.node->local.translate);
+    a.clip_ms = double(t);
 
     const size_t n = std::min(a.joint_local_cur.size(), s.joints.size());
     for (size_t j = 0; j < n; ++j) {
@@ -1667,6 +1693,121 @@ private:
     }
 
     const scene& m_sc;
+};
+
+// --- sound ----------------------------------------------------------------------
+//
+// One mixer for the game. Sounds are named as the scripts and skills name them
+// ("L01showerrun001", or with a ".wav" the files on disk do not have) and are
+// loaded from Audio/sfx on first use.
+k2::engine::mixer* g_mixer = 0;
+
+void audio_callback(float* out, int32_t frames, void*) {
+    std::memset(out, 0, size_t(frames) * 2 * sizeof(float));
+    if (g_mixer) g_mixer->mix(out, frames);
+}
+
+// A bare name ("L01waterdropN") stands for its numbered variants on disk
+// (L01waterdropn001.sfx): 1000 of the 1255 effects carry a three-digit
+// variant, up to eight per name. One that exists is picked at random each
+// time; how the original chooses is not traced.
+std::string resolve_sound_file(const std::string& name) {
+    char real[4096];
+    if (plat::fs_resolve_basename((name + ".sfx").c_str(), real, sizeof(real))) return name;
+    std::vector<std::string> found;
+    for (int v = 1; v <= 20; ++v) {
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "%03d", v);
+        if (plat::fs_resolve_basename((name + buf + ".sfx").c_str(), real, sizeof(real)))
+            found.push_back(name + buf);
+    }
+    if (found.empty()) return std::string();
+    return found[size_t(std::rand()) % found.size()];
+}
+
+bool ensure_sound(const std::string& raw) {
+    if (!g_mixer || raw.empty()) return false;
+    std::string name = raw;
+    const size_t dot = name.find_last_of('.');
+    if (dot != std::string::npos) name = name.substr(0, dot);
+    if (g_mixer->has_sound(name)) return true;
+    const std::string file = resolve_sound_file(name);
+    if (file.empty()) return false;
+    size_t size = 0;
+    uint8_t* d = plat::fs_read_basename((file + ".sfx").c_str(), size);
+    if (!d) return false;
+    assets::sfx_file sf;
+    const bool ok = assets::sfx_parse(d, size, sf);
+    plat::fs_free(d);
+    if (ok) g_mixer->add_sound(name, sf);
+    return ok;
+}
+
+int32_t play_sound(const std::string& raw, const float* pos, float radius, bool loop) {
+    if (!ensure_sound(raw)) return 0;
+    std::string name = raw;
+    const size_t dot = name.find_last_of('.');
+    if (dot != std::string::npos) name = name.substr(0, dot);
+    return g_mixer->play(name, pos, radius, loop);
+}
+
+// "audio": a non-positional sound by name ("audio,L01waterdropN").
+class audio_target : public k2::engine::script_target {
+public:
+    audio_target() : script_target("audio") {}
+    bool receive(const std::string& msg, k2::engine::script_target*) {
+        return play_sound(msg, 0, 0.0f, false) != 0 || !g_mixer;
+    }
+};
+
+// An AudioMessage trap (registry key "Audio"). Traps.txt: argv1 use the trap's
+// radius, argv2 positional, argv3 sound. "play" plays argv3, "silence" stops
+// it, any other message names a sound to play here. Looping sounds named in
+// argv3 are ambiences and start with the level (ours: not traced).
+class audio_trap : public k2::engine::trap_object {
+public:
+    audio_trap(k2::engine::script_world& w, const std::string& name,
+               const k2::engine::trap_header& h, const std::vector<std::string>& argv,
+               const float* bbox)
+        : trap_object(w, name, h), m_voice(0) {
+        bool use_radius = false;
+        m_positional = false;
+        if (argv.size() > 1) k2::engine::parse_trap_bool(argv[1], use_radius);
+        if (argv.size() > 2) k2::engine::parse_trap_bool(argv[2], m_positional);
+        m_sound = argv.size() > 3 ? argv[3] : std::string();
+        for (int k = 0; k < 3; ++k) m_pos[k] = (bbox[k] + bbox[k + 3]) * 0.5f;
+        const float dx = bbox[3] - bbox[0], dz = bbox[5] - bbox[2];
+        m_radius = use_radius ? std::max(4.0f, 0.5f * std::sqrt(dx * dx + dz * dz)) * 2.0f : 16.0f;
+    }
+
+    void start_ambient() {
+        if (m_sound.empty() || !ensure_sound(m_sound)) return;
+        m_voice = play_sound(m_sound, m_positional ? m_pos : 0, m_radius, true);
+    }
+
+    bool handle(const std::string& msg, k2::engine::script_target* sender) {
+        if (msg == "play" || msg == "Play") {
+            if (g_mixer && m_voice) g_mixer->stop(m_voice);
+            m_voice = play_sound(m_sound, m_positional ? m_pos : 0, m_radius, true);
+            return true;
+        }
+        if (msg == "silence" || msg == "SILENCE") {
+            if (g_mixer && m_voice) g_mixer->stop(m_voice);
+            m_voice = 0;
+            return true;
+        }
+        if (trap_object::handle(msg, sender)) return true;
+        if (msg.find(':') != std::string::npos || msg.find(',') != std::string::npos) return false;
+        if (g_mixer && m_voice) g_mixer->stop(m_voice);
+        m_voice = play_sound(msg, m_positional ? m_pos : 0, m_radius, true);
+        return m_voice != 0 || !g_mixer;
+    }
+
+private:
+    std::string m_sound;
+    bool        m_positional;
+    float       m_pos[3], m_radius;
+    int32_t     m_voice;
 };
 
 // Length of an actor's skill in seconds, e.g. TRAP_PressurePlate's "On";
@@ -1885,6 +2026,8 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
                     sc.script, n.name, hdr, n.trap.argv, vol);
                 sc.areas.push_back(a);
                 t = a;
+            } else if (n.trap.name == "Audio") {
+                t = new audio_trap(sc.script, n.name, hdr, n.trap.argv, n.trap.bbox);
             } else if (n.trap.name == "PressurePlate") {
                 const std::string actor = (n.trap.argv.size() > 1 && !n.trap.argv[1].empty())
                                           ? n.trap.argv[1] : std::string("TRAP_PressurePlate");
@@ -2561,6 +2704,60 @@ bool load_actor(const char* master_path, scene& sc) {
 
 // Headless: parse every .skl and validate the JKey quaternions. The strongest
 // available check, since a wrong field boundary destroys unit-norm immediately.
+// Headless: parse every .sfx. Counts, formats, and how many loop.
+int dump_sounds() {
+    std::vector<std::string> names;
+    plat::fs_list_paths_by_extension(".sfx", names);
+    int ok = 0, bad = 0, loops = 0, stereo = 0;
+    double seconds = 0.0;
+    for (size_t i = 0; i < names.size(); ++i) {
+        size_t size = 0;
+        uint8_t* d = plat::fs_read(names[i].c_str(), size);
+        if (!d) { ++bad; continue; }
+        assets::sfx_file sf;
+        std::string err;
+        if (assets::sfx_parse(d, size, sf, &err)) {
+            ++ok;
+            if (sf.loops()) ++loops;
+            if (sf.channels == 2) ++stereo;
+            seconds += double(sf.frames()) / double(sf.rate);
+        } else {
+            ++bad;
+            if (bad <= 5) std::printf("  FAIL %s (%s)\n", names[i].c_str(), err.c_str());
+        }
+        plat::fs_free(d);
+    }
+    std::printf("sounds: %d parsed, %d failed, %d loop, %d stereo, %.1f minutes\n",
+                ok, bad, loops, stereo, seconds / 60.0);
+
+    // Mixer self-test: half a second of a sound the prison scripts play, and
+    // a positional copy beside and far from the listener.
+    k2::engine::mixer mx(44100);
+    k2::engine::mixer* keep = g_mixer;
+    g_mixer = &mx;
+    const char* probe = "L01waterdropN";
+    std::vector<float> buf(44100 / 2 * 2, 0.0f);
+    double rms[3] = { 0, 0, 0 };
+    const float ear[3] = { 0, 0, 0 }, right[3] = { 1, 0, 0 };
+    mx.set_listener(ear, right);
+    const float near_right[3] = { 3, 0, 0 }, far_away[3] = { 100, 0, 0 };
+    const float* where[3] = { 0, near_right, far_away };
+    for (int k = 0; k < 3; ++k) {
+        std::fill(buf.begin(), buf.end(), 0.0f);
+        const int32_t id = play_sound(probe, where[k], 12.0f, false);
+        mx.mix(&buf[0], int32_t(buf.size() / 2));
+        double l = 0, r = 0;
+        for (size_t i = 0; i + 1 < buf.size(); i += 2) { l += buf[i] * buf[i]; r += buf[i + 1] * buf[i + 1]; }
+        rms[k] = std::sqrt((l + r) / double(buf.size()));
+        std::printf("  mixer %-11s voice %d  rms %.4f  (left %.4f right %.4f)\n",
+                    k == 0 ? "centre" : k == 1 ? "3 right" : "100 away", id, rms[k],
+                    std::sqrt(l / double(buf.size() / 2)), std::sqrt(r / double(buf.size() / 2)));
+        mx.stop(id);
+    }
+    g_mixer = keep;
+    return bad == 0 ? 0 : 1;
+}
+
 int dump_skills() {
     std::vector<std::string> names;
     plat::fs_list_paths_by_extension(".skl", names);
@@ -3344,6 +3541,8 @@ int main(int argc, char** argv) {
     bool autopush = false;
     bool autojump = false;
     bool classic  = false;
+    bool mute     = false;
+    bool sounds_only = false;
     bool find_ledges = false;
     std::vector<std::pair<std::string, double> > holds;   // --hold KEYS@T
     std::vector<std::string> send_args;
@@ -3392,6 +3591,8 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--autopush") == 0) autopush = true;
         else if (std::strcmp(argv[i], "--autojump") == 0) autojump = true;
         else if (std::strcmp(argv[i], "--findledges") == 0) find_ledges = true;
+        else if (std::strcmp(argv[i], "--mute") == 0) mute = true;
+        else if (std::strcmp(argv[i], "--sounds") == 0) sounds_only = true;
         else if (std::strcmp(argv[i], "--hold") == 0 && i + 1 < argc) {
             const std::string h = argv[++i];
             const size_t at = h.find('@');
@@ -3445,6 +3646,7 @@ int main(int argc, char** argv) {
         return describe_actor(dumpactor_path, m) ? 0 : 1;
     }
     if (skills_only)    return dump_skills();
+    if (sounds_only)    return dump_sounds();
     if (spawns_only)    return check_spawns();
     if (bind_path)      return check_bind_pose(bind_path);
     if (config_only)    return dump_config("distribution.dat");
@@ -3718,6 +3920,22 @@ int main(int argc, char** argv) {
     }
 
     // Scripts run on game time, which starts at zero with the level.
+    // Sound: one mixer, the camera as listener. Headless shots stay silent.
+    k2::engine::mixer game_mixer(44100);
+    audio_target audio_msgs;
+    sc.script.add(&audio_msgs);
+    if (!shot_path && !mute) {
+        g_mixer = &game_mixer;
+        if (!plat::audio_open(44100, audio_callback, 0)) {
+            std::printf("audio: no output device\n");
+            g_mixer = 0;
+        }
+    }
+    for (size_t i = 0; i < sc.traps.size(); ++i) {
+        audio_trap* at = dynamic_cast<audio_trap*>(sc.traps[i]);
+        if (at) at->start_ambient();
+    }
+
     // Every actor answers to its spawn node's name; the Prince to "prince".
     std::vector<actor_target*> actor_msgs;
     actor_target* prince_ptr = 0;
@@ -4215,6 +4433,8 @@ int main(int argc, char** argv) {
             for (size_t i = 0; i < sc.actors.size(); ++i)
                 if (!sc.actors[i].scripted) animate_actor(sc.actors[i], dt);
 
+        if (g_mixer) g_mixer->set_listener(cam.pos, right);
+
         const float at[3] = {cam.pos[0] + fwd[0], cam.pos[1] + fwd[1], cam.pos[2] + fwd[2]};
         const float up[3] = {0.0f, 1.0f, 0.0f};
         mat4_look_at(view, cam.pos, at, up);
@@ -4410,6 +4630,7 @@ int main(int argc, char** argv) {
              it != sc.script.unhandled().end(); ++it)
             std::printf("  %-48s %d\n", it->first.c_str(), it->second);
     }
+    if (g_mixer) { plat::audio_close(); g_mixer = 0; }
     gfx::shutdown();
     plat::shutdown();
     return 0;
