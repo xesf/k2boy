@@ -173,6 +173,14 @@ bool thread_start(thread_fn fn, void* arg, int core, const char* name);
 // Cores the game may use, the calling (main) thread's included.
 int  cpu_count();
 
+// Counting semaphores, for waking workers and waiting on them. The Vita's
+// kernel threads have no pthread state, so engine/jobs uses these rather
+// than std::mutex / std::condition_variable.
+typedef void* sema;
+sema sema_create(int initial);
+void sema_wait(sema s);
+void sema_signal(sema s, int count);
+
 // ---------------------------------------------------------------- audio
 
 // Pull model, matching CoreAudio's render callback and every other backend.

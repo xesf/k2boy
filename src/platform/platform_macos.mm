@@ -15,6 +15,8 @@
 
 #include <dlfcn.h>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <cstdlib>
 #include <sys/stat.h>
 #include <thread>
@@ -485,6 +487,32 @@ bool thread_start(thread_fn fn, void* arg, int core, const char* name) {
 int cpu_count() {
     const unsigned n = std::thread::hardware_concurrency();
     return n ? int(n) : 1;
+}
+
+namespace {
+struct sema_rec { std::mutex m; std::condition_variable cv; int count; };
+}
+
+sema sema_create(int initial) {
+    sema_rec* r = new sema_rec;
+    r->count = initial;
+    return r;
+}
+
+void sema_wait(sema s) {
+    sema_rec* r = static_cast<sema_rec*>(s);
+    std::unique_lock<std::mutex> l(r->m);
+    r->cv.wait(l, [r] { return r->count > 0; });
+    --r->count;
+}
+
+void sema_signal(sema s, int count) {
+    sema_rec* r = static_cast<sema_rec*>(s);
+    {
+        std::lock_guard<std::mutex> l(r->m);
+        r->count += count;
+    }
+    r->cv.notify_all();
 }
 
 // ---------------------------------------------------------------- audio

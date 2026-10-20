@@ -68,6 +68,8 @@
 #   make levels     headless: parse every .lvl and check all paths resolve
 #   make check      verify + images + parse every .K2A  (no window needed)
 #   make release    optimised build
+#   make vita       PlayStation Vita package (build-vita/k2boy.vpk; VitaSDK at
+#                   $VITASDK or ~/vitasdk). See docs/plan/07-vita.md.
 #   make coverage   regenerate docs/reference/coverage.md
 #   make clean      remove the build directory
 #
@@ -112,7 +114,7 @@ endef
 
 DEFAULT_ROOM ?= geometry\\rooms\\prisonfix\\prison1.k2a
 
-.PHONY: all play play-debug configure build run verify images dump room level levels actor prince actors skills spawns shot bind actnodes materials winding skeletons config modules boot skl check release coverage web webindex clean rebuild help
+.PHONY: vita all play play-debug configure build run verify images dump room level levels actor prince actors skills spawns shot bind actnodes materials winding skeletons config modules boot skl check release coverage web webindex clean rebuild help
 
 all: build
 
@@ -125,6 +127,13 @@ build: configure
 release:
 	$(call configure,$(RBUILD),Release)
 	@cmake --build $(RBUILD) -j $(JOBS)
+
+VBUILD = $(BUILD)-vita
+vita:
+	$(need_data)
+	@[ -f "$(VBUILD)/CMakeCache.txt" ] || cmake -S platforms/vita -B $(VBUILD) -DDATA="$(abspath $(DATA))" >/dev/null
+	@cmake --build $(VBUILD) -j $(JOBS)
+	@echo "k2boy: $(VBUILD)/k2boy.vpk"
 
 # The game, as far as it goes: the boot sequence with everything enabled.
 play: release
@@ -256,7 +265,7 @@ web: webindex
 	@python3 -m http.server $(WEB_PORT) --bind 127.0.0.1
 
 clean:
-	@rm -rf $(BUILD) $(RBUILD)
+	@rm -rf $(BUILD) $(RBUILD) $(BUILD)-vita
 
 rebuild: clean build
 
