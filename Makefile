@@ -20,8 +20,12 @@
 #              catch it, then forward pulls up, back drops, left/right shimmy.
 #     Combat   E picks up (the sword is in prison4); R / pad Y draws or sheathes,
 #              F / pad B attacks (left / right / centre by the stick), G / pad LB
-#              blocks. The bar top left is health; a fallen Prince returns
-#              to the level start.
+#              blocks. The bottles bottom left are health (three to start);
+#              a fallen Prince returns to the level start.
+#     Talk     an E badge shows where E does something: talk to prisoners,
+#              pull levers, use things.
+#     Swim     in deep water: move to swim, E dives, Space rises (air bottle
+#              shows under water), jump at a low edge to climb out.
 #     Also     V free-fly camera, T trigger volumes, Esc quit. Cutscenes take
 #              all control until they end. A gamepad (Xbox / PlayStation / MFi)
 #              is picked up when connected.
