@@ -3148,33 +3148,33 @@ bool load_level(const char* path, scene& sc, assets::lvl_file& lv, int region) {
                 lv.name.c_str(), path, lv.bodies.size(), lv.regions.size(),
                 lv.room_count(), lv.items.size());
 
-    int loaded = 0, missing = 0;
-    {
-        std::vector<std::string> files;
-        for (size_t r = 0; r < lv.regions.size(); ++r) {
-            if (region >= 0 && int(r) != region) continue;
-            for (size_t i = 0; i < lv.regions[r].rooms.size(); ++i)
-                files.push_back(assets::lvl_room_filename(lv.regions[r].rooms[i]));
-        }
-        loading_progress(0.05f);
-        prefetch_rooms(files);
-        loading_progress(0.3f);
-    }
-    int room_index = 0, room_total = 0;
+    // Every region's rooms. The original streams one region at a time as
+    // the Prince moves between them (LevelGroup's PrinceBrowser, through the
+    // .nbr neighbour data; not traced), so the doors out of Parts1to3 led to
+    // nothing. All of them are loaded instead; `region` still picks which
+    // [Prince] start is used.
+    (void)region;
+    std::vector<std::string> files;
     for (size_t r = 0; r < lv.regions.size(); ++r)
-        if (region < 0 || int(r) == region) room_total += int(lv.regions[r].rooms.size());
-    for (size_t r = 0; r < lv.regions.size(); ++r) {
-        if (region >= 0 && int(r) != region) continue;
-        const assets::lvl_region& reg = lv.regions[r];
-        for (size_t i = 0; i < reg.rooms.size(); ++i) {
-            const std::string file = assets::lvl_room_filename(reg.rooms[i]);
+        for (size_t i = 0; i < lv.regions[r].rooms.size(); ++i) {
+            const std::string f = assets::lvl_room_filename(lv.regions[r].rooms[i]);
+            if (std::find(files.begin(), files.end(), f) == files.end()) files.push_back(f);
+        }
+    int loaded = 0, missing = 0;
+    loading_progress(0.05f);
+    prefetch_rooms(files);
+    loading_progress(0.3f);
+    const int room_total = int(files.size());
+    int room_index = 0;
+    {
+        for (size_t i = 0; i < files.size(); ++i) {
+            const std::string& file = files[i];
             if (append_scene(file.c_str(), sc)) ++loaded;
             else { ++missing; std::printf("  missing room %s\n", file.c_str()); }
             loading_progress(0.3f + 0.4f * float(++room_index) / float(room_total ? room_total : 1));
         }
     }
-    std::printf("  region %s: rooms loaded %d, missing %d\n",
-                region < 0 ? "all" : "selected", loaded, missing);
+    std::printf("  rooms loaded %d, missing %d (all regions)\n", loaded, missing);
     return loaded > 0;
 }
 
