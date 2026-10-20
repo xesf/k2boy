@@ -21,6 +21,7 @@
 #include "engine/fight.h"
 #include "assets/sfx.h"
 #include "assets/nif.h"
+#include "gfx/ttf.h"
 
 #include <cstdio>
 #include <cstring>
@@ -5107,7 +5108,8 @@ int main(int argc, char** argv) {
     bool autorun  = false;
     bool noanim   = false;
     bool noclip   = false;
-    bool nif_check = false;      // parse every .nif in the install and report
+    bool nif_check = false;
+    const char* text_test = 0;   // render a string in Tsunami.ttf to a .bmp      // parse every .nif in the install and report
     bool noscript = false;
     bool autopush = false;
     bool autojump = false;
@@ -5162,6 +5164,7 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--noclip") == 0) noclip = true;
         else if (std::strcmp(argv[i], "--noscript") == 0) noscript = true;
         else if (std::strcmp(argv[i], "--nifcheck") == 0) nif_check = true;
+        else if (std::strcmp(argv[i], "--texttest") == 0 && i + 1 < argc) text_test = argv[++i];
         else if (std::strcmp(argv[i], "--autopush") == 0) autopush = true;
         else if (std::strcmp(argv[i], "--autojump") == 0) autojump = true;
         else if (std::strcmp(argv[i], "--findledges") == 0) find_ledges = true;
@@ -5214,6 +5217,36 @@ int main(int argc, char** argv) {
                      "usage: k2boy [--verify] [path-to-retail-install]\n",
                      data_root);
         return 1;
+    }
+    if (text_test) {
+        size_t size = 0;
+        uint8_t* d = plat::fs_read_basename("Tsunami.ttf", size);
+        gfx::xf_font font;
+        std::memset(&font, 0, sizeof(font));
+        if (!d || gfx::xf_font_init(&font, d, size) != 0) { std::printf("text: no font\n"); return 1; }
+        const char* msg = "Prince of Persia 3D";
+        const float px = 48.0f;
+        const int w = 900, h = 80;
+        std::vector<uint8_t> img(size_t(w) * h * 4, 0);
+        float pen = 10.0f;
+        for (const char* c = msg; *c; ++c) {
+            const int g = gfx::xf_font_glyph_index(&font, uint32_t(uint8_t(*c)));
+            gfx::xf_glyph gl;
+            if (gfx::xf_font_render(&font, g, px, &gl) == 0) {
+                for (int y = 0; y < gl.height; ++y)
+                    for (int x = 0; x < gl.width; ++x) {
+                        const int X = int(pen) + gl.x0 + x, Y = 60 + gl.y0 + y;
+                        if (X < 0 || Y < 0 || X >= w || Y >= h) continue;
+                        uint8_t* q = &img[size_t(Y * w + X) * 4];
+                        q[0] = q[1] = q[2] = std::max(q[0], gl.alpha[y * gl.width + x]); q[3] = 255;
+                    }
+                std::free(gl.alpha);
+            }
+            pen += gfx::xf_font_advance(&font, g, px);
+        }
+        write_bmp(text_test, w, h, &img[0]);
+        std::printf("text: wrote %s\n", text_test);
+        return 0;
     }
     if (nif_check) {
         std::vector<std::string> nifs;
