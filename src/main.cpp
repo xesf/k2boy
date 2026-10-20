@@ -624,6 +624,16 @@ struct draw_item {
     float           offset[3];      // a trap moved by script ("move,...")
     bool            has_model;      // a trap posed by a skill: draw under `model`
     float           model[16];
+    int             material;       // index into scene::materials, -1 for none
+    bool            cutout;         // colour-keyed: alpha-tested, still opaque
+};
+
+// A material's texture: one frame, or an IFL sequence with per-frame holds.
+struct mat_tex {
+    std::vector<gfx::texture_id> frames;
+    std::vector<int>             holds;      // frames each image is shown for
+    bool                         has_alpha;  // some texel is not fully opaque
+    mat_tex() : has_alpha(false) {}
 };
 
 // A spawned actor's drawable form: where it is, and which items are its body.
@@ -691,6 +701,7 @@ const char* const k_loco_names[LOCO_COUNT] = { "BasePose_L", "Running_L", "Walk_
 struct scene {
     std::vector<draw_item>  items;
     std::vector<gfx::texture_id> textures;   // owned, one per material
+    std::vector<mat_tex>    materials;       // parallel to textures, plus keyed variants
     std::vector<std::string> trap_types;     // distinct types present, for the legend
     std::vector<actor_inst>  actors;
     std::vector<std::string> item_names;    // parallel to items; the .K2A node name
@@ -784,11 +795,10 @@ std::string resolve_ifl(const std::string& path) {
     return first.empty() ? path : first;
 }
 
-gfx::texture_id load_texture(const std::string& bitmap_path, int& decoded, int& failed) {
-    if (bitmap_path.empty()) return gfx::INVALID_TEXTURE;
-
-    const std::string path = resolve_ifl(bitmap_path);
-
+// Loads one image. `chroma` keys pure black to transparent, as an
+// ALPHA_SOURCE Chroma map or a trap's ChromaKey/Transparent flag asks.
+gfx::texture_id load_image_texture(const std::string& path, bool chroma, bool& has_alpha,
+                                   int& decoded, int& failed) {
     size_t size = 0;
     uint8_t* data = plat::fs_read_basename(path.c_str(), size);
     if (!data) { ++failed; return gfx::INVALID_TEXTURE; }
@@ -799,8 +809,74 @@ gfx::texture_id load_texture(const std::string& bitmap_path, int& decoded, int& 
     plat::fs_free(data);
     if (!ok || !img.valid()) { ++failed; return gfx::INVALID_TEXTURE; }
 
+    for (size_t i = 0; i + 3 < img.rgba.size(); i += 4) {
+        if (chroma && img.rgba[i] == 0 && img.rgba[i + 1] == 0 && img.rgba[i + 2] == 0)
+            img.rgba[i + 3] = 0;
+        if (img.rgba[i + 3] != 255) has_alpha = true;
+    }
     ++decoded;
     return gfx::create_texture(img.width, img.height, &img.rgba[0]);
+}
+
+// An IFL ("Image File List") is one image name per line, optionally followed
+// by how many frames it is held. Anything else is a single image.
+mat_tex load_material_texture(const std::string& bitmap_path, bool chroma,
+                              int& decoded, int& failed) {
+    mat_tex mt;
+    if (bitmap_path.empty()) return mt;
+    std::string ext = bitmap_path.size() >= 4 ? bitmap_path.substr(bitmap_path.size() - 4) : "";
+    for (size_t i = 0; i < ext.size(); ++i)
+        if (ext[i] >= 'A' && ext[i] <= 'Z') ext[i] = char(ext[i] - 'A' + 'a');
+    if (ext == ".ifl") {
+        size_t size = 0;
+        uint8_t* data = plat::fs_read_basename(bitmap_path.c_str(), size);
+        if (data) {
+            const char* p = reinterpret_cast<const char*>(data);
+            const char* end = p + size;
+            while (p < end) {
+                const char* s0 = p;
+                while (p < end && *p != '\n' && *p != '\r') ++p;
+                std::string line(s0, size_t(p - s0));
+                while (p < end && (*p == '\n' || *p == '\r')) ++p;
+                const size_t a = line.find_first_not_of(" \t");
+                if (a == std::string::npos || line[a] == ';') continue;
+                const size_t b = line.find_first_of(" \t", a);
+                const std::string name = line.substr(a, (b == std::string::npos ? line.size() : b) - a);
+                int hold = 1;
+                if (b != std::string::npos) { hold = std::atoi(line.c_str() + b); if (hold < 1) hold = 1; }
+                const gfx::texture_id t = load_image_texture(name, chroma, mt.has_alpha, decoded, failed);
+                if (t != gfx::INVALID_TEXTURE) { mt.frames.push_back(t); mt.holds.push_back(hold); }
+            }
+            plat::fs_free(data);
+        }
+        if (!mt.frames.empty()) return mt;
+    }
+    const gfx::texture_id t = load_image_texture(resolve_ifl(bitmap_path), chroma, mt.has_alpha,
+                                                 decoded, failed);
+    if (t != gfx::INVALID_TEXTURE) { mt.frames.push_back(t); mt.holds.push_back(1); }
+    return mt;
+}
+
+// The texture a material shows at `time`. IFL frames advance at 30 per
+// second, Max's default frame rate, each held for its listed count.
+gfx::texture_id material_frame(const mat_tex& mt, double time) {
+    if (mt.frames.empty()) return gfx::INVALID_TEXTURE;
+    if (mt.frames.size() == 1) return mt.frames[0];
+    int total = 0;
+    for (size_t i = 0; i < mt.holds.size(); ++i) total += mt.holds[i];
+    int f = int(std::fmod(time * 30.0, double(total)));
+    for (size_t i = 0; i < mt.frames.size(); ++i) {
+        if (f < mt.holds[i]) return mt.frames[i];
+        f -= mt.holds[i];
+    }
+    return mt.frames[0];
+}
+
+// The texture a draw item shows now; animated materials step with `time`.
+gfx::texture_id item_texture(const scene& sc, const draw_item& di, double time) {
+    if (di.material >= 0 && size_t(di.material) < sc.materials.size())
+        return material_frame(sc.materials[size_t(di.material)], time);
+    return di.tex;
 }
 
 // Validates the recovered .act skeleton across every shipped actor: one root,
@@ -1191,6 +1267,7 @@ void scene_reset(scene& sc) {
     sc.items.clear();
     sc.item_names.clear();
     sc.textures.clear();
+    sc.materials.clear();
     sc.trap_types.clear();
     sc.actors.clear();
     delete sc.root;
@@ -1598,9 +1675,20 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
     const size_t first_item_of_file = sc.items.size();
     int decoded = 0, failed = 0;
     std::vector<bool> mat_transparent(f.materials.size(), false);
+    std::vector<bool> mat_cutout(f.materials.size(), false);
+    const size_t mat_base = sc.materials.size();
     for (size_t i = 0; i < f.materials.size(); ++i) {
-        sc.textures.push_back(load_texture(f.materials[i].bitmap, decoded, failed));
-        mat_transparent[i] = (f.materials[i].alpha == assets::K2A_ALPHA_OPACITY);
+        const assets::k2a_material& m = f.materials[i];
+        const bool chroma = m.diffuse_alpha == assets::k2a_material::DIFFUSE_ALPHA_CHROMA;
+        mat_tex mt = load_material_texture(m.bitmap, chroma, decoded, failed);
+        sc.textures.push_back(mt.frames.empty() ? gfx::INVALID_TEXTURE : mt.frames[0]);
+        // Blended: an opacity map, or a diffuse map whose own alpha is used
+        // and actually has some (the flames). Keyed: alpha-tested in the
+        // opaque pass, so it still writes depth.
+        mat_transparent[i] = m.alpha == assets::K2A_ALPHA_OPACITY ||
+            (m.diffuse_alpha == assets::k2a_material::DIFFUSE_ALPHA_OPACITY && mt.has_alpha);
+        mat_cutout[i] = chroma && mt.has_alpha;
+        sc.materials.push_back(mt);
     }
 
     for (size_t i = 0; i < f.nodes.size(); ++i) {
@@ -1700,6 +1788,31 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
         it.hidden    = hidden;
         it.offset[0] = it.offset[1] = it.offset[2] = 0.0f;
         it.has_model = false;
+        it.material  = (n.material_ref >= 0 && size_t(n.material_ref) < f.materials.size())
+                       ? int(mat_base + size_t(n.material_ref)) : -1;
+        it.cutout    = n.material_ref >= 0 && size_t(n.material_ref) < mat_cutout.size() &&
+                       mat_cutout[size_t(n.material_ref)];
+        // Doors, Forces and Movers have their own colour-key switch (Traps.txt:
+        // Door argv2 "Transparent", ForceTrap argv3 / Mover argv1 "ChromaKey").
+        // Prison gates use it: their texture is 64% black bars-background.
+        if (n.has_trap && it.material >= 0 && !it.cutout) {
+            size_t slot = 0;
+            if      (n.trap.name == "Door")  slot = 2;
+            else if (n.trap.name == "Force") slot = 3;
+            else if (n.trap.name == "Mover") slot = 1;
+            bool key = false;
+            if (slot && n.trap.argv.size() > slot) k2::engine::parse_trap_bool(n.trap.argv[slot], key);
+            if (key) {
+                mat_tex mt = load_material_texture(f.materials[size_t(n.material_ref)].bitmap, true,
+                                                   decoded, failed);
+                if (mt.has_alpha) {
+                    sc.materials.push_back(mt);
+                    it.material = int(sc.materials.size() - 1);
+                    it.tex = mt.frames[0];
+                    it.cutout = true;
+                }
+            }
+        }
         it.trap_type = -1;
         it.owner     = -1;
         it.joint     = -1;
@@ -3500,12 +3613,26 @@ int main(int argc, char** argv) {
             // the frame must come out near-identical; if it does not, depth is
             // not deciding visibility and something else is.
             const size_t i = rev_draw ? sc.items.size() - 1 - n : n;
-            if (sc.items[i].transparent || sc.items[i].is_trap) continue;
+            if (sc.items[i].transparent || sc.items[i].is_trap || sc.items[i].cutout) continue;
             if (sc.items[i].owner >= 0 || sc.items[i].hidden) continue;
             set_item_model(sc.items[i]);
-            gfx::set_texture(sc.items[i].tex);
+            gfx::set_texture(item_texture(sc, sc.items[i], game_time));
             gfx::draw(sc.items[i].mesh);
         }
+        // Colour-keyed geometry (prison bars): still opaque and depth-writing,
+        // but texels the key made transparent are discarded.
+        rs.alpha_test = true;
+        rs.alpha_ref  = 0.5f;
+        gfx::set_render_state(rs);
+        for (size_t i = 0; i < sc.items.size(); ++i) {
+            const draw_item& di = sc.items[i];
+            if (!di.cutout || di.transparent || di.is_trap || di.owner >= 0 || di.hidden) continue;
+            set_item_model(di);
+            gfx::set_texture(item_texture(sc, di, game_time));
+            gfx::draw(di.mesh);
+        }
+        rs.alpha_test = false;
+        gfx::set_render_state(rs);
         gfx::set_model(model);
 
         // Actors: same material rules as room geometry, but each is drawn under
@@ -3575,7 +3702,7 @@ int main(int argc, char** argv) {
             for (size_t k = order.size(); k-- > 0; ) {
                 const draw_item& di = sc.items[order[k].second];
                 set_item_model(di);
-                gfx::set_texture(di.tex);
+                gfx::set_texture(item_texture(sc, di, game_time));
                 gfx::draw(di.mesh);
             }
             gfx::set_model(model);

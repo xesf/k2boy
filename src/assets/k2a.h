@@ -29,7 +29,15 @@ struct k2a_material {
                                 // May be a .ifl frame list rather than an image.
     k2a_alpha_source  alpha;
 
-    k2a_material() : alpha(K2A_ALPHA_NONE) {}
+    // *ALPHA_SOURCE of the diffuse map, a value from the engine's K2A keyword
+    // table (sub_4248BE, strings at 0x7BD218 / 0x7BD210): where the texture's
+    // alpha comes from. Opacity: the image's own alpha channel (the torch
+    // TGAs; a BMP has none, so walls are unaffected). Chroma: black is
+    // transparent. 2912 and 436 maps across the shipped rooms.
+    enum diffuse_alpha_t { DIFFUSE_ALPHA_NONE = 0, DIFFUSE_ALPHA_OPACITY, DIFFUSE_ALPHA_CHROMA };
+    diffuse_alpha_t   diffuse_alpha;
+
+    k2a_material() : alpha(K2A_ALPHA_NONE), diffuse_alpha(DIFFUSE_ALPHA_NONE) {}
 };
 
 // A trap instance embedded in room geometry. `name` is the *factory registry

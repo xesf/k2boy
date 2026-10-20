@@ -140,6 +140,13 @@ void parse_material(tokenizer& t, k2a_material& m) {
             t.next();
             if (to_float(t.tok) > 0.0f) m.alpha = K2A_ALPHA_OPACITY;
         }
+        else if (t.tok == "*ALPHA_SOURCE") {
+            t.next();
+            if (channel == "*MAP_DIFFUSE") {
+                if      (t.tok == "Opacity") m.diffuse_alpha = k2a_material::DIFFUSE_ALPHA_OPACITY;
+                else if (t.tok == "Chroma")  m.diffuse_alpha = k2a_material::DIFFUSE_ALPHA_CHROMA;
+            }
+        }
         else if (t.tok == "*BITMAP") {
             t.next();
             // Prefer the diffuse map; fall back to the first bitmap seen so a

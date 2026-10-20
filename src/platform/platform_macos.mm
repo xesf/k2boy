@@ -279,6 +279,24 @@ bool poll_event(event& out) {
                         push(e);
                         break;
                     }
+                    // Shift, Ctrl and Alt never arrive as key down/up on macOS;
+                    // they come as a change of modifier flags, with the key
+                    // that changed in keyCode. Without this, run (Shift) and
+                    // every other modifier was dead.
+                    case NSEventTypeFlagsChanged: {
+                        const key k = map_keycode([ev keyCode]);
+                        NSEventModifierFlags mask = 0;
+                        if (k == KEY_LSHIFT || k == KEY_RSHIFT) mask = NSEventModifierFlagShift;
+                        else if (k == KEY_LCTRL || k == KEY_RCTRL) mask = NSEventModifierFlagControl;
+                        else if (k == KEY_LALT || k == KEY_RALT) mask = NSEventModifierFlagOption;
+                        if (mask) {
+                            event e = make_event(([ev modifierFlags] & mask) ? EVENT_KEY_DOWN
+                                                                             : EVENT_KEY_UP);
+                            e.k = k;
+                            push(e);
+                        }
+                        break;
+                    }
                     case NSEventTypeMouseMoved:
                     case NSEventTypeLeftMouseDragged:
                     case NSEventTypeRightMouseDragged: {
