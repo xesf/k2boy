@@ -1689,6 +1689,57 @@ public:
         return trap_object::handle(msg, sender);
     }
 
+    // A CollapsingFloor (Traps.txt: argv1 the actor whose skills it plays,
+    // argv2 wobble, argv3 fall, argv4 crash): stood on, it wobbles through
+    // its wobble skill, then drops - the fall skill is a single key, so the
+    // drop is gravity's, and it no longer holds anyone up - until it lands
+    // (or 30 units on), where the crash skill sounds. The trigger and the
+    // drop are ours; the class is not traced.
+    std::string wobble_skill, fall_skill, crash_skill;
+    void collapse_update(double now, float dt, const float* prince) {
+        if (type != "CollapsingFloor" || m_collapse == COLLAPSE_DOWN || !m_enabled) return;
+        if (m_collapse == COLLAPSE_NONE) {
+            if (!prince) return;
+            const float x = prince[0] - m_base[0], y = prince[1] - m_base[1], z = prince[2] - m_base[2];
+            if (x < box[0] || x > box[3] || z < box[2] || z > box[5] || y < box[4] - 0.3f || y > box[4] + 0.4f)
+                return;
+            const assets::skl_file* w = find_skill(wobble_skill);
+            if (w) { m_skill = w; m_skill_start = now; }
+            m_collapse_until = now + (w ? clip_length_ms(*w) / 1000.0 : 0.3);
+            m_collapse = COLLAPSE_WOBBLE;
+            if (w) fire_sound_keys(*w, 0.0, 1.0, prince);
+            return;
+        }
+        if (m_collapse == COLLAPSE_WOBBLE) {
+            if (now < m_collapse_until) return;
+            m_skill = 0;
+            set_collideable(false);
+            m_fall_v = 0.0f;
+            m_fall_from = m_base[1];
+            m_collapse = COLLAPSE_FALLING;
+            if (const assets::skl_file* f = find_skill(fall_skill)) {
+                const float c[3] = { (box[0] + box[3]) * 0.5f + m_base[0], box[4] + m_base[1], (box[2] + box[5]) * 0.5f + m_base[2] };
+                fire_sound_keys(*f, 0.0, 1.0, c);
+            }
+            return;
+        }
+        // Falling.
+        m_fall_v += 17.0f * dt;                     // FallGravity (0x4F8547)
+        const float step = m_fall_v * dt;
+        const float c[3] = { (box[0] + box[3]) * 0.5f + m_base[0], box[1] + m_base[1], (box[2] + box[5]) * 0.5f + m_base[2] };
+        const float down[3] = { 0.0f, -1.0f, 0.0f };
+        k2::engine::pick_hit h;
+        float off[3] = { m_base[0], m_base[1] - step, m_base[2] };
+        bool landed = false;
+        if (m_sc.coll.pick(c, down, step, true, h)) { off[1] = m_base[1] - h.distance; landed = true; }
+        if (m_fall_from - off[1] > 30.0f) landed = true;
+        place(off);
+        if (landed) {
+            m_collapse = COLLAPSE_DOWN;
+            if (const assets::skl_file* k = find_skill(crash_skill)) fire_sound_keys(*k, 0.0, 1.0, c);
+        }
+    }
+
     void update(double now) {
         if (m_skill) pose_from_skill(now);
         if (!m_moving) return;
@@ -1776,6 +1827,9 @@ private:
     k2::engine::translate_motion  m_motion;
     const assets::skl_file*       m_skill;
     double                        m_skill_start;
+    enum { COLLAPSE_NONE, COLLAPSE_WOBBLE, COLLAPSE_FALLING, COLLAPSE_DOWN } m_collapse = COLLAPSE_NONE;
+    double                        m_collapse_until = 0.0;
+    float                         m_fall_v = 0.0f, m_fall_from = 0.0f;
 };
 
 // An actor as a script target, under the name of the node that spawned it
@@ -2632,6 +2686,15 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
                 if (n.trap.name == "Door")
                     st->actor = (n.trap.argv.size() > 1 && !n.trap.argv[1].empty())
                                 ? n.trap.argv[1] : std::string("TRAP_Door");
+                if (n.trap.name == "CollapsingFloor") {
+                    const std::vector<std::string>& a = n.trap.argv;
+                    struct pick { static std::string arg(const std::vector<std::string>& v, size_t i, const char* def) {
+                        return i < v.size() && !v[i].empty() && v[i] != "*" ? v[i] : std::string(def); } };
+                    st->actor        = pick::arg(a, 1, "TRAP_CollapsingFloor");
+                    st->wobble_skill = pick::arg(a, 2, "Wobble");
+                    st->fall_skill   = pick::arg(a, 3, "Fall");
+                    st->crash_skill  = pick::arg(a, 4, "Crash");
+                }
                 t = st;
             }
             if (n.trap.name == "Water") {
@@ -6961,7 +7024,7 @@ int main(int argc, char** argv) {
             }
             for (size_t i = 0; i < sc.traps.size(); ++i) {
                 scene_trap* st = dynamic_cast<scene_trap*>(sc.traps[i]);
-                if (st) st->update(game_time);
+                if (st) { st->collapse_update(game_time, dt, pp); st->update(game_time); }
             }
         }
         const bool snoozed = !noscript && game_time < (prince_msgs ? prince_msgs->snooze_until : 0.0);
