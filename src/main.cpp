@@ -5589,6 +5589,8 @@ int main(int argc, char** argv) {
     double    drown_tick = 0.0;
     bool      draw_was_down = false, atk_was_down = false;
     bool      jump_was_down = false;
+    bool      act_was_down = false;
+    double    regrab_after = 0.0;      // let go: no catching the same ledge at once
     bool      pad_act_down = false;   // pad X last frame; areas run before the pad is read
     std::printf("scripts: %zu traps, %zu areas, %zu plates%s\n", sc.traps.size(),
                 sc.areas.size(), sc.plates.size(),
@@ -5912,7 +5914,12 @@ int main(int argc, char** argv) {
             const float ps[3] = { std::cos(player_yaw), 0.0f, -std::sin(player_yaw) };
             float local[3] = { 0.0f, 0.0f, 0.0f };
             if (classic) { local[0] = -in_x; local[2] = in_y; }
-            else if (ml > 1e-6f) {
+            else if (ledges.state != hang_ctl::NONE) {
+                // Hanging, up/down are pull up/let go whatever the camera's
+                // angle; left/right shimmy the way they point on screen.
+                local[2] = in_y;
+                local[0] = in_x * (right[0] * ps[0] + right[2] * ps[2]);
+            } else if (ml > 1e-6f) {
                 local[0] = (mv[0] * ps[0] + mv[2] * ps[2]) / std::max(ml, 1.0f);
                 local[2] = (mv[0] * pf[0] + mv[2] * pf[2]) / std::max(ml, 1.0f);
             }
@@ -5927,6 +5934,8 @@ int main(int argc, char** argv) {
                                                (pad.connected && pad.button[plat::PAD_A]));
             const bool jump_pressed_raw = jump_key && !jump_was_down;
             jump_was_down = jump_key;
+            const bool act_pressed = act && !act_was_down;
+            act_was_down = act;
 
             // --- combat input: R / pad Y draw or sheathe, F / pad B attack,
             // G / pad LB block (held). Only with the sword.
@@ -6012,12 +6021,14 @@ int main(int argc, char** argv) {
                 jumps.vel[0] = jumps.vel[1] = jumps.vel[2] = 0.0f;
                 jumps.peak_y = lt.translate[1];
                 jump_begin(jumps, *player, FALL_VERT, game_time, lt.translate);
+                regrab_after = game_time + 0.6;
             }
             if (!on_ledge && jump_pressed && !scripted_now && crates.state == crate_ctl::NONE &&
                 jumps.state == jump_ctl::NONE && player_vy == 0.0f && swim.state == swim_ctl::NONE) {
-                // A ledge in front decides what the jump button does: climb a
-                // low one, jump up to catch a high one, else an ordinary jump.
-                if (!hang_try_climb(ledges, *player, sc.coll, lt.translate, player_yaw, game_time)) {
+                // Jump never climbs (the original climbs from StStartStepBack,
+                // on the action input, 0x4B4CC8): under a high ledge it jumps
+                // straight up to catch it, else an ordinary jump.
+                {
                     const bool running = run && ml > 1e-6f && player->clip == LOCO_RUN;
                     float jl[3] = { local[0], 0.0f, local[2] };
                     hang_measure_grip(ledges, *player);
@@ -6056,14 +6067,14 @@ int main(int argc, char** argv) {
             bool in_swim = false;
             if (swim.state != swim_ctl::NONE) {
                 // Out over a low edge: the jump climbs, as on land.
-                if (swim.state == swim_ctl::SURFACE && jump_pressed &&
+                if (swim.state == swim_ctl::SURFACE && (jump_pressed || act_pressed) &&
                     hang_try_climb(ledges, *player, sc.coll, lt.translate, player_yaw, game_time)) {
                     swim.state = swim_ctl::NONE;
                     player->stance = 0;
                 } else {
                     bool drowning = false;
                     in_swim = swim_update(swim, sc, *player, lt.translate, player_yaw, surf, mv, ml,
-                                          jump_key, act, act && swim.state == swim_ctl::SURFACE,
+                                          jump_key, act, act_pressed && swim.state == swim_ctl::SURFACE,
                                           classic, dt, drowning);
                     if (drowning && game_time >= drown_tick) {
                         drown_tick = game_time + 1.0;
@@ -6074,13 +6085,22 @@ int main(int argc, char** argv) {
             bool in_jump = !in_swim && !scripted_now && !on_ledge && ledges.state == hang_ctl::NONE &&
                 jump_update(jumps, *player, sc.coll, lt.translate, player_yaw, game_time, dt);
             // In the air, the hands catch any ledge in reach.
-            if (in_jump && jumps.state == jump_ctl::AIR) {
+            if (in_jump && jumps.state == jump_ctl::AIR && game_time >= regrab_after) {
                 const float hs = std::sqrt(jumps.vel[0] * jumps.vel[0] + jumps.vel[2] * jumps.vel[2]);
                 if (hang_try_grab(ledges, *player, sc.coll, lt.translate, player_yaw,
                                   jumps.vel[1], hs, game_time)) {
                     jumps.state = jump_ctl::NONE;
                     in_jump = false;
                 }
+            }
+            // Action at a ledge he can get onto climbs it (StStart1MClimb),
+            // unless a crate there wants the action.
+            if (act_pressed && !scripted_now && !on_ledge && !in_jump && !in_swim &&
+                ledges.state == hang_ctl::NONE && crates.state == crate_ctl::NONE && !dead) {
+                float ax[3];
+                const float pfw[3] = { std::sin(player_yaw), 0.0f, std::cos(player_yaw) };
+                if (!crate_in_front(sc, lt.translate, pfw, ax))
+                    hang_try_climb(ledges, *player, sc.coll, lt.translate, player_yaw, game_time);
             }
             const bool busy = on_ledge || ledges.state != hang_ctl::NONE || in_swim;
             const bool in_crate = !scripted_now && !in_jump && !busy &&

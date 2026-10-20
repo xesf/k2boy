@@ -16,8 +16,9 @@
 #              facing, A/D turn him; the camera stays behind him.
 #     Both     Shift / RB / RT run, Space / A jump, E / X act (grab a crate and
 #              hold: then forward pushes, back pulls).
-#     Ledges   jump facing a low ledge to climb it; jump under a high one to
-#              catch it, then forward pulls up, back drops, left/right shimmy.
+#     Ledges   E facing a ledge he can reach climbs onto it; jump under a high
+#              one to catch it, then up pulls up, down lets go, left/right
+#              shimmy.
 #     Combat   E picks up (the sword is in prison4); R / pad Y draws or sheathes,
 #              F / pad B attacks (left / right / centre by the stick), G / pad LB
 #              blocks. The bottles bottom left are health (three to start);
@@ -25,7 +26,7 @@
 #     Talk     an E badge shows where E does something: talk to prisoners,
 #              pull levers, use things.
 #     Swim     in deep water: move to swim, E dives, Space rises (air bottle
-#              shows under water), jump at a low edge to climb out.
+#              shows under water), jump or E at a low edge to climb out.
 #     Also     V free-fly camera, T trigger volumes, Esc quit. Cutscenes take
 #              all control until they end. A gamepad (Xbox / PlayStation / MFi)
 #              is picked up when connected.
