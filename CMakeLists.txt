@@ -35,6 +35,7 @@ set(K2_SOURCES
     src/media/mov.cpp
     src/media/svq1.cpp
     src/media/qdm2.cpp
+    src/media/movie.cpp
     src/engine/module.cpp
     src/engine/nirtti.cpp
     src/engine/actor.cpp

@@ -25,6 +25,7 @@
 #include "media/mov.h"
 #include "media/svq1.h"
 #include "media/qdm2.h"
+#include "media/movie.h"
 
 #include <cstdio>
 #include <cstring>
@@ -4594,6 +4595,57 @@ int nearest_enemy(const combat_state& cs, const scene& sc, const float* pp, floa
     return best;
 }
 
+// --- cutscenes -------------------------------------------------------------------
+//
+// Plays a movie (data/Movies/<name>.mov) full screen, its sound through the
+// mixer. Esc, Space, Enter or a click skips it. Returns false if the window
+// was closed.
+bool play_movie(const std::string& name) {
+    media::movie mv;
+    std::string path = "movies/" + name;
+    if (path.size() < 4 || path.compare(path.size() - 4, 4, ".mov") != 0) path += ".mov";
+    for (size_t i = 0; i < path.size(); ++i) path[i] = char(std::tolower(static_cast<unsigned char>(path[i])));
+    if (!mv.open(path)) { std::printf("movie: %s not found\n", path.c_str()); return true; }
+    std::printf("movie: %s %dx%d, %.1f s, %zu audio samples\n", path.c_str(), mv.width(), mv.height(),
+                mv.duration(), mv.pcm().size());
+    int32_t voice = 0;
+    if (g_mixer && !mv.pcm().empty()) {
+        assets::sfx_file sf;
+        sf.channels = mv.audio_channels();
+        sf.rate = mv.audio_rate();
+        sf.samples = mv.pcm();
+        g_mixer->add_sound("__movie", sf);
+        voice = g_mixer->play("__movie", 0, 0.0f, false, 1.0f);
+    }
+    gfx::texture_id tex = gfx::INVALID_TEXTURE;
+    const double start = plat::time_seconds();
+    bool alive = true, skip = false;
+    while (alive && !skip) {
+        plat::event e;
+        while (plat::poll_event(e)) {
+            if (e.type == plat::EVENT_QUIT) alive = false;
+            if (e.type == plat::EVENT_KEY_DOWN &&
+                (e.k == plat::KEY_ESCAPE || e.k == plat::KEY_SPACE || e.k == plat::KEY_RETURN)) skip = true;
+            if (e.type == plat::EVENT_MOUSE_DOWN) skip = true;
+        }
+        const double t = plat::time_seconds() - start;
+        if (t >= mv.duration()) break;
+        if (mv.seek_video(t) && mv.rgba()) {
+            if (tex == gfx::INVALID_TEXTURE) tex = gfx::create_stream_texture(mv.width(), mv.height());
+            gfx::update_texture(tex, mv.rgba());
+        }
+        gfx::begin_frame();
+        gfx::set_clear_color(0.0f, 0.0f, 0.0f);
+        gfx::clear(true, true);
+        if (tex != gfx::INVALID_TEXTURE) gfx::draw_fullscreen_quad(tex);
+        gfx::end_frame();
+        plat::swap_buffers();
+    }
+    if (g_mixer && voice) g_mixer->stop(voice);
+    if (tex != gfx::INVALID_TEXTURE) gfx::destroy_texture(tex);
+    return alive;
+}
+
 // --- visual effects (.nif) -----------------------------------------------------
 //
 // A NetImmerse file played at a point or on an actor: its node tree posed
@@ -5113,6 +5165,7 @@ int main(int argc, char** argv) {
     bool noclip   = false;
     bool nif_check = false;
     bool mov_info = false;
+    std::vector<std::string> movies_to_play;   // --movie NAME (repeatable): play before the game
     const char* mov_audio = 0;        // --movaudio MOVIE: decode its whole sound track, report
     const char* mov_frame_file = 0;   // --movframe MOVIE N OUT.bmp: decode frames 0..N, save N
     int mov_frame_index = 0;
@@ -5173,6 +5226,7 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--noscript") == 0) noscript = true;
         else if (std::strcmp(argv[i], "--nifcheck") == 0) nif_check = true;
         else if (std::strcmp(argv[i], "--movinfo") == 0) mov_info = true;
+        else if (std::strcmp(argv[i], "--movie") == 0 && i + 1 < argc) movies_to_play.push_back(argv[++i]);
         else if (std::strcmp(argv[i], "--movaudio") == 0 && i + 1 < argc) mov_audio = argv[++i];
         else if (std::strcmp(argv[i], "--movframe") == 0 && i + 3 < argc) {
             mov_frame_file = argv[++i]; mov_frame_index = std::atoi(argv[++i]); mov_frame_out = argv[++i];
@@ -5658,6 +5712,8 @@ int main(int argc, char** argv) {
             g_mixer = 0;
         }
     }
+    for (size_t i = 0; i < movies_to_play.size(); ++i)
+        if (!play_movie(movies_to_play[i])) return 0;
     for (size_t i = 0; i < sc.traps.size(); ++i) {
         audio_trap* at = dynamic_cast<audio_trap*>(sc.traps[i]);
         if (at) at->start_ambient();
