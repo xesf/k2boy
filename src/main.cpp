@@ -1649,6 +1649,10 @@ public:
     // green axis turned by its pivot, 4 units a second), pushing whoever
     // swims inside its box. Ours: ForceTrap's Volume type is not traced.
     bool              has_current = false;
+    // A CrateTarget's message (Traps.txt argv1), sent once a crate stands
+    // in its box (prison4: pushing the crate over the pit drops it on the
+    // guard below and frees the sword).
+    std::string       message;
     float             current[3] = { 0.0f, 0.0f, 0.0f };
 
     // Where the trap sits now, relative to rest.
@@ -2035,7 +2039,12 @@ private:
                 a.scripted_yaw = p->second.yaw;
             }
         }
-        a.remove_after = f.size() > 2 && (f[2] == "REMOVE" || f[2] == "remove");
+        a.remove_after = f.size() > 2 && equals_nocase(f[2], "remove");
+        // DEAD: a scripted death (the prison's squished guard); he stays down.
+        const bool dead = f.size() > 2 && equals_nocase(f[2], "dead");
+        a.hold_last = dead;
+        a.posed_hold = false;
+        if (dead) a.health = 0;
         a.scripted = sk;
         a.scripted_start = m_world.now();
         a.clip_ms = 0.0;               // the play head, for its sound keys
@@ -2709,6 +2718,7 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
                                    int(sc.items.size()) - 1, node, n.trap.name, n.trap.bbox);
                 for (int k = 0; k < 3; ++k) st->pivot[k] = n.trap.pivot[k];
                 st->pivot_angle = n.trap.pivot_angle * (n.trap.pivot_axis[1] < 0.0f ? -1.0f : 1.0f);
+                if (n.trap.name == "CrateTarget" && n.trap.argv.size() > 1) st->message = n.trap.argv[1];
                 if (n.trap.name == "Force" && n.trap.argv.size() > 2 && equals_nocase(n.trap.argv[1], "Volume") &&
                     n.trap.argv[2].compare(0, 8, "current,") == 0) {
                     k2::engine::translate_motion m;     // the axis words as "move" reads them
@@ -4010,7 +4020,12 @@ void crate_input(crate_ctl& cc, scene& sc, actor_inst& a, const float* pos, floa
     }
     if (push || pull) {
         const int mv = push ? 1 : -1;
-        const bool ok = crate_move_ok(sc.coll, pos, fwd, mv);
+        // From where he took hold, before the antic's 0.7 step in (the
+        // crate's step and the clips' travel all assume it). Measured from
+        // where the step leaves him, a push from the ledge towards prison4's
+        // CrateTarget probed onto RampThingie's slope and always failed.
+        const float held[3] = { pos[0] - fwd[0] * 0.7f, pos[1], pos[2] - fwd[2] * 0.7f };
+        const bool ok = crate_move_ok(sc.coll, held, fwd, mv);
         const int clip = push ? (ok ? CRATE_PUSH : CRATE_PUSH_FAIL)
                               : (ok ? CRATE_PULL : CRATE_PULL_FAIL);
         cc.state = crate_ctl::MOVE;
@@ -5038,6 +5053,12 @@ void enemy_update(combat_state& cs, scene& sc, enemy_ai& e, actor_inst& prince,
                   bool prince_available, double now, float dt) {
     actor_inst& a = sc.actors[size_t(e.actor)];
     if (e.state == enemy_ai::DEAD || a.hidden) return;
+    if (a.health <= 0) {               // killed by a script ("SkillAt:...,DEAD")
+        e.state = enemy_ai::DEAD;
+        std::printf("combat: %s is defeated\n", a.script_name.c_str());
+        if (!e.on_death.empty()) sc.script.execute(e.on_death, 0);
+        return;
+    }
     const k2::engine::fight_params& fp = *cs.params;
     if (e.waiting) {
         // Asleep, or braced behind a door: wakes on "Start", on being hit,
@@ -6655,6 +6676,18 @@ int main(int argc, char** argv) {
         }
     }
     // --findledges: list standing spots with a ledge ahead, for testing.
+    // K2_FLOORPROBE=x,y,z0,z1: the floor under a line along z (front faces,
+    // from y + 1.5 down), every 0.1 - for checking crate and ledge rules.
+    if (const char* fp = std::getenv("K2_FLOORPROBE")) {
+        float x, y, z0, z1;
+        if (std::sscanf(fp, "%f,%f,%f,%f", &x, &y, &z0, &z1) == 4)
+            for (float z = z0; z <= z1 + 1e-4f; z += 0.1f) {
+                const float o[3] = { x, y + 1.5f, z }, d[3] = { 0.0f, -1.0f, 0.0f };
+                k2::engine::pick_hit h;
+                if (sc.coll.pick(o, d, 1.0e6f, true, h)) std::printf("floor z %.2f: %.3f\n", z, h.point[1]);
+                else std::printf("floor z %.2f: none\n", z);
+            }
+    }
     // K2_WATERPROBE: each water area's triangles with the floor depth under
     // their centres, to find where the outline covers dry ground.
     if (std::getenv("K2_WATERPROBE")) {
@@ -7127,6 +7160,24 @@ int main(int argc, char** argv) {
             for (size_t i = 0; i < sc.traps.size(); ++i) {
                 scene_trap* st = dynamic_cast<scene_trap*>(sc.traps[i]);
                 if (st) { st->collapse_update(game_time, dt, pp); st->update(game_time); }
+            }
+            // CrateTargets: a crate's centre inside the box sends the message.
+            for (size_t i = 0; i < sc.traps.size(); ++i) {
+                scene_trap* tg = dynamic_cast<scene_trap*>(sc.traps[i]);
+                if (!tg || tg->type != "CrateTarget" || !tg->enabled() || tg->message.empty()) continue;
+                for (size_t j = 0; j < sc.traps.size(); ++j) {
+                    scene_trap* cr = dynamic_cast<scene_trap*>(sc.traps[j]);
+                    if (!cr || cr->type != "Crate" || !cr->enabled()) continue;
+                    const float* o = cr->offset();
+                    const float c[3] = { (cr->box[0] + cr->box[3]) * 0.5f + o[0], cr->box[1] + o[1],
+                                         (cr->box[2] + cr->box[5]) * 0.5f + o[2] };
+                    const float* b = tg->box;
+                    if (c[0] < b[0] || c[0] > b[3] || c[2] < b[2] || c[2] > b[5] || std::fabs(c[1] - b[1]) > 1.0f) continue;
+                    std::printf("crate target: %s reached by %s\n", tg->name().c_str(), cr->name().c_str());
+                    tg->set_enabled(false);
+                    tg->execute(tg->message);
+                    break;
+                }
             }
             // Darts in flight: straight on until the Prince or a wall.
             for (size_t i = 0; i < g_darts.size(); ) {
