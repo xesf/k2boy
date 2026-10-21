@@ -5080,10 +5080,22 @@ struct pending_hit {
     double at;              // when it lands
     int    dir;
     int    attacker;        // actor index; -1 the Prince
+    // What kind of swing (Fight__AttackParams 0x4AB7F0's types): a plain
+    // attack, a counter (9/10), a follow (6..8), or a feint, which lands
+    // nothing. `dmg` < 0 takes the attack's own damage.
+    enum kind_t { ATTACK, COUNTER, FOLLOW, FEINT } kind = ATTACK;
+    int    dmg = -1;
 };
 
+// Fight helpers from docs/reference/combat-moves.md.
+// L -> C -> R -> L (Fight__FollowNextDir 0x4AE8DE), and the follow clip.
+inline int follow_next(int dir) { return (dir + 1) % 3; }
+inline const char* follow_clip(int from) {
+    return from == 0 ? "CombatFollowLeftToCenter" : from == 1 ? "CombatFollowCenterToRight" : "CombatFollowRightToLeft";
+}
+
 struct enemy_ai {
-    enum state_t { PATROL, CHARGE, FIGHT, RECOVER, DEAD } state;
+    enum state_t { PATROL, CHARGE, FIGHT, RECOVER, DEAD, DYING } state;
     int    actor;
     float  home[3];
     std::vector<std::array<float, 3> > way;
@@ -5110,6 +5122,10 @@ struct enemy_ai {
     // An archer's round: draw, aim, loose, and the wait before the next.
     int         shot_stage = 0;
     double      shot_at = 0.0;
+    // Dying (fight state 12): until the clip ends, a finisher can take him.
+    double      dying_until = 0.0;
+    bool        last_feint = false;     // never two feints in a row (fight+0x130)
+    bool        taunted = false;        // CombatTaunt on first engaging
 };
 
 struct combat_state {
@@ -5122,6 +5138,29 @@ struct combat_state {
     double                dead_since;     // < 0 while alive
     float                 spawn[3];
     float                 spawn_yaw;
+    // The Prince's block points one way, chosen as he raises it
+    // (Fight__StartBlock 0x4AC758): the attacker's direction, else random.
+    int                   prince_block_dir = 1;
+    bool                  prince_was_blocking = false;
+    // After he blocks a left or right swing: a counter on that side is open
+    // for Counter Attack Window (0x4ACFD3).
+    double                counter_until = -1.0;
+    int                   counter_dir = 0;
+    // After his swing lands unblocked: the next direction within +-Follow
+    // Window/2 of it is a follow (an early press is kept).
+    int                   follow_from = -1;
+    double                follow_lo = 0.0, follow_hi = -1.0;
+    double                press_at = -1.0;
+    int                   press_dir = 0;
+    // Dying (a blow that would leave him 1 or less): helpless until then.
+    double                prince_dying_until = -1.0;
+    double                taunt_at = -1.0;   // CombatTaunt after the draw
+    // A press that could not start yet waits for him to be ready
+    // (fight+0x12C, Fight__RunQueuedRequest 0x4AC7D6). The 1 s it keeps
+    // is ours.
+    double                queued_at = -1.0;
+    int                   queued_dir = 0;
+    bool                  queued_feint = false;
 };
 
 float yaw_toward(const float* from, const float* to) {
@@ -5184,7 +5223,7 @@ void combat_init(combat_state& cs, scene& sc, const k2::engine::fight_params& fp
                 const std::string& a1 = sp.argv[1];
                 int skill = std::atoi(a1.c_str());
                 if (skill < 0 || skill > 10) skill = 4;
-                e.skill = std::max(1, skill);
+                e.skill = std::min(10, skill + 1);   // index 0 is "Skill Level 1"
                 int bottles = combat_tuning::SKILL_BOTTLES[skill];
                 size_t c1 = a1.find(',');
                 size_t c2 = c1 == std::string::npos ? c1 : a1.find(',', c1 + 1);
@@ -5296,10 +5335,78 @@ void specials_update(scene& sc, combat_state& cs, actor_inst& prince, double now
     }
 }
 
-void enemy_damage(combat_state& cs, scene& sc, enemy_ai& e, int dmg, int dir, double now) {
+// A fight blow to the Prince: as for guards, one that would leave him 1 or
+// less leaves 1 and he goes Dying; a blow while dying kills.
+void prince_fight_damage(combat_state& cs, scene& sc, actor_inst& p, int dmg, int dir, double now) {
+    if (cs.dead_since >= 0.0) return;
+    if (cs.prince_dying_until >= now) { prince_damage(cs, sc, p, p.health, dir, now); cs.prince_dying_until = -1.0; return; }
+    if (!potion_state::on(g_potions.shield_until, now) && p.health - dmg <= 1) {
+        p.health = 1;
+        p.stance = 0;
+        play_once(sc, p, "CombatDying_G2", now, actor_yaw(p), true);
+        cs.prince_dying_until = now + std::max(1.0, skill_seconds(sc, p, "CombatDying_G2"));
+        cs.prince_busy_until = cs.prince_dying_until;
+        cs.prince_hit.active = false;
+        play_sound("GBLpfiteinjur", p.node->local.translate, 14.0f, false);
+        std::printf("combat: the Prince is dying\n");
+        return;
+    }
+    prince_damage(cs, sc, p, dmg, dir, now);
+}
+
+// Finishing move (Fight__TryFinishingMove 0x4AE6C5): the two are put
+// g_fight_FinishingDistance apart (1.85 with swords), facing; the finisher
+// plays CombatFinishingMove<N>, the dying CombatFinishingReceive<N> and is
+// dead. N is the finisher's weapon + 1 (guard sword 1, Prince sword 2); the
+// per-enemy numbers at actor+0x1C0 are not traced.
+void finishing_move(scene& sc, actor_inst& who, const std::string& move,
+                    actor_inst& victim, const std::string& receive, double now) {
+    float* v = victim.node->local.translate;
+    const float* w = who.node->local.translate;
+    float dx = v[0] - w[0], dz = v[2] - w[2];
+    const float l = std::sqrt(dx * dx + dz * dz);
+    if (l > 1e-4f) { dx /= l; dz /= l; } else { dx = 0.0f; dz = 1.0f; }
+    v[0] = w[0] + dx * 1.85f;
+    v[2] = w[2] + dz * 1.85f;
+    const float yw = std::atan2(dx, dz);
+    who.node->local.set_yaw(yw);
+    victim.node->local.set_yaw(yw + 3.14159265f);
+    who.stance = victim.stance = 0;
+    play_once(sc, who, move, now, yw, false);
+    if (!play_once(sc, victim, receive, now, yw + 3.14159265f, true)) victim.posed_hold = true;
+}
+
+void enemy_killed(scene& sc, enemy_ai& e) {
     actor_inst& a = sc.actors[size_t(e.actor)];
-    a.health -= dmg;
+    e.state = enemy_ai::DEAD;
+    a.health = 0;
+    a.stance = 0;
+    std::printf("combat: %s is defeated\n", a.script_name.c_str());
+    if (!e.on_death.empty()) sc.script.execute(e.on_death, 0);
+}
+
+// `sword`: a fight blow (Fight__TakeDamage 0x4ADBA0), which never takes the
+// last point: one that would leave 1 or less leaves exactly 1 and he goes
+// Dying (0x4ADC0F, 0x4AD63B). A blow to the dying kills.
+void enemy_damage(combat_state& cs, scene& sc, enemy_ai& e, int dmg, int dir, double now, bool sword = true) {
+    actor_inst& a = sc.actors[size_t(e.actor)];
     play_sound("gblswordswish", a.node->local.translate, 14.0f, false);
+    if (sword && e.state == enemy_ai::DYING) {
+        enemy_killed(sc, e);
+        if (!play_once(sc, a, "CombatDeathGeneric" + e.set, now, actor_yaw(a), true)) a.posed_hold = true;
+        return;
+    }
+    if (sword && a.health - dmg <= 1) {
+        a.health = 1;
+        e.state = enemy_ai::DYING;
+        e.hit.active = false;
+        a.stance = 0;
+        play_once(sc, a, "CombatDying" + e.set, now, actor_yaw(a), true);
+        e.dying_until = now + std::max(1.0, skill_seconds(sc, a, "CombatDying" + e.set));
+        std::printf("combat: %s is dying\n", a.script_name.c_str());
+        return;
+    }
+    a.health -= dmg;
     if (a.health <= 0) {
         e.state = enemy_ai::DEAD;
         a.stance = 0;
@@ -5405,6 +5512,21 @@ void enemy_update(combat_state& cs, scene& sc, enemy_ai& e, actor_inst& prince,
         if (!e.on_death.empty()) sc.script.execute(e.on_death, 0);
         return;
     }
+    if (e.state == enemy_ai::DYING) {
+        if (now < e.dying_until) return;
+        // No finisher came (0x4AD7CB): skill levels 7-10 get up with 1;
+        // the rest die.
+        if (e.skill >= 7) {
+            e.state = enemy_ai::FIGHT;
+            a.posed_hold = a.hold_last = false;
+            a.scripted = 0;
+            set_clip(a, LOCO_BASE);
+            std::printf("combat: %s gets up\n", a.script_name.c_str());
+        } else {
+            enemy_killed(sc, e);
+        }
+        return;
+    }
     const k2::engine::fight_params& fp = *cs.params;
     if (e.waiting) {
         // Asleep, or braced behind a door: wakes on "Start", on being hit,
@@ -5441,19 +5563,47 @@ void enemy_update(combat_state& cs, scene& sc, enemy_ai& e, actor_inst& prince,
     const float d = std::sqrt(dx * dx + dz * dz);
     const bool same_floor = std::fabs(pp[1] - p[1]) < 1.5f;
 
-    // A swing in flight lands at its time, blocked or not.
+    // A swing in flight lands at its time, blocked or not. A feint lands
+    // nothing.
     if (e.hit.active && now >= e.hit.at) {
         e.hit.active = false;
         const bool in_front = angle_diff(yaw_toward(p, pp), actor_yaw(a)) < 1.2f;
-        if (prince_available && same_floor && d <= combat_tuning::REACH && in_front) {
-            if (cs.prince_blocking || potion_state::on(g_potions.guard_until, now)) {   // Guard potion
+        if (e.hit.kind != pending_hit::FEINT && prince_available && same_floor &&
+            d <= combat_tuning::REACH && in_front) {
+            const int dir = e.hit.dir;
+            // Blocked only by a block the same way (0x4ACE54), or the Guard potion.
+            if ((cs.prince_blocking && cs.prince_block_dir == dir) || potion_state::on(g_potions.guard_until, now)) {
                 play_sound("gblswordclank", p, 14.0f, false);
-                const std::string rec = std::string("CombatBlocked") + k_dir_names[e.hit.dir] + e.set;
+                const std::string rec = std::string("CombatBlocked") + k_dir_names[dir] + e.set;
                 play_once(sc, a, rec, now, actor_yaw(a), false);
                 e.busy_until = now + std::max(skill_seconds(sc, a, rec),
-                    fp.fight(std::string("Sword Blocked ") + k_dir_names[e.hit.dir] + " Attack Recover", 0.37));
+                    fp.fight(std::string("Sword Blocked ") + k_dir_names[dir] + " Attack Recover", 0.37));
+                // A left or right swing blocked opens the Prince's counter;
+                // the guard stays open until the window closes.
+                if (dir != DIR_CENTER && e.hit.kind == pending_hit::ATTACK) {
+                    cs.counter_until = now + fp.fight("Counter Attack Window", 0.333);
+                    cs.counter_dir = dir;
+                    e.busy_until = std::max(e.busy_until, cs.counter_until);
+                }
             } else {
-                prince_damage(cs, sc, prince, sword_damage(fp, e.hit.dir), e.hit.dir, now);
+                const int dmg = e.hit.dmg >= 0 ? e.hit.dmg : sword_damage(fp, dir);
+                prince_fight_damage(cs, sc, prince, dmg, dir, now);
+                // His swing landed: a follow to the next side, by skill
+                // (Follow Attacks out of Follow Attack Opportunities, 0x4AD3B8).
+                if (e.hit.kind == pending_hit::ATTACK && cs.dead_since < 0.0 && cs.prince_dying_until < now &&
+                    frand() * skill_param(fp, e.skill, "Follow Attack Opportunities", 100) <
+                        skill_param(fp, e.skill, "Follow Attacks", 5)) {
+                    const int nd = follow_next(dir);
+                    const std::string fc = std::string(follow_clip(dir)) + e.set;
+                    if (play_once(sc, a, fc, now, actor_yaw(a), false)) {
+                        e.hit.active = true;
+                        e.hit.kind = pending_hit::FOLLOW;
+                        e.hit.dir = nd;
+                        e.hit.at = now + fp.fight(std::string(k_dir_names[nd]) + " Follow Attack Begin", 0.4);
+                        e.hit.dmg = int(fp.fight(std::string(k_dir_names[nd]) + " Follow Damage", 7));
+                        e.busy_until = now + skill_seconds(sc, a, fc);
+                    }
+                }
             }
         }
     }
@@ -5499,6 +5649,16 @@ void enemy_update(combat_state& cs, scene& sc, enemy_ai& e, actor_inst& prince,
         if (d <= combat_tuning::FIGHT_DIST) {
             e.state = enemy_ai::FIGHT;
             e.next_attack = now + 0.6;
+            // Fighter__StSetupForFightMode (0x4C604D): a taunt going in.
+            if (!e.taunted) {
+                e.taunted = true;
+                a.node->local.set_yaw(std::atan2(dx, dz));
+                const std::string tc = "CombatTaunt" + e.set;
+                if (play_once(sc, a, tc, now, std::atan2(dx, dz), false)) {
+                    e.busy_until = now + skill_seconds(sc, a, tc);
+                    e.next_attack = e.busy_until + 0.3;
+                }
+            }
             break;
         }
         steer(sc, a, pp, true, dt);
@@ -5508,19 +5668,57 @@ void enemy_update(combat_state& cs, scene& sc, enemy_ai& e, actor_inst& prince,
         if (!prince_available) { e.state = enemy_ai::PATROL; a.stance = 0; break; }
         if (d > combat_tuning::FIGHT_DIST * 1.6f) { e.state = enemy_ai::CHARGE; break; }
         a.node->local.set_yaw(std::atan2(dx, dz));
-        a.stance = find_actor_skill(sc, a, "CombatAtReady" + e.set);
-        if (e.react == enemy_ai::R_LATE && now >= e.react_at) { e.react = enemy_ai::R_NONE; e.next_attack = now; }
+        // At ready; woozy at a bottle or less (Fight__IdleAmbientOrWoozy 0x4AE60F).
+        a.stance = a.health <= combat_tuning::BOTTLE ? find_actor_skill(sc, a, "CombatWoozy" + e.set) : 0;
+        if (!a.stance) a.stance = find_actor_skill(sc, a, "CombatAtReady" + e.set);
+        // The Prince dying in reach: finish him (0x4ACBB4).
+        if (cs.prince_dying_until >= now && cs.dead_since < 0.0 && d <= combat_tuning::REACH) {
+            finishing_move(sc, a, "CombatFinishingMove1" + e.set, prince, "CombatFinishingReceive1_G2", now);
+            e.busy_until = now + skill_seconds(sc, a, "CombatFinishingMove1" + e.set);
+            prince.health = 0;
+            cs.dead_since = now;
+            cs.prince_dying_until = -1.0;
+            std::printf("combat: %s finishes the Prince\n", a.script_name.c_str());
+            break;
+        }
+        if (e.react == enemy_ai::R_LATE && now >= e.react_at) {
+            e.react = enemy_ai::R_NONE;
+            // A late answer to his swing meets it: a clash (Fight__Clash
+            // 0x4AC5FF) - both thrown 1.5 apart, nobody hurt. Our timing
+            // stands in for the 1/30 s test (0x4AC9E8).
+            if (cs.prince_hit.active && cs.prince_hit.kind != pending_hit::FEINT && d <= combat_tuning::REACH) {
+                cs.prince_hit.active = false;
+                const float nx = d > 1e-4f ? dx / d : 0.0f, nz = d > 1e-4f ? dz / d : 1.0f;
+                p[0] = pp[0] - nx * 1.5f;
+                p[2] = pp[2] - nz * 1.5f;
+                play_once(sc, a, "CombatClash" + e.set, now, actor_yaw(a), false);
+                play_once(sc, prince, "CombatClash_G2", now, actor_yaw(prince), false);
+                play_sound("gblswordclank", p, 14.0f, false);
+                e.busy_until = now + skill_seconds(sc, a, "CombatClash" + e.set);
+                cs.prince_busy_until = std::max(cs.prince_busy_until, now + skill_seconds(sc, prince, "CombatClash_G2"));
+                std::printf("combat: clash with %s\n", a.script_name.c_str());
+                break;
+            }
+            e.next_attack = now;
+        }
         // Blocking or flinching wrong: show it when his delay is up.
         if ((e.react == enemy_ai::R_BLOCK || e.react == enemy_ai::R_WRONG) && now >= e.react_at && !a.scripted)
             a.stance = find_actor_skill(sc, a, std::string("CombatBlocking") +
                 k_dir_names[e.react == enemy_ai::R_BLOCK ? cs.prince_hit.dir : (cs.prince_hit.dir + 1) % 3] + e.set);
         if (now >= e.next_attack && e.react != enemy_ai::R_BLOCK) {
             const int dir = std::rand() % 3;
-            const std::string atk = std::string("CombatAttack") + k_dir_names[dir] + e.set;
+            // A feint now and then: 100 out of the weight total 300, never
+            // twice running (0x4ACC36).
+            const bool feint = !e.last_feint && frand() * 300.0 < 100.0;
+            e.last_feint = feint;
+            const std::string atk = std::string(feint ? "CombatFeint" : "CombatAttack") + k_dir_names[dir] + e.set;
             if (play_once(sc, a, atk, now, actor_yaw(a), false)) {
                 e.hit.active = true;
                 e.hit.dir = dir;
-                e.hit.at = now + fp.fight(std::string("Sword ") + k_dir_names[dir] + " Attack Begin", 0.3)
+                e.hit.kind = feint ? pending_hit::FEINT : pending_hit::ATTACK;
+                e.hit.dmg = -1;
+                e.hit.at = feint ? now + fp.fight(std::string("Sword ") + k_dir_names[dir] + " Feint", 0.367)
+                         : now + fp.fight(std::string("Sword ") + k_dir_names[dir] + " Attack Begin", 0.3)
                                + fp.fight("Unblocked Attack", 0.0667);
                 e.busy_until = now + skill_seconds(sc, a, atk);
             }
@@ -5566,23 +5764,54 @@ void prince_hit_resolve(combat_state& cs, scene& sc, actor_inst& p, double now) 
     if (!best) return;
     actor_inst& a = sc.actors[size_t(best->actor)];
     const int dir = cs.prince_hit.dir;
-    if (react == enemy_ai::R_BLOCK && react_ready && !a.scripted) {
-        // Blocked: the Prince recoils for his Blocked .. Recover; the guard
-        // may counter once Computer Recover From Block has passed.
+    if (cs.prince_hit.kind == pending_hit::FEINT) {
+        // Half way through a feint, a guard who rose to block it lets the
+        // block fall, and is open for Computer Recover From Block (0x4AD858).
+        if (react == enemy_ai::R_BLOCK && react_ready && !a.scripted && best->state == enemy_ai::FIGHT) {
+            play_once(sc, a, std::string("CombatAIEndBlock") + k_dir_names[dir] + best->set, now, actor_yaw(a), false);
+            best->busy_until = now + fp.fight("Computer Recover From Block", 0.367);
+            best->next_attack = std::max(best->next_attack, best->busy_until);
+        }
+        return;
+    }
+    if (react == enemy_ai::R_BLOCK && react_ready && !a.scripted && best->state != enemy_ai::DYING) {
+        // Blocked: the Prince recoils for his Blocked .. Recover.
         play_sound("gblswordclank", a.node->local.translate, 14.0f, false);
         play_once(sc, a, std::string("CombatBlock") + k_dir_names[dir] + best->set, now, actor_yaw(a), false);
         play_once(sc, p, std::string("CombatBlocked") + k_dir_names[dir] + "_G2", now, actor_yaw(p), false);
         best->busy_until = now + fp.fight("Recover From Block", 0.0667);
         cs.prince_busy_until = std::max(cs.prince_busy_until,
             now + fp.fight(std::string("Sword Blocked ") + k_dir_names[dir] + " Attack Recover", 0.367));
-        if (frand() * 100.0 < skill_param(fp, best->skill, "Counterattacks", 5.0))
-            best->next_attack = now + fp.fight("Computer Recover From Block", 0.367);
+        // His left or right blocked: the guard may counter on that side
+        // (Fight__AITryCounter 0x4AD975: Counterattacks out of Opportunities).
+        // Both sides use the left counter's numbers (0x4AB83E).
+        if (dir != DIR_CENTER && cs.prince_hit.kind == pending_hit::ATTACK &&
+            frand() * skill_param(fp, best->skill, "Counterattack Opportunities", 100) <
+                skill_param(fp, best->skill, "Counterattacks", 5)) {
+            const std::string cc = std::string("CombatCounter") + k_dir_names[dir] + best->set;
+            if (play_once(sc, a, cc, now, actor_yaw(a), false)) {
+                best->hit.active = true;
+                best->hit.kind = pending_hit::COUNTER;
+                best->hit.dir = dir;
+                best->hit.at = now + fp.fight("Sword Left Counter Attack Begin", 0.467);
+                best->hit.dmg = int(fp.fight("Sword Left Counter Damage", 8));
+                best->busy_until = now + skill_seconds(sc, a, cc);
+                std::printf("combat: %s counters\n", a.script_name.c_str());
+            }
+        }
         return;
     }
-    const int dmg = sword_damage(fp, dir) +
-                    (potion_state::on(g_potions.strength_until, now) ? int(g_potions.strength) : 0);
+    const int base = cs.prince_hit.dmg >= 0 ? cs.prince_hit.dmg : sword_damage(fp, dir);
+    const int dmg = base + (potion_state::on(g_potions.strength_until, now) ? int(g_potions.strength) : 0);
     enemy_damage(cs, sc, *best, dmg, dir, now);
     cs.prince_busy_until = std::max(cs.prince_busy_until, now + fp.fight("Sword Recover From Injuring", 0.2));
+    // A plain swing landed: the follow window opens about this moment.
+    if (cs.prince_hit.kind == pending_hit::ATTACK && best->state != enemy_ai::DEAD) {
+        const double fw = fp.fight("Follow Window", 0.233);
+        cs.follow_from = dir;
+        cs.follow_lo = now - fw * 0.5;
+        cs.follow_hi = now + fw * 0.5;
+    }
 }
 
 // The Prince has started a swing at `dir`: the guard it is aimed at decides
@@ -7579,6 +7808,22 @@ int main(int argc, char** argv) {
                     if (!sc.actors[size_t(combat.enemies[i].actor)].walking)
                         enemy_update(combat, sc, combat.enemies[i], *prince_a, available, game_time, dt);
                 prince_hit_resolve(combat, sc, *prince_a, game_time);
+                // Bodies do not overlap: a swing's root motion stops at
+                // arm's length from a guard (ours; the original's character
+                // collision is not traced).
+                for (size_t i = 0; i < combat.enemies.size(); ++i) {
+                    const enemy_ai& en = combat.enemies[i];
+                    const actor_inst& ea = sc.actors[size_t(en.actor)];
+                    if (en.state == enemy_ai::DEAD || ea.hidden) continue;
+                    float* pp2 = prince_a->node->local.translate;
+                    const float* q = ea.node->local.translate;
+                    const float ox = pp2[0] - q[0], oz = pp2[2] - q[2];
+                    const float od = std::sqrt(ox * ox + oz * oz);
+                    if (od >= 1.1f || std::fabs(pp2[1] - q[1]) > 1.5f) continue;
+                    const float nx = od > 1e-4f ? ox / od : 0.0f, nz = od > 1e-4f ? oz / od : -1.0f;
+                    move_horizontal(sc.coll, pp2, nx * (1.1f - od), nz * (1.1f - od));
+                    if (prince_a->scripted) for (int k = 0; k < 3; k += 2) prince_a->scripted_origin[k] += (k ? nz : nx) * (1.1f - od);
+                }
                 // Falling out of the world is a death too.
                 if (combat.dead_since < 0.0 && prince_a->node->local.translate[1] < sc.mn[1] - 15.0f) {
                     prince_a->health = 0;
@@ -7705,7 +7950,7 @@ int main(int argc, char** argv) {
                         if (en.state == enemy_ai::DEAD || ea.hidden) continue;
                         if (!body_hit::test(ar.p, ar.d, travel, ea.node->local.translate)) continue;
                         en.waiting = false;
-                        enemy_damage(combat, sc, en, arrow_tuning::DAMAGE, DIR_CENTER, game_time);
+                        enemy_damage(combat, sc, en, arrow_tuning::DAMAGE, DIR_CENTER, game_time, false);
                         play_sound("mularrowhitop", ar.p, 14.0f, false);
                         gone = true;
                     }
@@ -7972,19 +8217,139 @@ int main(int argc, char** argv) {
                 play_once(sc, *player, clip, game_time, player_yaw, false);
                 combat.prince_busy_until = game_time + skill_seconds(sc, *player, clip);
                 if (!combat.prince_drawn) player->stance = 0;
+                // Prince__StDrawSwordDone (0x4AF7FF): a taunt once it is out.
+                combat.taunt_at = combat.prince_drawn ? combat.prince_busy_until : -1.0;
+            }
+            if (combat.taunt_at >= 0.0 && free_body && game_time >= combat.taunt_at) {
+                combat.taunt_at = -1.0;
+                if (combat.prince_drawn && play_once(sc, *player, "CombatTaunt_G2", game_time, player_yaw, false))
+                    combat.prince_busy_until = game_time + skill_seconds(sc, *player, "CombatTaunt_G2");
+            }
+            // Dying ran out with nobody to finish him: up again with 1.
+            if (combat.prince_dying_until >= 0.0 && game_time >= combat.prince_dying_until && !dead) {
+                combat.prince_dying_until = -1.0;
+                player->posed_hold = player->hold_last = false;
+                player->scripted = 0;
+                set_clip(*player, LOCO_BASE);
+                std::printf("combat: the Prince gets up\n");
             }
             combat.prince_blocking = combat.prince_drawn && blk_key && free_body;
+            if (combat.prince_blocking && !combat.prince_was_blocking) {
+                // Raised toward a swing coming at him, else any way.
+                int bd = std::rand() % 3;
+                for (size_t i = 0; i < combat.enemies.size(); ++i) {
+                    const enemy_ai& en = combat.enemies[i];
+                    if (!en.hit.active || en.state == enemy_ai::DEAD) continue;
+                    const float* q = sc.actors[size_t(en.actor)].node->local.translate;
+                    const float qx = q[0] - lt.translate[0], qz = q[2] - lt.translate[2];
+                    if (qx * qx + qz * qz <= combat_tuning::REACH * combat_tuning::REACH * 1.5f) { bd = en.hit.dir; break; }
+                }
+                combat.prince_block_dir = bd;
+            }
+            combat.prince_was_blocking = combat.prince_blocking;
             player->weapon_shown = combat.prince_drawn;
+            // The stick's side for a swing; the run key held makes it a feint
+            // (the original's Walk + attack, 0x502..0x504).
+            const int atk_dir = local[0] > 0.4f ? DIR_LEFT : local[0] < -0.4f ? DIR_RIGHT : DIR_CENTER;
+            const bool feint_key = down[plat::KEY_LSHIFT] || down[plat::KEY_RSHIFT] ||
+                                   (pad.connected && pad.button[plat::PAD_RSHOULDER]);
+            if (atk_pressed && combat.prince_drawn && !dead) { combat.press_at = game_time; combat.press_dir = atk_dir; }
+            if (atk_pressed && combat.prince_drawn && !dead && !free_body) {
+                combat.queued_at = game_time;
+                combat.queued_dir = atk_dir;
+                combat.queued_feint = feint_key;
+            }
+            // A follow: the next side pressed about when his swing landed,
+            // even while that swing's clip still plays.
+            if (combat.follow_from >= 0 && combat.prince_drawn && !dead) {
+                if (game_time > combat.follow_hi) combat.follow_from = -1;
+                else if (combat.press_at >= combat.follow_lo && combat.press_at <= combat.follow_hi &&
+                         combat.press_dir == follow_next(combat.follow_from)) {
+                    const int nd = follow_next(combat.follow_from);
+                    const std::string fc = std::string(follow_clip(combat.follow_from)) + "_G2";
+                    combat.follow_from = -1;
+                    if (play_once(sc, *player, fc, game_time, player_yaw, false)) {
+                        combat.prince_hit.active = true;
+                        combat.prince_hit.kind = pending_hit::FOLLOW;
+                        combat.prince_hit.dir = nd;
+                        combat.prince_hit.at = game_time + fight_tuning.fight(std::string(k_dir_names[nd]) + " Follow Attack Begin", 0.4);
+                        combat.prince_hit.dmg = int(fight_tuning.fight(std::string(k_dir_names[nd]) + " Follow Damage", 7));
+                        combat.prince_busy_until = game_time + skill_seconds(sc, *player, fc);
+                        enemy_react(combat, sc, lt.translate, player_yaw, game_time);
+                    }
+                }
+            }
             if (combat.prince_drawn && free_body) {
+                // A queued press goes now, as if just made.
+                bool atk_go = atk_pressed;
+                int  go_dir = atk_dir;
+                bool go_feint = feint_key;
+                if (!atk_go && combat.queued_at >= 0.0 && game_time - combat.queued_at < 1.0 &&
+                    !(combat.prince_blocking && game_time - combat.queued_at > 0.1)) {
+                    atk_go = true;
+                    go_dir = combat.queued_dir;
+                    go_feint = combat.queued_feint;
+                }
+                combat.queued_at = -1.0;
                 // Face the nearest guard; stand ready, or block.
                 const int ne = nearest_enemy(combat, sc, lt.translate, 6.0f);
                 if (ne >= 0) player_yaw = yaw_toward(lt.translate,
                                                      sc.actors[size_t(combat.enemies[size_t(ne)].actor)].node->local.translate);
-                if (atk_pressed) {
-                    const int dir = local[0] > 0.4f ? DIR_LEFT : local[0] < -0.4f ? DIR_RIGHT : DIR_CENTER;
+                // A dying guard in reach and in front, for a finisher.
+                int dying = -1;
+                for (size_t i = 0; i < combat.enemies.size(); ++i) {
+                    const enemy_ai& en = combat.enemies[i];
+                    if (en.state != enemy_ai::DYING) continue;
+                    const float* q = sc.actors[size_t(en.actor)].node->local.translate;
+                    const float qx = q[0] - lt.translate[0], qz = q[2] - lt.translate[2];
+                    if (qx * qx + qz * qz > combat_tuning::REACH * combat_tuning::REACH || std::fabs(q[1] - lt.translate[1]) > 1.5f) continue;
+                    if (angle_diff(std::atan2(qx, qz), player_yaw) > 1.2f) continue;
+                    dying = int(i);
+                    break;
+                }
+                if (atk_go && dying >= 0) {
+                    enemy_ai& en = combat.enemies[size_t(dying)];
+                    actor_inst& ea = sc.actors[size_t(en.actor)];
+                    finishing_move(sc, *player, "CombatFinishingMove2_G2", ea, "CombatFinishingReceive2" + en.set, game_time);
+                    player_yaw = actor_yaw(*player);
+                    combat.prince_busy_until = game_time + skill_seconds(sc, *player, "CombatFinishingMove2_G2");
+                    enemy_killed(sc, en);
+                    std::printf("combat: the Prince finishes %s\n", ea.script_name.c_str());
+                } else if (atk_go && go_feint) {
+                    // Feint (Fight__StartFeint 0x4AC229): threatens, lands nothing.
+                    const std::string fc = std::string("CombatFeint") + k_dir_names[go_dir] + "_G2";
+                    if (play_once(sc, *player, fc, game_time, player_yaw, false)) {
+                        const double len = fight_tuning.fight(std::string("Sword ") + k_dir_names[go_dir] + " Feint", 0.367);
+                        combat.prince_hit.active = true;
+                        combat.prince_hit.kind = pending_hit::FEINT;
+                        combat.prince_hit.dir = go_dir;
+                        combat.prince_hit.dmg = -1;
+                        combat.prince_hit.at = game_time + len * 0.5;
+                        combat.prince_busy_until = game_time + std::max(len, skill_seconds(sc, *player, fc));
+                        enemy_react(combat, sc, lt.translate, player_yaw, game_time);
+                    }
+                } else if (atk_go && combat.prince_blocking && game_time < combat.counter_until &&
+                           go_dir == combat.counter_dir) {
+                    // Counter (0x4AC002): the side he just blocked, from the
+                    // block, in the window. Left counter numbers both sides.
+                    const std::string cc = std::string("CombatCounter") + k_dir_names[go_dir] + "_G2";
+                    combat.counter_until = -1.0;
+                    if (play_once(sc, *player, cc, game_time, player_yaw, false)) {
+                        combat.prince_hit.active = true;
+                        combat.prince_hit.kind = pending_hit::COUNTER;
+                        combat.prince_hit.dir = go_dir;
+                        combat.prince_hit.at = game_time + fight_tuning.fight("Sword Left Counter Attack Begin", 0.467);
+                        combat.prince_hit.dmg = int(fight_tuning.fight("Sword Left Counter Damage", 8));
+                        combat.prince_busy_until = game_time + skill_seconds(sc, *player, cc);
+                        enemy_react(combat, sc, lt.translate, player_yaw, game_time);
+                    }
+                } else if (atk_go) {
+                    const int dir = go_dir;
                     const std::string atk = std::string("CombatAttack") + k_dir_names[dir] + "_G2";
                     if (play_once(sc, *player, atk, game_time, player_yaw, false)) {
                         combat.prince_hit.active = true;
+                        combat.prince_hit.kind = pending_hit::ATTACK;
+                        combat.prince_hit.dmg = -1;
                         combat.prince_hit.dir = dir;
                         combat.prince_hit.at = game_time + fight_tuning.fight(
                             std::string("Sword ") + k_dir_names[dir] + " Attack Begin", 0.3);
@@ -7999,8 +8364,10 @@ int main(int argc, char** argv) {
                         enemy_react(combat, sc, lt.translate, player_yaw, game_time);
                     }
                 }
-                player->stance = find_actor_skill(sc, *player,
-                    combat.prince_blocking ? "CombatBlockingCenter_G2" : "CombatAtReady_G2");
+                player->stance = combat.prince_blocking
+                    ? find_actor_skill(sc, *player, std::string("CombatBlocking") + k_dir_names[combat.prince_block_dir] + "_G2")
+                    : player->health <= combat_tuning::BOTTLE ? find_actor_skill(sc, *player, "CombatWoozy_G2") : 0;
+                if (!player->stance) player->stance = find_actor_skill(sc, *player, "CombatAtReady_G2");
             }
             // E near a pickup collects it.
             if (act && !dead && !taking.active()) {

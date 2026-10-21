@@ -40,7 +40,7 @@ reversed. The docs say which is which.
 | Front end | Title screen, in-game menu, Options (sound volume, difficulty, controls), Load/Save, Cinematics, Credits, drawn from the original art with its own TrueType font |
 | Levels | `.lvl` regions, every `.K2A` room, materials and textures, fog and clip planes |
 | Prince | Skeleton and skills from `.act`/`.skl`, walking, running, turning, jumping (the original's launch velocities and gravity), ledges (climb, hang, shimmy, pull-up), crates (push, pull, climb on), swimming and diving, picking things up |
-| Combat | Sword drawn and sheathed, attacks, blocks, injuries, deaths; guard AI and timing from `fight.ini` and `enemy.dat`; health in bottles |
+| Combat | Sword drawn and sheathed, attacks, blocks, feints, counters, follows, clashes, dying and finishing moves, taunts; guard AI and timing from `fight.ini` and `enemy.dat`; the bow and archers; health in bottles |
 | Traps and scripts | The trap message language: doors, plates, areas, movers, water raising and lowering, cutscene cameras, fixtures (prisoners, rats, levers, cranes), pickups and potions, pit spikes |
 | Effects | NetImmerse 2.3 `.nif` particle effects (potions, SpecialEffect traps) |
 | Audio | `.sfx` sounds, positional ambiences, skill sound keys, a software mixer |
@@ -95,10 +95,17 @@ Two schemes, switched with **Tab** in game or in Options:
 | Crouch (hold); move to crawl through low gaps | C | B, with the sword away |
 | Draw / sheathe sword | R | Y |
 | Attack (left / right / centre by the stick) | F | B |
-| Block | G | LB |
+| Feint (a swing that stops short) | Shift + F | RB + B |
+| Block (it turns to meet the swing coming) | G | LB |
+| Bow: ready / put away; hold attack to draw, let go to loose | B, then F | L3, then B |
 | Game menu | Esc | Start |
 | Motion camera (pads with a gyroscope) | — | Select |
 | Free-fly camera / trigger volumes | V / T | — |
+
+**Sword moves**, as the original has them: block a swing from the left or right and attack the
+same side at once to **counter**; attack the next side (left, centre, right, left) just as a blow
+lands to **follow** it; a fighter brought to his last point is **dying**, and the next attack is a
+**finishing move**.
 
 **Ledges:** E at a ledge in reach climbs it. Jump under a higher one to catch it, then press up to
 pull up, down to let go, and left or right to shimmy. **Swimming:** in deep water, move to swim, E
