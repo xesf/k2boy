@@ -137,6 +137,22 @@ private:
     double      m_exit_time;        // +0x1E8
 };
 
+// A Messenger (Traps.txt: "as many as needed; specifies a sequence of
+// states with messages"): a state machine of scripts. Each argv from 1 on
+// is "<state>:<msg>:{items}[<msg>:{items}...]"; a message the current
+// state lists runs its items, which usually move it on with "state:X"
+// (Ivory Tower's gates: "IsClosed:Open:{gate,open5m;G1Msg,state:IsOpen}").
+// The format is the data's; the class is not traced.
+class messenger_trap : public trap_object {
+public:
+    messenger_trap(script_world& w, const std::string& name, const trap_header& h,
+                   const std::vector<std::string>& argv);
+    bool handle(const std::string& msg, script_target* sender);
+private:
+    struct entry { std::string state, msg, items; };
+    std::vector<entry> m_entries;
+};
+
 // An Action: something the Prince works with the action input - a lever, a
 // crane's control, a cart to push, the crusher, Assan's mouth. Traps.txt
 // names its arguments:

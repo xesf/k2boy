@@ -173,6 +173,48 @@ void pressure_plate::update(double now, bool pressed) {
     }
 }
 
+messenger_trap::messenger_trap(script_world& w, const std::string& name, const trap_header& h,
+                               const std::vector<std::string>& argv)
+    : trap_object(w, name, h) {
+    for (size_t i = 1; i < argv.size(); ++i) {
+        const std::string& a = argv[i];
+        const size_t c = a.find(':');
+        if (c == std::string::npos) continue;
+        const std::string state = a.substr(0, c);
+        size_t at = c + 1;
+        for (;;) {                                  // "<msg>:{items}" pairs
+            const size_t open = a.find('{', at);
+            if (open == std::string::npos) break;
+            std::string m = a.substr(at, open - at);
+            while (!m.empty() && (m[m.size() - 1] == ':' || m[m.size() - 1] == ' ')) m.erase(m.size() - 1);
+            while (!m.empty() && (m[0] == ' ' || m[0] == ';')) m.erase(0, 1);
+            int depth = 0;
+            size_t close = open;
+            for (; close < a.size(); ++close) {
+                if (a[close] == '{') ++depth;
+                else if (a[close] == '}' && --depth == 0) break;
+            }
+            entry e;
+            e.state = lower(state);
+            e.msg = lower(m);
+            e.items = a.substr(open + 1, close - open - 1);
+            m_entries.push_back(e);
+            if (close >= a.size()) break;
+            at = close + 1;
+        }
+    }
+}
+
+bool messenger_trap::handle(const std::string& msg, script_target* sender) {
+    const std::string st = lower(m_state), m = lower(msg);
+    for (size_t i = 0; i < m_entries.size(); ++i)
+        if (m_entries[i].state == st && m_entries[i].msg == m) {
+            if (m_enabled) execute(m_entries[i].items);
+            return true;
+        }
+    return trap_object::handle(msg, sender);
+}
+
 action_trap::action_trap(script_world& w, const std::string& name, const trap_header& h,
                          const std::vector<std::string>& argv, const trap_volume& volume)
     : trap_object(w, name, h), m_argv(argv), m_volume(volume) {

@@ -839,6 +839,10 @@ struct scene {
     // against - not the trap's box.
     struct water_area { size_t trap; std::vector<float> tris; float mn[2], mx[2]; };
     std::vector<water_area> waters;
+    // Abyss traps (no arguments): falling into one is death. Ours; the
+    // class is not traced.
+    struct abyss_area { k2::engine::trap_object* trap; k2::engine::trap_volume vol; };
+    std::vector<abyss_area> abysses;
     // Trap actors' skills, loaded on first use: "actor/skill" lower-case.
     std::map<std::string, assets::skl_file*> trap_skills;
     // Hand-held weapons (Geometry/Utils/WEAPONS.K2A, OtherWeapons.K2A), by
@@ -2806,6 +2810,7 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
         if (!n.has_trap)                 solid = !it.transparent;
         else if (n.trap.name == "Generic") solid = hdr.collideable;
         else if (n.trap.name == "Water")   solid = false;   // swum in, not stood on
+        else if (n.trap.name == "Abyss")   solid = false;   // fallen through
         else                             solid = hdr.collideable && !is_volume;
         // Trap geometry gets its own collision node, so scripts can switch it
         // on and off and move it; it is added even when it starts non-solid.
@@ -2835,6 +2840,8 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
                 a->set_center(n.trap.center);
                 sc.actions.push_back(a);
                 t = a;
+            } else if (n.trap.name == "Messenger") {
+                t = new k2::engine::messenger_trap(sc.script, n.name, hdr, n.trap.argv);
             } else if (n.trap.name == "Audio") {
                 t = new audio_trap(sc.script, n.name, hdr, n.trap.argv, n.trap.bbox);
             } else if (n.trap.name == "SpecialEffect") {
@@ -2895,6 +2902,12 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
                         wa.mn[1] = std::min(wa.mn[1], v.z); wa.mx[1] = std::max(wa.mx[1], v.z);
                     }
                 sc.waters.push_back(wa);
+            }
+            if (n.trap.name == "Abyss") {
+                scene::abyss_area ab;
+                ab.trap = t;
+                ab.vol = vol;
+                sc.abysses.push_back(ab);
             }
             sc.traps.push_back(t);
             // A spawn trap's messages are its actor's (EnemyStart__ctor knows
@@ -4205,6 +4218,18 @@ potion_state g_potions;
 namespace jump_tuning {
 const float GRAVITY = -17.0f;           // FallGravity
 const float MIN_FALL_HEIGHT = 6.25f;
+// The rest of the fall block (0x4F8547; config.dat sets the damage three).
+const float FALL_DEATH_HEIGHT = 12.0f;
+const float FALL_CONST_DAMAGE = 6.0f, FALL_LINEAR_DAMAGE = 0.5f, FALL_SQUARED_DAMAGE = 1.5f;
+// Damage for a drop of `h`. How the three combine is not traced: here a
+// polynomial in the height past MinFallHeight, and death past
+// FallDeathHeight.
+inline int fall_damage(float h, int health) {
+    if (h <= MIN_FALL_HEIGHT) return 0;
+    if (h >= FALL_DEATH_HEIGHT) return health;
+    const float x = h - MIN_FALL_HEIGHT;
+    return int(FALL_CONST_DAMAGE + FALL_LINEAR_DAMAGE * x + FALL_SQUARED_DAMAGE * x * x + 0.5f);
+}
 }
 
 struct jump_ctl {
@@ -4214,8 +4239,9 @@ struct jump_ctl {
     float  origin[3];
     float  vel[3];
     float  peak_y;
+    float  fell;           // height of the last landing's drop, until combat takes it
 
-    jump_ctl() : state(NONE), dir(0), t0(0), peak_y(0) {
+    jump_ctl() : state(NONE), dir(0), t0(0), peak_y(0), fell(0) {
         for (int k = 0; k < 3; ++k) origin[k] = vel[k] = 0.0f;
     }
 };
@@ -4351,6 +4377,7 @@ bool jump_update(jump_ctl& jc, actor_inst& a, const k2::engine::collision_world&
         jc.state = jump_ctl::LAND;
         const bool feather = potion_state::on(g_potions.fall_until, now);    // Fall potion
         const int c = fell > jump_tuning::MIN_FALL_HEIGHT && !feather ? LAND_PAINFUL : land[jc.dir];
+        jc.fell = feather ? 0.0f : fell;
         jump_begin(jc, a, c, now, pos);
         return true;
     }
@@ -7684,6 +7711,26 @@ int main(int argc, char** argv) {
             }
             bool in_jump = !in_swim && !scripted_now && !on_ledge && ledges.state == hang_ctl::NONE &&
                 jump_update(jumps, *player, sc.coll, lt.translate, player_yaw, game_time, dt);
+            if (jumps.fell > 0.0f) {            // a hard landing hurts; a long drop kills
+                const int dmg = jump_tuning::fall_damage(jumps.fell, player->health);
+                jumps.fell = 0.0f;
+                if (dmg > 0 && !dead) {
+                    prince_damage(combat, sc, *player, dmg, 0, game_time);
+                    if (combat.dead_since >= 0.0)
+                        play_once(sc, *player, "LandVertDeadly_G", game_time, player_yaw, true);
+                    else
+                        player->scripted = 0;   // the painful landing, not a sword injury
+                }
+            }
+            if (!dead && combat.dead_since < 0.0)
+                for (size_t i = 0; i < sc.abysses.size(); ++i) {
+                    if (!sc.abysses[i].trap->enabled() || !sc.abysses[i].vol.contains(lt.translate)) continue;
+                    // Into the abyss: dead, still falling.
+                    player->health = 0;
+                    combat.dead_since = game_time;
+                    std::printf("combat: the Prince falls into the abyss\n");
+                    break;
+                }
             // In the air, the hands catch any ledge in reach.
             if (in_jump && jumps.state == jump_ctl::AIR && game_time >= regrab_after) {
                 const float hs = std::sqrt(jumps.vel[0] * jumps.vel[0] + jumps.vel[2] * jumps.vel[2]);
@@ -7790,10 +7837,22 @@ int main(int argc, char** argv) {
             }
             // Stand on the floor, step up small ledges, fall off edges.
             if (!noclip && !scripted_now && !in_jump && !busy) {
+                static const float k_down[3] = { 0.0f, -1.0f, 0.0f };
+                k2::engine::pick_hit fall_probe;
                 float gy;
                 if (player_vy <= 0.0f && ground_under(sc.coll, lt.translate, gy)) {
                     lt.translate[1] = gy;
                     player_vy = 0.0f;
+                } else if (player_vy == 0.0f && !in_swim && crates.state == crate_ctl::NONE &&
+                           crouch.state == crouch_ctl::NONE && !sc.coll.pick(lt.translate, k_down, 1.0f, true, fall_probe)) {
+                    // Off an edge with nothing within a unit below: a fall,
+                    // as letting go of a ledge is - the fall clip, a landing,
+                    // and fall damage from the height.
+                    jumps.state = jump_ctl::AIR;
+                    jumps.dir = 0;
+                    jumps.vel[0] = jumps.vel[1] = jumps.vel[2] = 0.0f;
+                    jumps.peak_y = lt.translate[1];
+                    jump_begin(jumps, *player, FALL_VERT, game_time, lt.translate);
                 } else {
                     player_vy -= move_tuning::GRAVITY * dt;
                     const float o[3] = { lt.translate[0], lt.translate[1], lt.translate[2] };
