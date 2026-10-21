@@ -2703,6 +2703,9 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
             pd.trap = n.trap;
             pd.trap.node = n.name;
             for (int k = 0; k < 3; ++k) pd.pos[k] = (n.trap.bbox[k] + n.trap.bbox[k + 3]) * 0.5f;
+            if (std::getenv("K2_PICKUPS"))
+                std::printf("pickup %s at (%.2f %.2f %.2f) %s\n", n.name.c_str(), pd.pos[0], pd.pos[1], pd.pos[2],
+                            pd.argv.size() > 1 ? pd.argv[1].c_str() : "");
             sc.pickups.push_back(pd);
         }
     }
@@ -6126,14 +6129,74 @@ bool pickup_live(scene& sc, size_t i) {
 // mapped by the table built at 0x4EB9D6 to the effect it applies with argv2
 // as its argument; a name is an object (PrinceSword01 and argv2 "weapon"
 // arms the Prince). Durations become absolute game times; -1 is for good.
+// Taking a pickup: argv4..7 name the Prince's reach, grasp, use and finish
+// clips (Traps.txt); left empty, the kind of item picks them - a potion is
+// bent for, drunk and finished by its effect (DrinkFinish<Effect>_G), a
+// weapon inspected, anything else bent down for. Which clips the original
+// picks by default is not traced.
+struct pickup_seq {
+    int pickup;
+    std::vector<std::string> clips;
+    size_t step;
+    bool taken, applied;
+    pickup_seq() : pickup(-1), step(0), taken(false), applied(false) {}
+    bool active() const { return pickup >= 0; }
+    void begin(scene& sc, const actor_inst& p, const scene::pickup_def& pk, int i) {
+        static const char* finish[11] = { 0, "Heal", "Life", "Strength", "Impervious", "Jump", "Fall",
+                                          "Camouflage", "Guard", "FullHeal", "Poison" };
+        pickup = i;
+        step = 0;
+        taken = applied = false;
+        clips.clear();
+        for (size_t a = 4; a <= 7 && a < pk.argv.size(); ++a)
+            if (!pk.argv[a].empty() && find_actor_skill(sc, p, pk.argv[a])) clips.push_back(pk.argv[a]);
+        if (!clips.empty()) return;
+        const std::string a1 = pk.argv.size() > 1 ? pk.argv[1] : "";
+        const std::string a2 = pk.argv.size() > 2 ? pk.argv[2] : "";
+        if (!a1.empty() && a1.find_first_not_of("0123456789") == std::string::npos) {
+            const int type = std::atoi(a1.c_str());
+            clips.push_back("BendDownToGrab_G");
+            clips.push_back("DrinkPotion_G");
+            clips.push_back(type >= 1 && type <= 10 ? std::string("DrinkFinish") + finish[type] + "_G"
+                                                    : std::string("DrinkPotionFinish_G"));
+        } else if (equals_nocase(a2, "weapon")) {
+            clips.push_back("InspectWeaponFromGound_G");
+            clips.push_back("InspectWeaponFinish_G");
+        } else {
+            clips.push_back("BendDownToGrabObject_G");
+        }
+        std::vector<std::string> have;
+        for (size_t c = 0; c < clips.size(); ++c)
+            if (find_actor_skill(sc, p, clips[c])) have.push_back(clips[c]);
+        clips.swap(have);
+    }
+};
+
 void pickup_apply(combat_state& cs, scene& sc, actor_inst& p, const scene::pickup_def& pk, double now) {
     const std::string a1 = pk.argv.size() > 1 ? pk.argv[1] : "";
     const std::string a2 = pk.argv.size() > 2 ? pk.argv[2] : "";
     std::string lo = a2;
     for (size_t i = 0; i < lo.size(); ++i) lo[i] = char(std::tolower(static_cast<unsigned char>(lo[i])));
     if (lo == "weapon") {
-        p.armed = true;
-        std::printf("pickup: %s - the Prince has a sword (R draws it)\n", pk.name.c_str());
+        // The sword arms him here; the bow and arrows come from their
+        // scripts ("prince,weapon:+bow").
+        std::string l1 = a1;
+        for (size_t i = 0; i < l1.size(); ++i) l1[i] = char(std::tolower(static_cast<unsigned char>(l1[i])));
+        if (l1.find("sword") != std::string::npos) {
+            p.armed = true;
+            std::printf("pickup: %s - the Prince has a sword (R draws it)\n", pk.name.c_str());
+        } else {
+            std::printf("pickup: %s (%s)\n", pk.name.c_str(), a1.c_str());
+        }
+        return;
+    }
+    if (lo == "reload") {
+        // "arrows","reload","<type>,<count>,<?>": a quiver's worth.
+        const std::string a3 = pk.argv.size() > 3 ? pk.argv[3] : "";
+        const size_t c = a3.find(',');
+        const int n = c == std::string::npos ? 1 : std::atoi(a3.c_str() + c + 1);
+        p.arrows += n;
+        std::printf("pickup: %s - %d arrows, %d now\n", pk.name.c_str(), n, p.arrows);
         return;
     }
     if (a1.empty() || a1.find_first_not_of("0123456789") != std::string::npos) {
@@ -6986,6 +7049,7 @@ int main(int argc, char** argv) {
                 sc.actors[i].health = start_health;
             }
     std::vector<bool> pickup_taken(sc.pickups.size(), false);
+    pickup_seq taking;
     std::printf("combat: %zu fight.ini values, %zu enemy.dat values, %zu guards, %zu pickups\n",
                 fight_tuning.fight_count(), fight_tuning.enemy_count(), combat.enemies.size(),
                 sc.pickups.size());
@@ -7636,19 +7700,37 @@ int main(int argc, char** argv) {
                     combat.prince_blocking ? "CombatBlockingCenter_G2" : "CombatAtReady_G2");
             }
             // E near a pickup collects it.
-            if (act && !dead) {
+            if (act && !dead && !taking.active()) {
                 for (size_t i = 0; i < sc.pickups.size(); ++i) {
                     if (pickup_taken[i] || !pickup_live(sc, i)) continue;
                     const scene::pickup_def& pk = sc.pickups[i];
                     const float dx = pk.pos[0] - lt.translate[0], dz = pk.pos[2] - lt.translate[2];
                     if (dx * dx + dz * dz > 1.6f * 1.6f || std::fabs(pk.pos[1] - lt.translate[1]) > 2.0f) continue;
                     pickup_taken[i] = true;
-                    if (pk.actor >= 0) sc.actors[size_t(pk.actor)].hidden = true;
-                    pickup_apply(combat, sc, *player, pk, game_time);
-                    if (pk.argv.size() > 3 && !pk.argv[3].empty()) sc.script.execute(pk.argv[3], 0);
-                    play_sound("PRNpickup", lt.translate, 10.0f, false);
+                    taking.begin(sc, *player, pk, int(i));
+                    player_yaw = yaw_toward(lt.translate, pk.pos);
                     break;
                 }
+            }
+            // A pickup's clips, one after another: the item leaves the floor
+            // as the first ends, and works as the last (the finish) starts.
+            if (taking.active() && !player->scripted && !dead) {
+                const scene::pickup_def& pk = sc.pickups[size_t(taking.pickup)];
+                if ((taking.step >= 1 || taking.clips.empty()) && !taking.taken) {
+                    taking.taken = true;
+                    if (pk.actor >= 0) sc.actors[size_t(pk.actor)].hidden = true;
+                    play_sound("PRNpickup", lt.translate, 10.0f, false);
+                }
+                if (taking.step + 1 >= taking.clips.size() && !taking.applied) {
+                    taking.applied = true;
+                    pickup_apply(combat, sc, *player, pk, game_time);
+                    const bool code = pk.argv.size() > 2 && equals_nocase(pk.argv[2], "reload");
+                    if (!code && pk.argv.size() > 3 && !pk.argv[3].empty()) sc.script.execute(pk.argv[3], 0);
+                }
+                if (taking.step < taking.clips.size())
+                    play_once(sc, *player, taking.clips[taking.step++], game_time, player_yaw, false);
+                else
+                    taking.pickup = -1;
             }
             if (!dead) specials_update(sc, combat, *player, game_time);
             if (player->pending_hurt > 0) {       // "prince,hurt:N" from a trap
