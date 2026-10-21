@@ -703,6 +703,11 @@ struct actor_inst {
     bool                              has_bow;        // "weapon:+bow"
     int                               arrows;         // "weapon:+arrow,type,count"
     int                               pending_hurt;   // "hurt:N", applied by combat
+    // "WalkAt:walk|run,<placeholder>[,REMOVE]": on his way there, under the
+    // script's control; REMOVE hides him on arrival.
+    bool                              walking;
+    bool                              walk_run, walk_remove;
+    float                             walk_to[3];
     // A Fixture trap's actor (prisoners, rats, levers, cranes): it idles
     // through `ambient`, a random pick each time, and plays any skill a
     // script names. `home` is where it stands between them.
@@ -733,6 +738,7 @@ struct actor_inst {
                    scripted_yaw(0), remove_after(false), hidden(false), stance(0),
                    hold_last(false), posed_hold(false), health(100), max_health(100), armed(false),
                    has_bow(false), arrows(0), pending_hurt(0),
+                   walking(false), walk_run(false), walk_remove(false),
                    is_fixture(false), start_flag(false), hand_joint(-1), weapon_shown(false), carry_joint(-1), home_yaw(0), body_pitch(0) {
         hand_off[0] = hand_off[1] = hand_off[2] = 0.0f;
         scripted_origin[0] = scripted_origin[1] = scripted_origin[2] = 0.0f;
@@ -1992,6 +1998,7 @@ public:
         }
         if (msg.compare(0, 8, "SkillAt:") == 0 || msg.compare(0, 8, "skillat:") == 0)
             return skill_at(msg.substr(8));
+        if (msg.size() > 7 && equals_nocase(msg.substr(0, 7), "walkat:")) return walk_at(msg.substr(7));
         actor_inst& a = m_sc.actors[m_actor];
         if (msg.size() > 5 && equals_nocase(msg.substr(0, 5), "item:")) return item(a, msg.substr(5));
         if (is_prince(a)) {
@@ -2025,6 +2032,30 @@ public:
     double snooze_until;
 
 private:
+    bool walk_at(const std::string& args) {
+        actor_inst& a = m_sc.actors[m_actor];
+        std::vector<std::string> f;
+        size_t st = 0;
+        for (;;) {
+            const size_t c = args.find(',', st);
+            f.push_back(args.substr(st, c == std::string::npos ? std::string::npos : c - st));
+            if (c == std::string::npos) break;
+            st = c + 1;
+        }
+        if (f.size() < 2) return false;
+        std::string key = f[1];
+        for (size_t i = 0; i < key.size(); ++i) key[i] = char(std::tolower(static_cast<unsigned char>(key[i])));
+        std::map<std::string, scene::named_point>::const_iterator p = m_sc.points.find(key);
+        if (p == m_sc.points.end()) { std::printf("WalkAt: no placeholder %s\n", f[1].c_str()); return false; }
+        for (int k = 0; k < 3; ++k) a.walk_to[k] = p->second.pos[k];
+        a.walk_run = equals_nocase(f[0], "run");
+        a.walk_remove = f.size() > 2 && equals_nocase(f[2], "remove");
+        a.walking = true;
+        a.scripted = 0;
+        a.hidden = false;
+        return true;
+    }
+
     // "weapon:+sword", "weapon:+bow", "weapon:+arrow,<type>,<count>",
     // "weapon:-all": what the Prince carries (prison1 takes it all away,
     // the secret guy's door gives the sword back).
@@ -2280,12 +2311,18 @@ bool play_once(scene& sc, actor_inst& a, const std::string& name, double now, fl
 //   follow,(dx,dy,dz)(lx,ly,lz)  ride along at an offset from the Prince, looking
 //                           along a direction (our reading; not traced further)
 //   follow,Actor,(..)(..)   the same about a named actor ("follow,pg2Yell,...")
+//   security,[Actor,](pos)(off)  fixed at pos, turning to keep the Prince (or
+//                           the actor) in view, aimed at him plus `off`
+//   look,(off)(at)          rides at an offset from the Prince, looking at a
+//                           fixed point
+//   #d                      as D
+// security and look are our reading of the data; the class is not traced.
 //
 // Trailing letters ("X") are flags the original keeps (0x409975, |5); the
 // transition they select is not modelled - every change is a cut.
 class camera_target : public k2::engine::script_target {
 public:
-    enum mode_t { DEFAULT, TRIPOD, FOLLOW };
+    enum mode_t { DEFAULT, TRIPOD, FOLLOW, SECURITY, LOOK };
 
     explicit camera_target(const scene& sc) : script_target("camera"), mode(DEFAULT), m_sc(sc) {
         for (int k = 0; k < 3; ++k) pos[k] = look[k] = 0.0f;
@@ -2293,7 +2330,7 @@ public:
 
     bool receive(const std::string& msg, k2::engine::script_target*) {
         if (msg.empty()) return false;
-        if (msg[0] == 'D' || msg[0] == 'd') { mode = DEFAULT; return true; }
+        if (msg[0] == 'D' || msg[0] == 'd' || equals_nocase(msg, "#d")) { mode = DEFAULT; return true; }
         const size_t comma = msg.find(',');
         if (comma == std::string::npos) return false;
         std::string verb = msg.substr(0, comma);
@@ -2301,7 +2338,7 @@ public:
             if (verb[i] >= 'A' && verb[i] <= 'Z') verb[i] = char(verb[i] - 'A' + 'a');
         std::string args = msg.substr(comma + 1);
         subject.clear();
-        if (verb.compare(0, 3, "fol") == 0 && !args.empty() && args[0] != '(') {
+        if ((verb.compare(0, 3, "fol") == 0 || verb.compare(0, 3, "sec") == 0) && !args.empty() && args[0] != '(') {
             const size_t c2 = args.find(',');
             if (c2 == std::string::npos) return false;
             subject = args.substr(0, c2);
@@ -2320,10 +2357,10 @@ public:
             mode = TRIPOD;
             return true;
         }
-        if (verb.compare(0, 3, "fol") == 0) {
+        if (verb.compare(0, 3, "fol") == 0 || verb.compare(0, 3, "sec") == 0 || verb.compare(0, 3, "loo") == 0) {
             if (!have_b) return false;
             for (int k = 0; k < 3; ++k) { pos[k] = a[k]; look[k] = b[k]; }
-            mode = FOLLOW;
+            mode = verb[0] == 'f' ? FOLLOW : verb[0] == 's' ? SECURITY : LOOK;
             return true;
         }
         return false;
@@ -7297,8 +7334,20 @@ int main(int argc, char** argv) {
             if (prince_a) {
                 const bool snoozing = game_time < (prince_msgs ? prince_msgs->snooze_until : 0.0);
                 const bool available = !snoozing && combat.dead_since < 0.0;
+                // Scripted walks ("WalkAt:") come before the guards' own minds.
+                for (size_t i = 0; i < sc.actors.size(); ++i) {
+                    actor_inst& wa = sc.actors[i];
+                    if (!wa.walking || wa.scripted) continue;
+                    const float* q = wa.node->local.translate;
+                    const float wx = wa.walk_to[0] - q[0], wz = wa.walk_to[2] - q[2];
+                    if (wx * wx + wz * wz > 0.04f) { steer(sc, wa, wa.walk_to, wa.walk_run, dt); continue; }
+                    wa.walking = false;
+                    set_clip(wa, LOCO_BASE);
+                    if (wa.walk_remove) wa.hidden = true;
+                }
                 for (size_t i = 0; i < combat.enemies.size(); ++i)
-                    enemy_update(combat, sc, combat.enemies[i], *prince_a, available, game_time, dt);
+                    if (!sc.actors[size_t(combat.enemies[i].actor)].walking)
+                        enemy_update(combat, sc, combat.enemies[i], *prince_a, available, game_time, dt);
                 prince_hit_resolve(combat, sc, *prince_a, game_time);
                 // Falling out of the world is a death too.
                 if (combat.dead_since < 0.0 && prince_a->node->local.translate[1] < sc.mn[1] - 15.0f) {
@@ -7950,6 +7999,8 @@ int main(int argc, char** argv) {
                 float at[3];
                 if (camera_msgs.mode == camera_target::TRIPOD) {
                     for (int k = 0; k < 3; ++k) { cam.pos[k] = camera_msgs.pos[k]; at[k] = camera_msgs.look[k]; }
+                } else if (camera_msgs.mode == camera_target::LOOK) {
+                    for (int k = 0; k < 3; ++k) { cam.pos[k] = w.translate[k] + camera_msgs.pos[k]; at[k] = camera_msgs.look[k]; }
                 } else {
                     const float* o = w.translate;
                     if (!camera_msgs.subject.empty())
@@ -7958,8 +8009,9 @@ int main(int argc, char** argv) {
                                 o = sc.actors[i].node->world().translate;
                                 break;
                             }
+                    const bool fixed = camera_msgs.mode == camera_target::SECURITY;
                     for (int k = 0; k < 3; ++k) {
-                        cam.pos[k] = o[k] + camera_msgs.pos[k];
+                        cam.pos[k] = fixed ? camera_msgs.pos[k] : o[k] + camera_msgs.pos[k];
                         at[k] = o[k] + camera_msgs.look[k];
                     }
                 }
