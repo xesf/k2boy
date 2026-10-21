@@ -7258,6 +7258,13 @@ int main(int argc, char** argv) {
     // the camera looks, at the nearest guard or ArrowTarget in a narrow cone
     // if there is one. The controls and the aim help are ours.
     struct bow_ctl { bool ready = false; int stage = 0; bool released = false; } bow;
+    // Locomotion transitions (docs/reference/locomotion.md): the run's first
+    // step (StartRun*Right_L), its last (StepEndRun*_L), and turning round
+    // standing (QuickTurnaround_G) or running (RunningQuickTurn_L). The
+    // original chains a step clip per footfall; here the loops carry the
+    // middle and only these ends are its clips. A turn clip ends facing
+    // back, so his facing flips when it is done.
+    struct loco_ctl { double run_since = -1.0; bool flip = false; } loco;
     bool      jump_was_down = false;
     bool      act_was_down = false;
     double    regrab_after = 0.0;      // let go: no catching the same ledge at once
@@ -7757,6 +7764,7 @@ int main(int argc, char** argv) {
                     const char ch = holds[i].keys[c];
                     if (ch >= 'A' && ch <= 'Z') down[plat::KEY_A + (ch - 'A')] = false;
                     if (ch == '_') down[plat::KEY_SPACE] = false;
+                    if (ch == '^') down[plat::KEY_LSHIFT] = false;
                 }
             for (size_t i = 0; i < holds.size(); ++i) {
                 if (game_time < holds[i].from || game_time >= holds[i].to) continue;
@@ -7764,6 +7772,7 @@ int main(int argc, char** argv) {
                     const char ch = holds[i].keys[c];
                     if (ch >= 'A' && ch <= 'Z') down[plat::KEY_A + (ch - 'A')] = true;
                     if (ch == '_') down[plat::KEY_SPACE] = true;
+                    if (ch == '^') down[plat::KEY_LSHIFT] = true;
                 }
             }
         }
@@ -8219,7 +8228,65 @@ int main(int argc, char** argv) {
             const bool in_crate = !scripted_now && !in_jump && !busy &&
                                   update_crate(crates, sc, *player, lt.translate, player_yaw,
                                                game_time, act, push, pull);
-            if (scripted_now || in_jump || busy) {
+            if (loco.flip && !player->scripted) {
+                player_yaw += 3.14159265f;
+                loco.flip = false;
+            }
+            // Height of the floor `ahead` units along his facing, from his
+            // feet (the step selectors' probe, K2ActivityRun 0x49023F).
+            struct floor_ahead { static float dh(const k2::engine::collision_world& w, const float* p, float yaw, float ahead) {
+                const float q[3] = { p[0] + std::sin(yaw) * ahead, p[1] + 1.0f, p[2] + std::cos(yaw) * ahead };
+                float gy;
+                return ground_under(w, q, gy) ? gy - p[1] : -10.0f;
+            } };
+            bool loco_started = false;
+            if (!scripted_now && !in_jump && !busy && !in_crate && !classic && !noclip && !dead) {
+                const bool running_now = player->clip == LOCO_RUN && loco.run_since >= 0.0;
+                if (ml > 1e-6f) {
+                    float diff = std::atan2(mv[0], mv[2]) - player_yaw;
+                    diff = std::fmod(diff + 3.14159265f, 6.2831853f);
+                    if (diff < 0.0f) diff += 6.2831853f;
+                    diff -= 3.14159265f;
+                    const bool reverse = std::fabs(diff) > 2.6f;       // ~150 degrees
+                    if (reverse && player->clip == LOCO_BASE && !combat.prince_drawn) {
+                        // StStartQuickTurn: turn round where he stands.
+                        loco_started = play_once(sc, *player, "QuickTurnaround_G", game_time, player_yaw, false);
+                        loco.flip = loco_started;
+                    } else if (reverse && running_now && game_time - loco.run_since > 0.3) {
+                        // StStartMovingQuickTurn, only on a flat run ahead
+                        // (Prince__CanRunningQuickTurn 0x4D18D9: 1 m and 2 m).
+                        const float d1 = floor_ahead::dh(sc.coll, lt.translate, player_yaw, 1.0f);
+                        const float d2 = floor_ahead::dh(sc.coll, lt.translate, player_yaw, 2.0f);
+                        if (std::fabs(d1) <= 0.05f && std::fabs(d2) <= 0.05f) {
+                            loco_started = play_once(sc, *player, "RunningQuickTurn_L", game_time, player_yaw, false);
+                            loco.flip = loco_started;
+                            loco.run_since = -1.0;
+                        }
+                    } else if (run && player->clip == LOCO_BASE && loco.run_since < 0.0 && !combat.prince_drawn) {
+                        // The run's first step, up or down by the floor
+                        // ahead (> 0.3 / < -0.3, fMaxRunNormalHeight).
+                        player_yaw = std::atan2(mv[0], mv[2]);
+                        const float dh = floor_ahead::dh(sc.coll, lt.translate, player_yaw, 1.0f);
+                        const char* c = dh > 0.3f && dh < 0.65f ? "StartRunUpRight_L"
+                                      : dh < -0.3f && dh > -0.65f ? "StartRunDownRight_L" : "StartRunRight_L";
+                        loco_started = play_once(sc, *player, c, game_time, player_yaw, false);
+                        if (loco_started) { set_clip(*player, LOCO_RUN); loco.run_since = game_time; }
+                    }
+                } else if (running_now && game_time - loco.run_since > 0.3) {
+                    // StStartRunStop: one last step, on the foot that is down.
+                    const float dh = floor_ahead::dh(sc.coll, lt.translate, player_yaw, 1.0f);
+                    const double len = double(std::max(1u, clip_length_ms(player->loco[size_t(LOCO_RUN)])));
+                    const bool left = std::fmod(player->clip_ms, len) < len * 0.5;
+                    std::string c = "StepEndRun";
+                    c += dh > 0.3f && dh < 0.65f ? "Up" : dh < -0.3f && dh > -0.65f ? "Down" : "";
+                    c += left ? "Left_L" : "Right_L";
+                    loco_started = play_once(sc, *player, c, game_time, player_yaw, false);
+                    loco.run_since = -1.0;
+                }
+            }
+            if (loco_started && std::getenv("K2_LOCODBG"))
+                std::printf("loco: %.2f %s\n", game_time, player->scripted ? "transition" : "?");
+            if (scripted_now || in_jump || busy || loco_started) {
                 // A scripted skill, a jump or a ledge owns the body.
             } else if (in_crate) {
                 crate_input(crates, sc, *player, lt.translate, player_yaw, game_time, act, push, pull);
@@ -8229,6 +8296,8 @@ int main(int argc, char** argv) {
                 // covers, so the feet do not slide. Classic's back step plays
                 // WalkBackwards_L1 and keeps his facing.
                 const int clip = walk_back ? WALK_BACK : (run ? LOCO_RUN : LOCO_WALK);
+                if (clip == LOCO_RUN && loco.run_since < 0.0) loco.run_since = game_time;
+                if (clip != LOCO_RUN) loco.run_since = -1.0;
                 set_clip(*player, clip);
                 float speed = walk_speed * (run ? 2.5f : 1.0f);
                 if (walk_back) speed = walk_speed * 0.6f;
@@ -8257,6 +8326,7 @@ int main(int argc, char** argv) {
             } else if (!combat.prince_drawn) {
                 player->stance = 0;
                 set_clip(*player, LOCO_BASE);
+                loco.run_since = -1.0;
             }
             // Stand on the floor, step up small ledges, fall off edges.
             if (!noclip && !scripted_now && !in_jump && !busy) {

@@ -164,7 +164,7 @@ Scripted, deterministic runs, used to check gameplay changes with screenshots:
 | Flag | |
 |---|---|
 | `--place x,y,z,yaw` | put the Prince somewhere |
-| `--hold KEYS@from-to` | hold keys between two times (`_` is Space) |
+| `--hold KEYS@from-to` | hold keys between two times (`_` is Space, `^` is Shift) |
 | `--send "target,message"` | send a trap message, as a script would |
 | `--fixeddt S --frames N --shot F.bmp` | step N frames of S seconds, then save a screenshot |
 | `--movie NAME` | play a cutscene |
