@@ -740,6 +740,14 @@ struct actor_inst {
     }
 };
 
+bool equals_nocase(const std::string& a, const char* b) {
+    size_t i = 0;
+    for (; i < a.size() && b[i]; ++i)
+        if (std::tolower(static_cast<unsigned char>(a[i])) != std::tolower(static_cast<unsigned char>(b[i])))
+            return false;
+    return i == a.size() && !b[i];
+}
+
 // The player: neither a guard nor a Fixture's actor.
 inline bool is_prince(const actor_inst& a) { return !a.is_enemy && !a.is_fixture; }
 
@@ -1642,6 +1650,7 @@ public:
         m_base[0] = m_base[1] = m_base[2] = 0.0f;
         for (int i = 0; i < 6; ++i) box[i] = bbox[i];
         pivot[0] = pivot[1] = pivot[2] = 0.0f;
+        for (int i = 0; i < 9; ++i) m_rot[i] = i % 4 == 0 ? 1.0f : 0.0f;
     }
 
     const std::string type;     // the K2_TRAP_NAME: "Crate", "Force", ...
@@ -1677,14 +1686,7 @@ public:
         m_sc.coll.set_node_enabled(m_node, b);
     }
     bool handle(const std::string& msg, k2::engine::script_target* sender) {
-        if (msg.size() > 5 && (msg.compare(0, 5, "move,") == 0 || msg.compare(0, 5, "Move,") == 0)) {
-            k2::engine::translate_motion m;
-            if (!m.parse(msg.substr(5))) return false;
-            m.begin(m_world.now());
-            m_motion = m;
-            m_moving = true;
-            return true;
-        }
+        if (is_motion(msg)) return motions(msg);
         // Water: "raise,d,t" / "lower,d,t" move the surface d along y over t
         // seconds - a TranslateMotion built directly (0x48C939 -> 0x47ABDC),
         // with no ease.
@@ -1777,16 +1779,112 @@ public:
         if (m_skill) pose_from_skill(now);
         if (!m_moving) return;
         const double f = m_motion.fraction(now);
-        float off[3];
-        for (int k = 0; k < 3; ++k) off[k] = m_base[k] + float(m_motion.dir[k] * f);
-        apply(off);
-        if (m_motion.done(now)) {
-            for (int k = 0; k < 3; ++k) m_base[k] = off[k];
-            m_moving = false;
+        float off[3], rot[9];
+        if (m_rotating) {
+            rotation_now(float(m_motion.distance * f), rot);
+            for (int k = 0; k < 3; ++k) off[k] = m_base[k];
+            pose(rot, off);
+        } else {
+            for (int k = 0; k < 3; ++k) off[k] = m_base[k] + float(m_motion.dir[k] * f);
+            if (m_turned) pose(m_rot, off);
+            else apply(off);
         }
+        if (!m_motion.done(now)) return;
+        if (m_rotating) for (int i = 0; i < 9; ++i) m_rot[i] = rot[i];
+        else for (int k = 0; k < 3; ++k) m_base[k] = off[k];
+        m_moving = false;
+        // The next step of a chain; after the last, "loop" starts it over.
+        if (m_step + 1 < m_chain.size()) start_step(m_step + 1, m_motion.start + m_motion.total);
+        else if (m_loop && !m_chain.empty()) start_step(0, m_motion.start + m_motion.total);
     }
 
 private:
+    // "move,<axis>,<d>,<t>,<accel>,<decel>[,Loop|Crush|HalfCrush]" and
+    // "rotate,<axis>,<degrees>,<t>,<accel>,<decel>", chained in one message
+    // ("move,...,move,...,loop" runs them in turn, over and over). "STOP"
+    // first drops whatever it was doing. The chaining and rotation are ours;
+    // the TranslateMotion maths is the original's (0x47ABDC).
+    struct motion_step { k2::engine::translate_motion m; bool rotate; };
+    std::vector<motion_step> m_chain;
+    size_t                   m_step = 0;
+    bool                     m_loop = false, m_rotating = false, m_turned = false;
+    float                    m_rot[9];      // rotation reached by "rotate" so far
+    float                    m_axis[3] = { 0.0f, 1.0f, 0.0f };
+
+    static bool is_motion(const std::string& msg) {
+        const std::string w = msg.substr(0, msg.find(','));
+        return msg.find(',') != std::string::npos &&
+               (equals_nocase(w, "move") || equals_nocase(w, "rotate") || equals_nocase(w, "stop"));
+    }
+    bool motions(const std::string& msg) {
+        std::vector<std::string> f;
+        size_t st = 0;
+        for (;;) {
+            const size_t c = msg.find(',', st);
+            f.push_back(msg.substr(st, c == std::string::npos ? std::string::npos : c - st));
+            if (c == std::string::npos) break;
+            st = c + 1;
+        }
+        std::vector<motion_step> chain;
+        bool loop = false;
+        for (size_t i = 0; i < f.size();) {
+            if (equals_nocase(f[i], "stop")) {      // freeze where it is
+                settle();
+                ++i;
+                continue;
+            }
+            if (equals_nocase(f[i], "loop")) { loop = true; ++i; continue; }
+            if ((equals_nocase(f[i], "move") || equals_nocase(f[i], "rotate")) && i + 5 < f.size()) {
+                motion_step ms;
+                ms.rotate = equals_nocase(f[i], "rotate");
+                if (!ms.m.parse(f[i + 1] + "," + f[i + 2] + "," + f[i + 3] + "," + f[i + 4] + "," + f[i + 5]))
+                    return false;
+                chain.push_back(ms);
+                i += 6;
+                continue;
+            }
+            ++i;                                    // Crush, HalfCrush: no effect on the path
+        }
+        if (chain.empty()) return true;
+        m_chain = chain;
+        m_loop = loop;
+        start_step(0, m_world.now());
+        return true;
+    }
+    // Whatever motion is under way stops at its current point.
+    void settle() {
+        if (!m_moving) return;
+        const double f = m_motion.fraction(m_world.now());
+        if (m_rotating) { float r[9]; rotation_now(float(m_motion.distance * f), r); for (int i = 0; i < 9; ++i) m_rot[i] = r[i]; }
+        else for (int k = 0; k < 3; ++k) m_base[k] += float(m_motion.dir[k] * f);
+        m_moving = false;
+        m_chain.clear();
+        m_loop = false;
+    }
+    void start_step(size_t i, double at) {
+        m_step = i;
+        m_motion = m_chain[i].m;
+        m_motion.begin(at);
+        m_rotating = m_chain[i].rotate;
+        if (m_rotating) {
+            m_turned = true;
+            const double d = m_motion.distance;
+            for (int k = 0; k < 3; ++k) m_axis[k] = d != 0.0 ? float(m_motion.dir[k] / d) : 0.0f;
+        }
+        m_moving = true;
+    }
+    // m_rot turned a further `deg` degrees about m_axis (Rodrigues).
+    void rotation_now(float deg, float* out) const {
+        const float a = deg * 3.14159265f / 180.0f, c = std::cos(a), sn = std::sin(a), t = 1.0f - c;
+        const float x = m_axis[0], y = m_axis[1], z = m_axis[2];
+        const float r[9] = { t * x * x + c,     t * x * y - sn * z, t * x * z + sn * y,
+                             t * x * y + sn * z, t * y * y + c,     t * y * z - sn * x,
+                             t * x * z - sn * y, t * y * z + sn * x, t * z * z + c };
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j)
+                out[i * 3 + j] = r[i * 3] * m_rot[j] + r[i * 3 + 1] * m_rot[3 + j] + r[i * 3 + 2] * m_rot[6 + j];
+    }
+
     const assets::skl_file* find_skill(const std::string& name) {
         std::string key = actor + "/" + name;
         for (size_t i = 0; i < key.size(); ++i)
@@ -1826,24 +1924,27 @@ private:
             transform_from_pos_quat(pos, q, r);
             float off[3];
             for (int k = 0; k < 3; ++k) off[k] = m_base[k] + pos[k];
-            m_sc.coll.set_node_transform(m_node, r.rotate, pivot, off);
-            if (m_item >= 0) {
-                draw_item& di = m_sc.items[size_t(m_item)];
-                // world = R (p - pivot) + pivot + off, as a column-major 4x4.
-                float* m = di.model;
-                for (int c = 0; c < 3; ++c)
-                    for (int rr = 0; rr < 3; ++rr) m[c * 4 + rr] = r.rotate[rr * 3 + c];
-                m[3] = m[7] = m[11] = 0.0f;
-                for (int rr = 0; rr < 3; ++rr) {
-                    const float rp = r.rotate[rr * 3] * pivot[0] + r.rotate[rr * 3 + 1] * pivot[1]
-                                   + r.rotate[rr * 3 + 2] * pivot[2];
-                    m[12 + rr] = pivot[rr] - rp + off[rr];
-                }
-                m[15] = 1.0f;
-                di.has_model = true;
-            }
+            pose(r.rotate, off);
             return;
         }
+    }
+
+    // Turned by `rot` (row-major) about the pivot, then moved by `off`.
+    void pose(const float* rot, const float* off) {
+        m_sc.coll.set_node_transform(m_node, rot, pivot, off);
+        if (m_item < 0) return;
+        draw_item& di = m_sc.items[size_t(m_item)];
+        // world = R (p - pivot) + pivot + off, as a column-major 4x4.
+        float* m = di.model;
+        for (int c = 0; c < 3; ++c)
+            for (int rr = 0; rr < 3; ++rr) m[c * 4 + rr] = rot[rr * 3 + c];
+        m[3] = m[7] = m[11] = 0.0f;
+        for (int rr = 0; rr < 3; ++rr) {
+            const float rp = rot[rr * 3] * pivot[0] + rot[rr * 3 + 1] * pivot[1] + rot[rr * 3 + 2] * pivot[2];
+            m[12 + rr] = pivot[rr] - rp + off[rr];
+        }
+        m[15] = 1.0f;
+        di.has_model = true;
     }
 
     void apply(const float* off) {
@@ -1873,14 +1974,6 @@ private:
 //                                    placeholder, from that node's position
 //                                    and facing; REMOVE hides it afterwards
 bool play_once(scene& sc, actor_inst& a, const std::string& name, double now, float yaw, bool hold);
-
-bool equals_nocase(const std::string& a, const char* b) {
-    size_t i = 0;
-    for (; i < a.size() && b[i]; ++i)
-        if (std::tolower(static_cast<unsigned char>(a[i])) != std::tolower(static_cast<unsigned char>(b[i])))
-            return false;
-    return i == a.size() && !b[i];
-}
 
 class actor_target : public k2::engine::script_target {
 public:
@@ -2182,6 +2275,7 @@ bool play_once(scene& sc, actor_inst& a, const std::string& name, double now, fl
 //   tripod,(x,y,z)(x,y,z)   fixed at a point, looking at a point (engine space)
 //   follow,(dx,dy,dz)(lx,ly,lz)  ride along at an offset from the Prince, looking
 //                           along a direction (our reading; not traced further)
+//   follow,Actor,(..)(..)   the same about a named actor ("follow,pg2Yell,...")
 //
 // Trailing letters ("X") are flags the original keeps (0x409975, |5); the
 // transition they select is not modelled - every change is a cut.
@@ -2201,7 +2295,14 @@ public:
         std::string verb = msg.substr(0, comma);
         for (size_t i = 0; i < verb.size(); ++i)
             if (verb[i] >= 'A' && verb[i] <= 'Z') verb[i] = char(verb[i] - 'A' + 'a');
-        const std::string args = msg.substr(comma + 1);
+        std::string args = msg.substr(comma + 1);
+        subject.clear();
+        if (verb.compare(0, 3, "fol") == 0 && !args.empty() && args[0] != '(') {
+            const size_t c2 = args.find(',');
+            if (c2 == std::string::npos) return false;
+            subject = args.substr(0, c2);
+            args = args.substr(c2 + 1);
+        }
         float a[3], b[3];
         bool have_b = false;
         size_t at = 0;
@@ -2227,6 +2328,7 @@ public:
     mode_t mode;
     float  pos[3];      // TRIPOD: where; FOLLOW: offset from the Prince
     float  look[3];     // TRIPOD: at what; FOLLOW: what it looks at, also from the Prince
+    std::string subject;    // FOLLOW: whom, when not the Prince
 
 private:
     // One "( ... )" group from `at`: "@Node" or "x,y,z". A node that is a
@@ -7790,9 +7892,16 @@ int main(int argc, char** argv) {
                 if (camera_msgs.mode == camera_target::TRIPOD) {
                     for (int k = 0; k < 3; ++k) { cam.pos[k] = camera_msgs.pos[k]; at[k] = camera_msgs.look[k]; }
                 } else {
+                    const float* o = w.translate;
+                    if (!camera_msgs.subject.empty())
+                        for (size_t i = 0; i < sc.actors.size(); ++i)
+                            if (sc.actors[i].node && equals_nocase(sc.actors[i].script_name, camera_msgs.subject.c_str())) {
+                                o = sc.actors[i].node->world().translate;
+                                break;
+                            }
                     for (int k = 0; k < 3; ++k) {
-                        cam.pos[k] = w.translate[k] + camera_msgs.pos[k];
-                        at[k] = w.translate[k] + camera_msgs.look[k];
+                        cam.pos[k] = o[k] + camera_msgs.pos[k];
+                        at[k] = o[k] + camera_msgs.look[k];
                     }
                 }
                 const float d[3] = { at[0] - cam.pos[0], at[1] - cam.pos[1], at[2] - cam.pos[2] };
