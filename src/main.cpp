@@ -703,6 +703,12 @@ struct actor_inst {
     bool                              has_bow;        // "weapon:+bow"
     int                               arrows;         // "weapon:+arrow,type,count"
     int                               pending_hurt;   // "hurt:N", applied by combat
+    bool                              archer;         // a bowman: shoots, never closes in
+    // The other hand (master.dat's second grip), where the Prince's bow is
+    // held while `bow_shown`.
+    int                               alt_hand_joint;
+    float                             alt_hand_off[3];
+    bool                              bow_shown;
     // "WalkAt:walk|run,<placeholder>[,REMOVE]": on his way there, under the
     // script's control; REMOVE hides him on arrival.
     bool                              walking;
@@ -738,7 +744,8 @@ struct actor_inst {
                    scripted_yaw(0), remove_after(false), hidden(false), stance(0),
                    hold_last(false), posed_hold(false), health(100), max_health(100), armed(false),
                    has_bow(false), arrows(0), pending_hurt(0),
-                   walking(false), walk_run(false), walk_remove(false),
+                   walking(false), walk_run(false), walk_remove(false), archer(false),
+                   alt_hand_joint(-1), bow_shown(false),
                    is_fixture(false), start_flag(false), hand_joint(-1), weapon_shown(false), carry_joint(-1), home_yaw(0), body_pitch(0) {
         hand_off[0] = hand_off[1] = hand_off[2] = 0.0f;
         scripted_origin[0] = scripted_origin[1] = scripted_origin[2] = 0.0f;
@@ -1446,7 +1453,23 @@ std::string actor_dir_for(const std::string& act_name) {
 void load_loco_clips(const std::string& act_name, actor_inst& a) {
     a.loco.assign(LOCO_COUNT, assets::skl_file());
     a.loco_ok.assign(LOCO_COUNT, false);
-    const std::string dir = actor_dir_for(act_name);
+    std::string dir = actor_dir_for(act_name);
+    // The archers (PG3Archer, A2ARCHER, D4Archer) have no skills of their
+    // own; their base guard's folder (PG3/SKILLS) has the Bow* clips. Ours:
+    // how the .act points there is not traced.
+    if (!dir.empty()) {
+        std::string l = dir;
+        for (size_t i = 0; i < l.size(); ++i) l[i] = char(std::tolower(static_cast<unsigned char>(l[i])));
+        const size_t at = l.rfind("archer/");
+        if (at != std::string::npos) {
+            a.archer = true;
+            char real[1024];
+            if (!plat::fs_probe((dir + "skills/basepose_l.skl").c_str(), real, sizeof(real))) {
+                const std::string base = dir.substr(0, at) + "/";
+                if (plat::fs_probe((base + "skills/basepose_l.skl").c_str(), real, sizeof(real))) dir = base;
+            }
+        }
+    }
     a.skill_dir = dir;
     if (dir.empty()) return;
     for (int c = 0; c < LOCO_COUNT; ++c) {
@@ -1595,6 +1618,11 @@ void bind_actor_weapon(const assets::master_file& m, actor_inst& inst, scene& sc
     for (size_t j = 0; j < inst.joint_names.size(); ++j)
         if (inst.joint_names[j] == m.hands[0].node) { inst.hand_joint = int(j); break; }
     for (int k = 0; k < 3; ++k) inst.hand_off[k] = m.hands[0].offset[k];
+    if (m.hands.size() > 1) {
+        for (size_t j = 0; j < inst.joint_names.size(); ++j)
+            if (inst.joint_names[j] == m.hands[1].node) { inst.alt_hand_joint = int(j); break; }
+        for (int k = 0; k < 3; ++k) inst.alt_hand_off[k] = m.hands[1].offset[k];
+    }
     if (inst.hand_joint < 0 || !sc.weapons.count(inst.weapon))
         std::printf("  %s: weapon %s / hand %s not found\n", inst.name.c_str(), inst.weapon.c_str(),
                     m.hands[0].node.c_str());
@@ -1645,6 +1673,28 @@ void scene_reset(scene& sc) {
 // are ours - the Launcher class is not traced.
 struct dart { float p[3], d[3]; double born; };
 std::vector<dart> g_darts;
+
+// Arrows in flight (enemy.dat [Archery]: kArrowSpeed 60, kArrowNormalDamage
+// 12): straight on until a body, an ArrowTarget or a wall, where one sticks
+// for a while. The flight and the hits are ours; Arrow's class is not traced.
+namespace arrow_tuning {
+const float SPEED = 60.0f;
+const int   DAMAGE = 12;
+const double STUCK_FOR = 4.0;
+}
+struct arrow_shot { float p[3], d[3]; double born, stuck_at; bool from_prince; };
+std::vector<arrow_shot> g_arrows;
+void fire_arrow(const float* from, const float* to, bool from_prince, double now) {
+    arrow_shot a;
+    float d[3] = { to[0] - from[0], to[1] - from[1], to[2] - from[2] };
+    const float l = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    if (l < 1e-4f) return;
+    for (int k = 0; k < 3; ++k) { a.p[k] = from[k]; a.d[k] = d[k] / l; }
+    a.born = now;
+    a.stuck_at = -1.0;
+    a.from_prince = from_prince;
+    g_arrows.push_back(a);
+}
 
 // Parses one .K2A and appends its meshes to `sc`, growing the bounds.
 // A trap node in a room. The base handles reset / state / enable / visible /
@@ -2903,6 +2953,7 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
                 for (int k = 0; k < 3; ++k) st->pivot[k] = n.trap.pivot[k];
                 st->pivot_angle = n.trap.pivot_angle * (n.trap.pivot_axis[1] < 0.0f ? -1.0f : 1.0f);
                 if (n.trap.name == "CrateTarget" && n.trap.argv.size() > 1) st->message = n.trap.argv[1];
+                if (n.trap.name == "ArrowTarget" && n.trap.argv.size() > 2) st->message = n.trap.argv[2];
                 if (n.trap.name == "Force" && n.trap.argv.size() > 2 && equals_nocase(n.trap.argv[1], "Volume") &&
                     n.trap.argv[2].compare(0, 8, "current,") == 0) {
                     k2::engine::translate_motion m;     // the axis words as "move" reads them
@@ -3172,6 +3223,11 @@ void spawn_level_actors(scene& sc, k2::engine::body_table& bodies,
         bind_actor_skeleton(b->master, inst, sc);
         bind_actor_weapon(b->master, inst, sc, -1);
         inst.weapon_shown = is_enemy;           // guards hold theirs; the Prince draws his
+        {   // the bowmen's bodies: PG3Archer, A2ARCHER, D4Archer
+            std::string bn = b->name;
+            for (size_t i = 0; i < bn.size(); ++i) bn[i] = char(std::tolower(static_cast<unsigned char>(bn[i])));
+            if (is_enemy && bn.find("archer") != std::string::npos) inst.archer = true;
+        }
         sc.actors.push_back(inst);
 
         sc.root->update_world();
@@ -5032,6 +5088,9 @@ struct enemy_ai {
     int         skill;
     enum react_t { R_NONE, R_BLOCK, R_WRONG, R_LATE } react;
     double      react_at;
+    // An archer's round: draw, aim, loose, and the wait before the next.
+    int         shot_stage = 0;
+    double      shot_at = 0.0;
 };
 
 struct combat_state {
@@ -5253,6 +5312,68 @@ void steer(scene& sc, actor_inst& a, const float* to, bool run, float dt) {
     a.node->local.set_yaw(std::atan2(dx, dz));
 }
 
+// An archer (PG3Archer, A2ARCHER, D4Archer) keeps his distance: with the
+// Prince in sight and in range he turns to him, draws (BowDrawArrow_G),
+// aims (BowAim_G) and looses (BowFireArrow_G), then waits. The ranges and
+// the pace are ours; enemy.dat's shooter table (LittleBilly..RobinHood) is
+// not traced, and skill only shortens the wait here.
+namespace archer_tuning {
+const float  RANGE = 40.0f;
+const double AIM = 0.6, WAIT = 3.0;
+}
+void archer_update(scene& sc, enemy_ai& e, actor_inst& a, const actor_inst& prince,
+                   bool prince_available, double now) {
+    float* p = a.node->local.translate;
+    const float* q = prince.node->local.translate;
+    const float eye[3] = { p[0], p[1] + 1.5f, p[2] };
+    const float chest[3] = { q[0], q[1] + 1.2f, q[2] };
+    float d[3] = { chest[0] - eye[0], chest[1] - eye[1], chest[2] - eye[2] };
+    const float dist = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    bool sees = prince_available && dist < archer_tuning::RANGE && dist > 0.5f;
+    if (sees) {
+        for (int k = 0; k < 3; ++k) d[k] /= dist;
+        k2::engine::pick_hit h;
+        if (sc.coll.pick(eye, d, dist - 0.5f, false, h)) sees = false;
+    }
+    if (a.scripted) return;                         // a clip of the round is playing
+    if (!sees) {
+        e.shot_stage = 0;
+        a.stance = 0;
+        set_clip(a, LOCO_BASE);
+        return;
+    }
+    const float yaw = yaw_toward(p, q);
+    a.node->local.set_yaw(yaw);
+    switch (e.shot_stage) {
+    case 0:
+        a.stance = find_actor_skill(sc, a, "BowDrawBase_G");
+        if (now < e.shot_at) return;
+        if (play_once(sc, a, "BowDrawArrow_G", now, yaw, false)) {
+            play_sound("MULarrowdraw", eye, 14.0f, false);
+            e.shot_stage = 1;
+        }
+        return;
+    case 1:
+        a.stance = find_actor_skill(sc, a, "BowAim_G");
+        e.shot_at = now + archer_tuning::AIM;
+        e.shot_stage = 2;
+        return;
+    default: {
+        if (now < e.shot_at) return;
+        play_once(sc, a, "BowFireArrow_G", now, yaw, false);
+        // A little off, less so the better he is.
+        const float miss = 0.6f / float(std::max(1, e.skill));
+        const float to[3] = { chest[0] + miss * float(std::rand() % 200 - 100) / 100.0f, chest[1],
+                              chest[2] + miss * float(std::rand() % 200 - 100) / 100.0f };
+        const float from[3] = { eye[0] + d[0] * 0.6f, eye[1], eye[2] + d[2] * 0.6f };
+        fire_arrow(from, to, false, now);
+        e.shot_at = now + archer_tuning::WAIT - 0.15 * double(std::min(10, e.skill));
+        e.shot_stage = 0;
+        return;
+    }
+    }
+}
+
 void enemy_update(combat_state& cs, scene& sc, enemy_ai& e, actor_inst& prince,
                   bool prince_available, double now, float dt) {
     actor_inst& a = sc.actors[size_t(e.actor)];
@@ -5270,8 +5391,19 @@ void enemy_update(combat_state& cs, scene& sc, enemy_ai& e, actor_inst& prince,
         const float* q = a.node->local.translate;
         const float* r = prince.node->local.translate;
         const float wx = r[0] - q[0], wz = r[2] - q[2];
-        const bool near = prince_available && std::fabs(r[1] - q[1]) < 1.5f &&
-                          wx * wx + wz * wz < 9.0f;
+        bool near = prince_available && std::fabs(r[1] - q[1]) < 1.5f &&
+                    wx * wx + wz * wz < 9.0f;
+        // An archer wakes to the Prince anywhere he can shoot him (ours).
+        if (a.archer && prince_available && !near) {
+            const float eye[3] = { q[0], q[1] + 1.5f, q[2] };
+            float d[3] = { r[0] - eye[0], r[1] + 1.2f - eye[1], r[2] - eye[2] };
+            const float l = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+            if (l < archer_tuning::RANGE && l > 0.5f) {
+                for (int k = 0; k < 3; ++k) d[k] /= l;
+                k2::engine::pick_hit h;
+                near = !sc.coll.pick(eye, d, l - 0.5f, false, h);
+            }
+        }
         if (!a.start_flag && !near && a.health == a.max_health) return;
         e.waiting = false;
         a.scripted_start = now;
@@ -5281,6 +5413,7 @@ void enemy_update(combat_state& cs, scene& sc, enemy_ai& e, actor_inst& prince,
         std::printf("combat: %s starts (%s)\n", a.script_name.c_str(), e.start_skill.c_str());
         return;
     }
+    if (a.archer) { archer_update(sc, e, a, prince, prince_available, now); return; }
     float* p = a.node->local.translate;
     const float* pp = prince.node->local.translate;
     const float dx = pp[0] - p[0], dz = pp[2] - p[2];
@@ -7098,7 +7231,12 @@ int main(int argc, char** argv) {
     int       prince_last_dir = -1;
     double    prince_last_attack = -10.0;
     double    drown_tick = 0.0;
-    bool      draw_was_down = false, atk_was_down = false;
+    bool      draw_was_down = false, atk_was_down = false, bow_was_down = false;
+    // The bow (Ivory Tower on): B / pad L3 readies it or puts it away; held
+    // attack draws an arrow, aims, and letting go looses it. He aims where
+    // the camera looks, at the nearest guard or ArrowTarget in a narrow cone
+    // if there is one. The controls and the aim help are ours.
+    struct bow_ctl { bool ready = false; int stage = 0; bool released = false; } bow;
     bool      jump_was_down = false;
     bool      act_was_down = false;
     double    regrab_after = 0.0;      // let go: no catching the same ledge at once
@@ -7506,6 +7644,75 @@ int main(int argc, char** argv) {
                     fx_spawn("DartTrail.NIF", d.p, std::atan2(d.d[0], d.d[2]), game_time, 0.2);
                 ++i;
             }
+            // Arrows: the Prince's hit guards and ArrowTargets, the archers'
+            // hit him; walls stop both.
+            for (size_t i = 0; i < g_arrows.size(); ) {
+                arrow_shot& ar = g_arrows[i];
+                if (ar.stuck_at >= 0.0) {
+                    if (game_time - ar.stuck_at > arrow_tuning::STUCK_FOR) { g_arrows.erase(g_arrows.begin() + long(i)); continue; }
+                    ++i;
+                    continue;
+                }
+                const float step = arrow_tuning::SPEED * dt;
+                bool gone = game_time - ar.born > 3.0, stuck = false;
+                k2::engine::pick_hit h;
+                float travel = step;
+                if (!gone && sc.coll.pick(ar.p, ar.d, step, false, h)) { travel = h.distance; stuck = true; }
+                // A body: a column 0.4 round from the feet up 1.8, met along
+                // this frame's path.
+                struct body_hit { static bool test(const float* p, const float* d, float len, const float* foot) {
+                    const float wx = foot[0] - p[0], wz = foot[2] - p[2];
+                    const float hl = std::sqrt(d[0] * d[0] + d[2] * d[2]);
+                    if (hl < 1e-5f) return false;
+                    const float u = std::max(0.0f, std::min(len * hl, (wx * d[0] + wz * d[2]) / hl));
+                    const float t = u / hl;
+                    const float cx = p[0] + d[0] * t - foot[0], cz = p[2] + d[2] * t - foot[2];
+                    const float y = p[1] + d[1] * t;
+                    return cx * cx + cz * cz < 0.16f && y > foot[1] && y < foot[1] + 1.8f;
+                } };
+                if (ar.from_prince) {
+                    for (size_t e = 0; e < combat.enemies.size() && !gone; ++e) {
+                        enemy_ai& en = combat.enemies[e];
+                        actor_inst& ea = sc.actors[size_t(en.actor)];
+                        if (en.state == enemy_ai::DEAD || ea.hidden) continue;
+                        if (!body_hit::test(ar.p, ar.d, travel, ea.node->local.translate)) continue;
+                        en.waiting = false;
+                        enemy_damage(combat, sc, en, arrow_tuning::DAMAGE, DIR_CENTER, game_time);
+                        play_sound("mularrowhitop", ar.p, 14.0f, false);
+                        gone = true;
+                    }
+                    for (size_t t = 0; t < sc.traps.size() && !gone; ++t) {
+                        scene_trap* tg = dynamic_cast<scene_trap*>(sc.traps[t]);
+                        if (!tg || tg->type != "ArrowTarget" || !tg->enabled()) continue;
+                        const float* b = tg->box;
+                        bool in = false;
+                        for (int sN = 0; sN <= 4 && !in; ++sN) {
+                            const float f = travel * float(sN) / 4.0f;
+                            const float q[3] = { ar.p[0] + ar.d[0] * f, ar.p[1] + ar.d[1] * f, ar.p[2] + ar.d[2] * f };
+                            in = q[0] >= b[0] - 0.2f && q[0] <= b[3] + 0.2f && q[1] >= b[1] - 0.2f && q[1] <= b[4] + 0.2f &&
+                                 q[2] >= b[2] - 0.2f && q[2] <= b[5] + 0.2f;
+                        }
+                        if (!in) continue;
+                        std::printf("arrow target: %s hit\n", tg->name().c_str());
+                        tg->set_enabled(false);
+                        tg->execute(tg->message);
+                        play_sound("L02brarrowhit", ar.p, 14.0f, false);
+                        stuck = true;
+                    }
+                } else if (pp && combat.dead_since < 0.0 && body_hit::test(ar.p, ar.d, travel, pp)) {
+                    for (size_t a = 0; a < sc.actors.size(); ++a)
+                        if (is_prince(sc.actors[a])) {
+                            prince_damage(combat, sc, sc.actors[a], arrow_tuning::DAMAGE, DIR_CENTER, game_time);
+                            break;
+                        }
+                    play_sound("mularrowhitop", ar.p, 14.0f, false);
+                    gone = true;
+                }
+                if (!gone) for (int k = 0; k < 3; ++k) ar.p[k] += ar.d[k] * travel;
+                if (gone) { g_arrows.erase(g_arrows.begin() + long(i)); continue; }
+                if (stuck) { ar.stuck_at = game_time; play_sound("mularrowstrik", ar.p, 14.0f, false); }
+                ++i;
+            }
         }
         const bool snoozed = !noscript && game_time < (prince_msgs ? prince_msgs->snooze_until : 0.0);
         input_locked = snoozed;
@@ -7663,7 +7870,73 @@ int main(int argc, char** argv) {
             const bool free_body = !dead && !player->scripted && game_time >= combat.prince_busy_until &&
                                    jumps.state == jump_ctl::NONE && ledges.state == hang_ctl::NONE &&
                                    crates.state == crate_ctl::NONE;
-            if (draw_pressed && player->armed && free_body) {
+            const bool bow_key = !snoozed && (down[plat::KEY_B] || (pad.connected && pad.button[plat::PAD_LSTICK]));
+            const bool bow_pressed = bow_key && !bow_was_down;
+            bow_was_down = bow_key;
+            if (!player->has_bow || dead) bow.ready = false;
+            if (bow_pressed && player->has_bow && free_body && !combat.prince_drawn) {
+                bow.ready = !bow.ready;
+                bow.stage = 0;
+                const char* clip = bow.ready ? "BowDraw_G" : "BowPutAway_G";
+                play_once(sc, *player, clip, game_time, player_yaw, false);
+                combat.prince_busy_until = game_time + skill_seconds(sc, *player, clip);
+                player->stance = 0;
+            }
+            player->bow_shown = bow.ready;
+            if (bow.ready && !dead) {
+                if (!input_locked) player_yaw = 3.14159265f - cam.yaw;
+                if (free_body) {
+                    if (bow.stage == 0) {
+                        player->stance = find_actor_skill(sc, *player, "BowDrawBase_G");
+                        if (atk_key && player->arrows > 0) {
+                            play_once(sc, *player, "BowDrawArrow_G", game_time, player_yaw, false);
+                            play_sound("MULarrowdraw", lt.translate, 12.0f, false);
+                            bow.stage = 1;
+                            bow.released = false;
+                        } else if (atk_pressed) {
+                            std::printf("bow: no arrows\n");     // the original's empty click is not traced
+                        }
+                    } else if (bow.stage == 1) {
+                        player->stance = find_actor_skill(sc, *player, "BowAim_G");
+                        bow.stage = 2;
+                    }
+                    if (bow.stage == 2 && (!atk_key || bow.released)) {
+                        play_once(sc, *player, "BowFireArrow_G", game_time, player_yaw, false);
+                        const float fx = std::sin(player_yaw), fz = std::cos(player_yaw);
+                        const float from[3] = { lt.translate[0] + fx * 0.6f, lt.translate[1] + 1.45f,
+                                                lt.translate[2] + fz * 0.6f };
+                        float to[3] = { from[0] + fx * 30.0f, from[1], from[2] + fz * 30.0f };
+                        float best = 0.97f;         // cos of the help cone, ~14 degrees
+                        for (size_t e = 0; e < combat.enemies.size(); ++e) {
+                            const actor_inst& ea = sc.actors[size_t(combat.enemies[e].actor)];
+                            if (combat.enemies[e].state == enemy_ai::DEAD || ea.hidden) continue;
+                            const float* q = ea.node->local.translate;
+                            const float c[3] = { q[0], q[1] + 1.2f, q[2] };
+                            const float vx = c[0] - from[0], vz = c[2] - from[2], l = std::sqrt(vx * vx + vz * vz);
+                            if (l < 0.5f || l > 40.0f) continue;
+                            const float cs = (vx * fx + vz * fz) / l;
+                            if (cs > best) { best = cs; for (int k = 0; k < 3; ++k) to[k] = c[k]; }
+                        }
+                        for (size_t t = 0; t < sc.traps.size(); ++t) {
+                            scene_trap* tg = dynamic_cast<scene_trap*>(sc.traps[t]);
+                            if (!tg || tg->type != "ArrowTarget" || !tg->enabled()) continue;
+                            const float c[3] = { (tg->box[0] + tg->box[3]) * 0.5f, (tg->box[1] + tg->box[4]) * 0.5f,
+                                                 (tg->box[2] + tg->box[5]) * 0.5f };
+                            const float vx = c[0] - from[0], vz = c[2] - from[2], l = std::sqrt(vx * vx + vz * vz);
+                            if (l < 0.5f || l > 60.0f) continue;
+                            const float cs = (vx * fx + vz * fz) / l;
+                            if (cs > best) { best = cs; for (int k = 0; k < 3; ++k) to[k] = c[k]; }
+                        }
+                        fire_arrow(from, to, true, game_time);
+                        --player->arrows;
+                        std::printf("bow: loosed, %d arrows left\n", player->arrows);
+                        bow.stage = 0;
+                    }
+                } else if (bow.stage == 1 && !atk_key) {
+                    bow.released = true;    // let go while still drawing: looses when drawn
+                }
+            }
+            if (draw_pressed && player->armed && free_body && !bow.ready) {
                 combat.prince_drawn = !combat.prince_drawn;
                 const char* clip = combat.prince_drawn ? "CombatDrawWeaponBack_G2" : "CombatStoreWeaponBack_G2";
                 play_once(sc, *player, clip, game_time, player_yaw, false);
@@ -7923,7 +8196,7 @@ int main(int argc, char** argv) {
                 crouch_update(crouch, sc, *player, sc.coll, lt.translate, player_yaw, crouch_key,
                               mv, ml, classic, in_x, in_y, game_time, dt);
             const bool busy = on_ledge || ledges.state != hang_ctl::NONE || in_swim || crouched ||
-                              working.trap != 0;
+                              working.trap != 0 || bow.ready;
             const bool in_crate = !scripted_now && !in_jump && !busy &&
                                   update_crate(crates, sc, *player, lt.translate, player_yaw,
                                                game_time, act, push, pull);
@@ -8287,14 +8560,17 @@ int main(int argc, char** argv) {
                     }
                 }
                 // The weapon, in the hand: actor * hand joint * grip offset.
-                if (ai.weapon_shown && ai.hand_joint >= 0 && ai.skinned) {
-                    std::map<std::string, std::vector<size_t> >::const_iterator wi = sc.weapons.find(ai.weapon);
+                // The Prince's bow goes in the other hand.
+                const bool bow_in_hand = ai.bow_shown && ai.alt_hand_joint >= 0;
+                if ((ai.weapon_shown || bow_in_hand) && ai.hand_joint >= 0 && ai.skinned) {
+                    std::map<std::string, std::vector<size_t> >::const_iterator wi =
+                        sc.weapons.find(bow_in_hand ? std::string("LongBow") : ai.weapon);
                     if (wi != sc.weapons.end()) {
                         k2::engine::transform grip, t0, t1;
-                        grip = ai.cur[size_t(ai.hand_joint)];
+                        grip = ai.cur[size_t(bow_in_hand ? ai.alt_hand_joint : ai.hand_joint)];
                         k2::engine::transform off;
                         for (int k = 0; k < 9; ++k) off.rotate[k] = (k % 4 == 0) ? 1.0f : 0.0f;
-                        for (int k = 0; k < 3; ++k) off.translate[k] = ai.hand_off[k];
+                        for (int k = 0; k < 3; ++k) off.translate[k] = bow_in_hand ? ai.alt_hand_off[k] : ai.hand_off[k];
                         off.scale = 1.0f;
                         k2::engine::transform_compose(grip, off, t0);
                         k2::engine::transform_compose(aw, t0, t1);
@@ -8309,6 +8585,27 @@ int main(int argc, char** argv) {
                     }
                 }
             }
+            // Arrows in flight or stuck: OtherWeapons.K2A's "arrow", whose
+            // shaft runs along its +y, turned onto the flight.
+            std::map<std::string, std::vector<size_t> >::const_iterator arw = sc.weapons.find("arrow");
+            if (arw != sc.weapons.end())
+                for (size_t i = 0; i < g_arrows.size(); ++i) {
+                    const arrow_shot& ar = g_arrows[i];
+                    const float* f = ar.d;
+                    float r[3] = { f[2], 0.0f, -f[0] };           // f x up
+                    float rl = std::sqrt(r[0] * r[0] + r[2] * r[2]);
+                    if (rl < 1e-4f) { r[0] = 1.0f; r[2] = 0.0f; rl = 1.0f; }
+                    r[0] /= rl; r[2] /= rl;
+                    const float z[3] = { r[1] * f[2] - r[2] * f[1], r[2] * f[0] - r[0] * f[2], r[0] * f[1] - r[1] * f[0] };
+                    const float am[16] = { r[0], r[1], r[2], 0.0f,  f[0], f[1], f[2], 0.0f,
+                                           z[0], z[1], z[2], 0.0f,  ar.p[0], ar.p[1], ar.p[2], 1.0f };
+                    gfx::set_model(am);
+                    for (size_t k = 0; k < arw->second.size(); ++k) {
+                        const draw_item& wd = sc.items[arw->second[k]];
+                        gfx::set_texture(wd.tex);
+                        gfx::draw(wd.mesh);
+                    }
+                }
             gfx::set_model(model);   // room geometry is world-space; restore identity
         }
 
