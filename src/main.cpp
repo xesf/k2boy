@@ -822,6 +822,7 @@ struct scene {
         float  trig[6], kill[6];
         bool   have_trig, have_kill;
         double struck_at, safe_at;      // -1 while not struck / not reset
+        std::string death;              // the Prince's clip when it kills him
         special() : actor(-1), have_trig(false), have_kill(false), struck_at(-1), safe_at(-1) {}
     };
     std::vector<special> specials;
@@ -3379,6 +3380,24 @@ void spawn_fixtures(scene& sc) {
                 }
             plat::fs_free(d);
         }
+        // How each kind kills him, by the Prince's Death* clips' names. The
+        // pairing is ours; the binary's table is not traced.
+        {
+            std::string an = t.argv[1];
+            for (size_t c = 0; c < an.size(); ++c) an[c] = char(std::tolower(static_cast<unsigned char>(an[c])));
+            struct kind { const char* key; const char* clip; };
+            static const kind kinds[] = {
+                { "feetgrinder", "DeathFeetGrinders_G" }, { "lowblade", "DeathLowBlade_G" },
+                { "cspike", "DeathCSpike_G" },            { "crawldrill", "DeathCrawl_G" },
+                { "scythe", "DeathDecap_G" },             { "guillotine", "DeathDecap_G" },
+                { "chopper", "DeathDecap_G" },            { "wallblade", "DeathDecap_G" },
+                { "ceilingblade", "DeathDecap_G" },       { "slicer", "DeathDecap_G" },
+                { "hammer", "DeathCrushing_M" },          { "grinder", "DeathCrushing_M" },
+                { "djinni", "DeathCrushing_M" },          { 0, 0 } };
+            sp.death = "DeathSpikes_G";
+            for (int k = 0; kinds[k].key; ++k)
+                if (an.find(kinds[k].key) != std::string::npos) { sp.death = kinds[k].clip; break; }
+        }
         actor_inst& a = sc.actors[size_t(sp.actor)];
         if (find_actor_skill(sc, a, "StartPosition")) play_once(sc, a, "StartPosition", 0.0, a.home_yaw, true);
         sc.specials.push_back(sp);
@@ -5204,7 +5223,10 @@ void combat_init(combat_state& cs, scene& sc, const k2::engine::fight_params& fp
     }
 }
 
-void prince_damage(combat_state& cs, scene& sc, actor_inst& p, int dmg, int dir, double now) {
+// `death` names the clip he dies with when this blow kills him (drowning:
+// DeathUnderwater_G); otherwise the generic one.
+void prince_damage(combat_state& cs, scene& sc, actor_inst& p, int dmg, int dir, double now,
+                   const char* death = 0) {
     if (cs.dead_since >= 0.0) return;
     if (dmg > 0 && potion_state::on(g_potions.shield_until, now)) {       // Shield potion
         play_sound("gblswordclank", p.node->local.translate, 14.0f, false);
@@ -5216,7 +5238,8 @@ void prince_damage(combat_state& cs, scene& sc, actor_inst& p, int dmg, int dir,
         p.health = 0;
         cs.dead_since = now;
         p.stance = 0;
-        if (!play_once(sc, p, p.armed ? "CombatDeathGeneric_G2" : "DeathGeneric_G", now, actor_yaw(p), true))
+        if (death && play_once(sc, p, death, now, actor_yaw(p), true)) {}
+        else if (!play_once(sc, p, p.armed ? "CombatDeathGeneric_G2" : "DeathGeneric_G", now, actor_yaw(p), true))
             play_once(sc, p, "CombatDeathGeneric_G1", now, actor_yaw(p), true);
         std::printf("combat: the Prince falls\n");
         return;
@@ -5262,9 +5285,7 @@ void specials_update(scene& sc, combat_state& cs, actor_inst& prince, double now
         }
         const double t = now - sp.struck_at;
         if (t >= 0.066 && in_kill && cs.dead_since < 0.0) {
-            prince_damage(cs, sc, prince, prince.health, 1, now);
-            if (cs.dead_since >= 0.0)
-                play_once(sc, prince, "DeathSpikes_G", now, actor_yaw(prince), true);
+            prince_damage(cs, sc, prince, prince.health, 1, now, sp.death.c_str());
             std::printf("specials: %s kills the Prince\n", a.name.c_str());
         }
         if (t > 2.0 && !in_trig && cs.dead_since < 0.0) {
@@ -8109,7 +8130,7 @@ int main(int argc, char** argv) {
                         }
                     if (drowning && game_time >= drown_tick) {
                         drown_tick = game_time + 1.0;
-                        prince_damage(combat, sc, *player, combat_tuning::BOTTLE / 3, 0, game_time);
+                        prince_damage(combat, sc, *player, combat_tuning::BOTTLE / 3, 0, game_time, "DeathUnderwater_G");
                     }
                 }
             }
@@ -8119,10 +8140,8 @@ int main(int argc, char** argv) {
                 const int dmg = jump_tuning::fall_damage(jumps.fell, player->health);
                 jumps.fell = 0.0f;
                 if (dmg > 0 && !dead) {
-                    prince_damage(combat, sc, *player, dmg, 0, game_time);
-                    if (combat.dead_since >= 0.0)
-                        play_once(sc, *player, "LandVertDeadly_G", game_time, player_yaw, true);
-                    else
+                    prince_damage(combat, sc, *player, dmg, 0, game_time, "LandVertDeadly_G");
+                    if (combat.dead_since < 0.0)
                         player->scripted = 0;   // the painful landing, not a sword injury
                 }
             }
