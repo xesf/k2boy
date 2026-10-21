@@ -700,6 +700,9 @@ struct actor_inst {
     bool                              posed_hold;     // holding that frame now
     int                               health, max_health;
     bool                              armed;          // the Prince has his sword
+    bool                              has_bow;        // "weapon:+bow"
+    int                               arrows;         // "weapon:+arrow,type,count"
+    int                               pending_hurt;   // "hurt:N", applied by combat
     // A Fixture trap's actor (prisoners, rats, levers, cranes): it idles
     // through `ambient`, a random pick each time, and plays any skill a
     // script names. `home` is where it stands between them.
@@ -729,6 +732,7 @@ struct actor_inst {
                    skinned(false), clip(-1), clip_ms(0.0), clip_once(false), scripted(0), scripted_start(0),
                    scripted_yaw(0), remove_after(false), hidden(false), stance(0),
                    hold_last(false), posed_hold(false), health(100), max_health(100), armed(false),
+                   has_bow(false), arrows(0), pending_hurt(0),
                    is_fixture(false), start_flag(false), hand_joint(-1), weapon_shown(false), carry_joint(-1), home_yaw(0), body_pitch(0) {
         hand_off[0] = hand_off[1] = hand_off[2] = 0.0f;
         scripted_origin[0] = scripted_origin[1] = scripted_origin[2] = 0.0f;
@@ -1893,6 +1897,14 @@ public:
             return skill_at(msg.substr(8));
         actor_inst& a = m_sc.actors[m_actor];
         if (msg.size() > 5 && equals_nocase(msg.substr(0, 5), "item:")) return item(a, msg.substr(5));
+        if (is_prince(a)) {
+            if (msg.size() > 5 && equals_nocase(msg.substr(0, 5), "hurt:")) {
+                a.pending_hurt += std::atoi(msg.c_str() + 5);
+                return true;
+            }
+            if (msg.size() > 7 && equals_nocase(msg.substr(0, 7), "weapon:")) return weapon(a, msg.substr(7));
+            return false;
+        }
         if (a.is_enemy) {
             // EnemyStart's table (0x46CB7C): Start sets flag 0x1000; Remove
             // takes him out of the level.
@@ -1916,6 +1928,29 @@ public:
     double snooze_until;
 
 private:
+    // "weapon:+sword", "weapon:+bow", "weapon:+arrow,<type>,<count>",
+    // "weapon:-all": what the Prince carries (prison1 takes it all away,
+    // the secret guy's door gives the sword back).
+    bool weapon(actor_inst& a, const std::string& arg) {
+        if (arg.empty()) return false;
+        const bool add = arg[0] != '-';
+        const std::string w = arg[0] == '+' || arg[0] == '-' ? arg.substr(1) : arg;
+        const std::string kind = w.substr(0, w.find(','));
+        if (equals_nocase(kind, "all")) {
+            if (!add) { a.armed = false; a.has_bow = false; a.arrows = 0; a.stance = 0; }
+            return true;
+        }
+        if (equals_nocase(kind, "sword")) { a.armed = add; if (!add) a.stance = 0; return true; }
+        if (equals_nocase(kind, "bow")) { a.has_bow = add; return true; }
+        if (equals_nocase(kind, "arrow")) {
+            const size_t c2 = w.rfind(',');
+            const int n = c2 == std::string::npos || c2 == w.find(',') ? 1 : std::atoi(w.c_str() + c2 + 1);
+            a.arrows = add ? a.arrows + n : std::max(0, a.arrows - n);
+            return true;
+        }
+        return false;
+    }
+
     // "Item:<object>,<on|off>[,L|R]": take a world object into a hand, or put
     // it down where the hand is.
     bool item(actor_inst& a, const std::string& args) {
@@ -6800,6 +6835,20 @@ int main(int argc, char** argv) {
         }
     };
     static game_target game_msgs;
+    // "enemy,<name>:<msg>": a message to a guard by name (Ivory Tower's
+    // cutscenes: "enemy,TowerGuardB:SkillAt:...,DEAD").
+    struct enemy_target : public k2::engine::script_target {
+        k2::engine::script_world& w;
+        explicit enemy_target(k2::engine::script_world& sw) : script_target("enemy"), w(sw) {}
+        bool receive(const std::string& msg, k2::engine::script_target* from) {
+            const size_t c = msg.find(':');
+            if (c == std::string::npos) return false;
+            w.send(msg.substr(0, c), msg.substr(c + 1), from);
+            return true;
+        }
+    };
+    enemy_target enemy_msgs(sc.script);
+    sc.script.add(&enemy_msgs);
     game_msgs.exit_requested = false;
     sc.script.add(&game_msgs);
     // While a script holds the Prince (snooze) the player has no control at
@@ -7424,6 +7473,10 @@ int main(int argc, char** argv) {
                 }
             }
             if (!dead) specials_update(sc, combat, *player, game_time);
+            if (player->pending_hurt > 0) {       // "prince,hurt:N" from a trap
+                if (!dead) prince_damage(combat, sc, *player, player->pending_hurt, 0, game_time);
+                player->pending_hurt = 0;
+            }
             // Pickups shown or hidden by script (P4BoxPotion02 appears when
             // its box breaks) follow their trap.
             for (size_t i = 0; i < sc.pickups.size(); ++i)
