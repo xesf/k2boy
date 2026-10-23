@@ -69,6 +69,8 @@ public:
               bool front_only, pick_hit& out) const;
 
     size_t triangle_count() const { return m_tris.size() / 9; }
+    size_t dynamic_count() const { return m_dynamic.size(); }
+    mutable size_t picks = 0;           // casts since the counter was cleared (profiling)
     // The node a picked triangle belongs to (-1: static), and a point
     // carried between world space and that node's rest frame - what a
     // platform's rider holds onto while it moves.
@@ -88,7 +90,11 @@ private:
 
     std::vector<float>                  m_tris;     // 9 floats per triangle
     std::vector<int32_t>                m_tri_node; // per triangle, -1 for static
-    std::vector<uint32_t>               m_dynamic;  // triangles with a node
+    std::vector<uint32_t>               m_dynamic;  // triangles with a node, grouped by node
+    // Each node's run in m_dynamic and its box in its rest frame: a ray
+    // meets a node's triangles only if it meets that box.
+    struct node_run { int32_t node; uint32_t first, count; float mn[3], mx[3]; };
+    std::vector<node_run>               m_runs;
     std::vector<node_state>             m_nodes;
     float                               m_cell;
     float                               m_min[2];

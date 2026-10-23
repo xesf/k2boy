@@ -1,5 +1,6 @@
 // collision.cpp — see collision.h.
 
+#include <algorithm>
 #include "engine/collision.h"
 
 #include <cmath>
@@ -124,6 +125,30 @@ void collision_world::build() {
             for (int32_t x = x0; x <= x1; ++x)
                 m_grid[size_t(z) * size_t(m_nx) + size_t(x)].push_back(uint32_t(t));
     }
+    // Group the moving triangles by node, each with its rest-frame box.
+    std::stable_sort(m_dynamic.begin(), m_dynamic.end(),
+                     [this](uint32_t a, uint32_t b) { return m_tri_node[a] < m_tri_node[b]; });
+    m_runs.clear();
+    for (size_t i = 0; i < m_dynamic.size(); ++i) {
+        const uint32_t t = m_dynamic[i];
+        const int32_t nd = m_tri_node[t];
+        if (m_runs.empty() || m_runs.back().node != nd) {
+            node_run r;
+            r.node = nd;
+            r.first = uint32_t(i);
+            r.count = 0;
+            for (int k = 0; k < 3; ++k) { r.mn[k] = FLT_MAX; r.mx[k] = -FLT_MAX; }
+            m_runs.push_back(r);
+        }
+        node_run& r = m_runs.back();
+        ++r.count;
+        const float* p = &m_tris[size_t(t) * 9];
+        for (int v = 0; v < 3; ++v)
+            for (int k = 0; k < 3; ++k) {
+                r.mn[k] = std::min(r.mn[k], p[v * 3 + k]);
+                r.mx[k] = std::max(r.mx[k], p[v * 3 + k]);
+            }
+    }
     m_built = true;
 }
 
@@ -155,6 +180,7 @@ bool collision_world::ray_triangle(size_t tri, const float o[3], const float d[3
 
 bool collision_world::pick(const float o[3], const float d[3], float max_t,
                            bool front_only, pick_hit& out) const {
+    ++picks;
     if (!m_built || m_grid.empty()) return false;
 
     // The original seeds its running minimum with FLT_MAX and keeps the nearest.
@@ -179,13 +205,13 @@ bool collision_world::pick(const float o[3], const float d[3], float max_t,
                 }
             }
         }
-    // Trap geometry: brute force, each triangle shifted by its node's offset,
-    // which is the same as casting the ray from origin - offset.
-    for (size_t i = 0; i < m_dynamic.size(); ++i) {
-        const uint32_t t = m_dynamic[i];
-        const node_state& ns = m_nodes[size_t(m_tri_node[t])];
+    // Trap and prop geometry, node by node: the ray goes into the node's
+    // rest frame once (p_local = R^T (p - pivot - offset) + pivot), and only
+    // a node whose box it meets has its triangles tested.
+    for (size_t n = 0; n < m_runs.size(); ++n) {
+        const node_run& run = m_runs[n];
+        const node_state& ns = m_nodes[size_t(run.node)];
         if (!ns.enabled) continue;
-        // Into the node's rest frame: p_local = R^T (p - pivot - offset) + pivot.
         float lo[3], ld[3];
         if (ns.rotated) {
             const float q[3] = { o[0] - ns.pivot[0] - ns.offset[0], o[1] - ns.pivot[1] - ns.offset[1],
@@ -197,10 +223,26 @@ bool collision_world::pick(const float o[3], const float d[3], float max_t,
         } else {
             for (int r = 0; r < 3; ++r) { lo[r] = o[r] - ns.offset[r]; ld[r] = d[r]; }
         }
-        float tt;
-        if (ray_triangle(t, lo, ld, max_t, front_only, tt) && tt < best) {
-            best = tt;
-            best_tri = int32_t(t);
+        // Slab test against the box, out to the nearest hit so far.
+        float t0 = 0.0f, t1 = std::min(max_t, best);
+        bool miss = false;
+        for (int k = 0; k < 3 && !miss; ++k) {
+            const float lo_k = run.mn[k] - 1e-3f, hi_k = run.mx[k] + 1e-3f;
+            if (std::fabs(ld[k]) < 1e-12f) { if (lo[k] < lo_k || lo[k] > hi_k) miss = true; continue; }
+            float a = (lo_k - lo[k]) / ld[k], b = (hi_k - lo[k]) / ld[k];
+            if (a > b) std::swap(a, b);
+            if (a > t0) t0 = a;
+            if (b < t1) t1 = b;
+            if (t0 > t1) miss = true;
+        }
+        if (miss) continue;
+        for (uint32_t i = 0; i < run.count; ++i) {
+            const uint32_t t = m_dynamic[run.first + i];
+            float tt;
+            if (ray_triangle(t, lo, ld, max_t, front_only, tt) && tt < best) {
+                best = tt;
+                best_tri = int32_t(t);
+            }
         }
     }
     if (best_tri < 0) return false;

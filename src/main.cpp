@@ -7733,7 +7733,7 @@ int main(int argc, char** argv) {
                 }
     }
     {
-        std::printf("collision: %zu triangles\n", sc.coll.triangle_count());
+        std::printf("collision: %zu triangles, %zu moving\n", sc.coll.triangle_count(), sc.coll.dynamic_count());
         for (size_t i = 0; i < sc.actors.size(); ++i) {
             if (!is_prince(sc.actors[i])) continue;
             float gy;
@@ -8231,6 +8231,18 @@ int main(int argc, char** argv) {
         float dt = float(now - last_time);
         last_time = now;
         if (dt > 0.1f) dt = 0.1f;          // don't lurch after a stall
+        {   // K2_PROFILE: collision casts a frame, every 2 s of frames.
+            static const bool prof = std::getenv("K2_PROFILE") != 0;
+            static int pf_frames = 0;
+            static double pf_t0 = plat::time_seconds();
+            if (prof && ++pf_frames == 120) {
+                const double t1 = plat::time_seconds();
+                std::printf("profile: %.0f picks/frame, %.2f ms/frame\n", double(sc.coll.picks) / 120.0, (t1 - pf_t0) * 1000.0 / 120.0);
+                sc.coll.picks = 0;
+                pf_frames = 0;
+                pf_t0 = t1;
+            }
+        }
         if (fixed_dt > 0.0f) dt = fixed_dt; // headless runs: game time per frame
 
         float fwd[3], right[3];
