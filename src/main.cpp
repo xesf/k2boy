@@ -642,7 +642,12 @@ struct draw_item {
     float           model[16];
     int             material;       // index into scene::materials, -1 for none
     bool            cutout;         // colour-keyed: alpha-tested, still opaque
+    int32_t         coll_node = -1; // a solid prop's part: collision that follows `owner`'s pose
 };
+
+// While set, actor geometry being loaded also goes into the collision world,
+// one node per part, switched off until its actor says otherwise.
+bool g_part_collision = false;
 
 // A material's texture: one frame, or an IFL sequence with per-frame holds.
 struct mat_tex {
@@ -709,6 +714,10 @@ struct actor_inst {
     int                               alt_hand_joint;
     float                             alt_hand_off[3];
     bool                              bow_shown;
+    // A Fixture that is solid (argv0's Collideable, "Collide:T/F"): carts,
+    // crates, levers - not the creatures, which idle. Its parts' collision
+    // follows the pose (ours; the original's prop collision is not traced).
+    bool                              collides = false;
     // "WalkAt:walk|run,<placeholder>[,REMOVE]": on his way there, under the
     // script's control; REMOVE hides him on arrival.
     bool                              walking;
@@ -2071,6 +2080,7 @@ public:
         std::string l = msg;
         for (size_t i = 0; i < l.size(); ++i) l[i] = char(std::tolower(static_cast<unsigned char>(l[i])));
         if (l == "enable:t" || l == "visible:t") { a.hidden = false; return true; }
+        if (l == "collide:t" || l == "collide:f") { a.collides = l[8] == 't'; return true; }
         if (l == "visible:f") { a.hidden = true; return true; }
         if (l.compare(0, 7, "enable:") == 0 || l.compare(0, 6, "state:") == 0) return true;
         // Anything else names one of its skills. One that interrupts the
@@ -2891,6 +2901,12 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
         }
         sc.items.push_back(it);
         sc.item_names.push_back(n.name);
+        if (!collide && g_part_collision && !it.is_trap && !it.transparent && !ib.empty()) {
+            const int32_t pn = sc.coll.add_node();
+            sc.coll.set_node_enabled(pn, false);
+            sc.coll.add_mesh(&vb[0].x, sizeof(assets::k2a_vertex) / sizeof(float), vb.size(), &ib[0], ib.size(), pn);
+            sc.items.back().coll_node = pn;
+        }
 
         // What the floor and wall picks (mask 6) see, per 0x449546 and
         // 0x474525: room geometry minus its alpha leaves, plus any Generic
@@ -3319,7 +3335,9 @@ void spawn_fixtures(scene& sc) {
         loading_progress(0.9f + 0.1f * float(i) / float(sc.fixture_points.size()));
         const assets::k2a_trap& t = sc.fixture_points[i];
         const std::string& who = t.argv[1];
+        g_part_collision = true;
         const int idx = spawn_prop(sc, t, who, t.node);
+        g_part_collision = false;
         if (idx < 0) continue;
         actor_inst& inst = sc.actors[size_t(idx)];
 
@@ -3347,6 +3365,10 @@ void spawn_fixtures(scene& sc) {
             }
         }
         actor_inst& placed = inst;
+        placed.collides = !(f0.size() > 3 && (f0[3] == "false" || f0[3] == "F" || f0[3] == "f")) &&
+                          placed.ambient.empty() &&
+                          !(placed.loco_ok.size() > size_t(LOCO_BASE) && placed.loco_ok[LOCO_BASE]);   // people
+        if (placed.collides) std::printf("  fixture %s is solid\n", t.node.c_str());
         // A named starting state ("Empty", "closed") is posed and held.
         if (!f0.empty() && !f0[0].empty() && find_actor_skill(sc, placed, f0[0]))
             play_once(sc, placed, f0[0], 0.0, placed.home_yaw, true);
@@ -3354,6 +3376,7 @@ void spawn_fixtures(scene& sc) {
                     t.node.c_str(), who.c_str(), placed.home[0], placed.home[1], placed.home[2],
                     placed.item_count, placed.ambient.size(), placed.hidden ? ", hidden" : "");
     }
+    sc.coll.build();        // the props' parts joined the collision world
     // Specials: the SPEC_ actor named by argv1 (Specials ctor, 0x4896B1:
     // "actors\\<name>\\<name>.k2a"), and the volumes in it the binary looks
     // up by name, "trigger" and "kill".
@@ -7029,7 +7052,7 @@ int main(int argc, char** argv) {
                     dumpskl_path, sk.name.c_str(), sk.kind_tag.c_str(), sk.version,
                     sk.chunk_tag.c_str(), sk.joint_keys.size(), sk.sound_keys.size(),
                     sk.event_keys.size(), sk.duration());
-        for (size_t k = 0; k < sk.joint_keys.size() && k < 3; ++k) {
+        for (size_t k = 0; k < sk.joint_keys.size() && (k < 3 || std::getenv("K2_ALLKEYS")); ++k) {
             const assets::skl_joint_key& j = sk.joint_keys[k];
             std::printf("    key t=%-6u ease %.4f/%.4f\n", j.time, j.ease_in, j.ease_out);
             for (int t = 0; t < 2; ++t)
@@ -8881,6 +8904,21 @@ int main(int argc, char** argv) {
             for (size_t i = 0; i < job.sounds.size(); ++i)
                 for (size_t k = 0; k < job.sounds[i].size(); ++k)
                     play_sound(*job.sounds[i][k].name, job.sounds[i][k].at, 14.0f, false);
+            // Solid props: each part's collision where it is drawn.
+            for (size_t i = 0; i < sc.actors.size(); ++i) {
+                const actor_inst& a = sc.actors[i];
+                if (!a.is_fixture || a.part_mats.size() < a.item_count * 16) continue;
+                for (size_t k = 0; k < a.item_count; ++k) {
+                    const int32_t cn = sc.items[a.first_item + k].coll_node;
+                    if (cn < 0) continue;
+                    sc.coll.set_node_enabled(cn, a.collides && !a.hidden);
+                    if (!a.collides || a.hidden) continue;
+                    const float* m = &a.part_mats[k * 16];
+                    const float rot[9] = { m[0], m[4], m[8], m[1], m[5], m[9], m[2], m[6], m[10] };
+                    const float zero[3] = { 0.0f, 0.0f, 0.0f };
+                    sc.coll.set_node_transform(cn, rot, zero, m + 12);
+                }
+            }
         }
 
         if (g_mixer) g_mixer->set_listener(cam.pos, right);
