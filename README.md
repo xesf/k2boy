@@ -39,16 +39,17 @@ reversed. The docs say which is which.
 | Boot | The original's module manager: Red Orb logo movie → title screen → level |
 | Front end | Title screen, in-game menu, Options (sound volume, difficulty, controls), Load/Save, Cinematics, Credits, drawn from the original art with its own TrueType font |
 | Levels | `.lvl` regions, every `.K2A` room, materials and textures, fog and clip planes |
-| Prince | Skeleton and skills from `.act`/`.skl`, walking, running, turning, jumping (the original's launch velocities and gravity), ledges (climb, hang, shimmy, pull-up), crates (push, pull, climb on), swimming and diving, picking things up |
+| Prince | Skeleton and skills from `.act`/`.skl`, walking and running with the original's start, stop and turn steps, jumping (the original's launch velocities and gravity), falls that hurt, ledges (climb, hang, shimmy, pull-up), poles (climb, slide), bars (hang, shimmy, swing and launch), swinging ropes, crates (push, pull, climb on), riding moving platforms, swimming and diving, picking things up and drinking potions |
 | Combat | Sword drawn and sheathed, attacks, blocks, feints, counters, follows, clashes, dying and finishing moves, taunts; guard AI and timing from `fight.ini` and `enemy.dat`; the bow and archers; health in bottles |
-| Traps and scripts | The trap message language: doors, plates, areas, movers, water raising and lowering, cutscene cameras, fixtures (prisoners, rats, levers, cranes), pickups and potions, pit spikes |
+| Traps and scripts | The trap message language: doors, plates, areas, messengers, movers (moves, turns, loops), water raising and lowering, cutscene cameras, fixtures (prisoners, rats, levers, cranes, carts), pickups and potions, spikes and blades, dart and fireball launchers, flamethrowers, collapsing floors, abysses, crate and arrow targets, arrow chargers |
 | Effects | NetImmerse 2.3 `.nif` particle effects (potions, SpecialEffect traps) |
 | Audio | `.sfx` sounds, positional ambiences, skill sound keys, a software mixer |
 | Cutscenes | QuickTime `.mov` with Sorenson Video 1 and QDesign Music 2, all decoded in-tree |
-| Saves | Our own text format under `~/.k2boy`, not yet the original's `.pop` |
+| Saves | Our own text format under `~/.k2boy`, with the level's state (traps, moved crates, pickups, dead guards); not yet the original's `.pop` |
 
-Not yet: levels after the prison, the original's save format, the bow, graphics options and key
-rebinding, and some trap types.
+Every level loads, and the Ivory Tower plays through its opening; the later levels are not yet
+played end to end. Not yet: the original's save format, graphics options and key rebinding,
+fountains and light switches, and the special arrows' possession and swarm.
 
 ## Getting started
 
