@@ -2986,6 +2986,10 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
                 st->pivot_angle = n.trap.pivot_angle * (n.trap.pivot_axis[1] < 0.0f ? -1.0f : 1.0f);
                 if (n.trap.name == "CrateTarget" && n.trap.argv.size() > 1) st->message = n.trap.argv[1];
                 if (n.trap.name == "ArrowTarget" && n.trap.argv.size() > 2) st->message = n.trap.argv[2];
+                // Movers (Traps.txt: argv2 "Starting Motions"): lifts and
+                // turning platforms already under way when the level opens.
+                if (n.trap.name == "Mover" && n.trap.argv.size() > 2 && !n.trap.argv[2].empty())
+                    st->handle(n.trap.argv[2], 0);
                 if (n.trap.name == "Force" && n.trap.argv.size() > 2 && equals_nocase(n.trap.argv[1], "Volume") &&
                     n.trap.argv[2].compare(0, 8, "current,") == 0) {
                     k2::engine::translate_motion m;     // the axis words as "move" reads them
