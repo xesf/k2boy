@@ -724,6 +724,10 @@ struct actor_inst {
     // crates, levers - not the creatures, which idle. Its parts' collision
     // follows the pose (ours; the original's prop collision is not traced).
     bool                              collides = false;
+    // Special arrows from an ArrowCharger (Inventory__AddArrows 0x4C1EBC):
+    // their kind, how many, and until when they last.
+    int                               special_type = 0, special_count = 0;
+    double                            special_until = 0.0;
     // "WalkAt:walk|run,<placeholder>[,REMOVE]": on his way there, under the
     // script's control; REMOVE hides him on arrival.
     bool                              walking;
@@ -1718,7 +1722,9 @@ const float SPEED = 60.0f;
 const int   DAMAGE = 12;
 const double STUCK_FOR = 4.0;
 }
-struct arrow_shot { float p[3], d[3]; double born, stuck_at; bool from_prince; };
+// `type`: the weapon table's arrow index (0x745C04) - 0 normal, 1 BlueFire,
+// 2 Charm, 3 Swarm, 4 Possess, 5 Freeze, 6 Magic, 7 Death, 8 Stealer.
+struct arrow_shot { float p[3], d[3]; double born, stuck_at; bool from_prince; int type = 0; };
 std::vector<arrow_shot> g_arrows;
 void fire_arrow(const float* from, const float* to, bool from_prince, double now) {
     arrow_shot a;
@@ -1812,6 +1818,11 @@ public:
             if (!fireball) play_sound("MULdartshoot", dt.p, 14.0f, false);   // fireballs fly silent (0x475D97)
             return true;
         }
+        if (type == "ArrowCharger") {                       // ArrowCharger__HandleMessage 0x4653A8
+            if (equals_nocase(msg, "on")) { charge_on = true; return true; }
+            if (equals_nocase(msg, "off")) { charge_on = false; return true; }
+            if (equals_nocase(msg, "reset")) { charge_on = charge_on0; return true; }
+        }
         // FlameThrower (0x471206): "on", "off" (back to the pattern's
         // start), "reset" (argv again); anything else is a new pattern.
         if (type == "FlameThrower") {
@@ -1837,6 +1848,11 @@ public:
     // drop are ours; the class is not traced.
     std::string wobble_skill, fall_skill, crash_skill;
     bool fireball = false;              // a Launcher of type 2
+    // An ArrowCharger (0x4650CC): argv1 the arrow kind, argv2 how long the
+    // charged arrows last, argv3 on.
+    int    charge_type = 0;
+    double charge_secs = 0.0;
+    bool   charge_on = false, charge_on0 = false;
     // A FlameThrower (FlameThrower__Update 0x4710EA): argv1 starts it on;
     // argv2's seconds alternate burn, pause, burn ..., from a burn, and wrap.
     // No list burns for good.
@@ -3048,6 +3064,7 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
         else if (n.trap.name == "Water")   solid = false;   // swum in, not stood on
         else if (n.trap.name == "Abyss")   solid = false;   // fallen through
         else if (n.trap.name == "Spikes")  solid = false;   // never solid (Spikes__Update)
+        else if (n.trap.name == "ArrowCharger") solid = false;
         else                             solid = hdr.collideable && !is_volume;
         // Trap geometry gets its own collision node, so scripts can switch it
         // on and off and move it; it is added even when it starts non-solid.
@@ -3105,6 +3122,11 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
                 if (n.trap.name == "CrateTarget" && n.trap.argv.size() > 1) st->message = n.trap.argv[1];
                 if (n.trap.name == "ArrowTarget" && n.trap.argv.size() > 2) st->message = n.trap.argv[2];
                 if (n.trap.name == "Launcher" && n.trap.argv.size() > 1) st->fireball = std::atoi(n.trap.argv[1].c_str()) == 2;
+                if (n.trap.name == "ArrowCharger") {
+                    st->charge_type = n.trap.argv.size() > 1 ? std::atoi(n.trap.argv[1].c_str()) : 0;
+                    st->charge_secs = n.trap.argv.size() > 2 ? std::atof(n.trap.argv[2].c_str()) : 0.0;
+                    st->charge_on = st->charge_on0 = n.trap.argv.size() > 3 && (n.trap.argv[3] == "true" || n.trap.argv[3] == "T");
+                }
                 if (n.trap.name == "FlameThrower") {
                     st->flame_on = st->flame_on0 = n.trap.argv.size() > 1 && (n.trap.argv[1] == "true" || n.trap.argv[1] == "T" || n.trap.argv[1] == "1");
                     st->flame_pattern0 = n.trap.argv.size() > 2 ? n.trap.argv[2] : std::string();
@@ -6923,7 +6945,7 @@ const float AIR_REACH   = 0.7f;
 //   m <trap> <where a moved trap, door or collapse has got to>
 //   p <pickup index taken>
 //   a <actor> <hidden> <health> <dead> <a prop's held clip>
-//   b <has bow> <arrows>
+//   b <has bow> <arrows> <special arrow kind> <special arrows>
 std::vector<std::string> world_capture(scene& sc, const combat_state& cs, const std::vector<bool>& taken) {
     std::vector<std::string> out;
     char b[1024];
@@ -6944,7 +6966,7 @@ std::vector<std::string> world_capture(scene& sc, const combat_state& cs, const 
     for (size_t i = 0; i < sc.actors.size(); ++i) {
         const actor_inst& a = sc.actors[i];
         if (is_prince(a)) {
-            std::snprintf(b, sizeof(b), "b %d %d", int(a.has_bow), a.arrows);
+            std::snprintf(b, sizeof(b), "b %d %d %d %d", int(a.has_bow), a.arrows, a.special_type, a.special_count);
             out.push_back(b);
             continue;
         }
@@ -6989,10 +7011,16 @@ void world_apply(scene& sc, combat_state& cs, std::vector<bool>& taken, const st
                 if (sc.pickups[i].actor >= 0) sc.actors[size_t(sc.pickups[i].actor)].hidden = true;
             }
         } else if (kind == 'b') {
-            int bow = 0, arrows = 0;
-            std::sscanf(ln.c_str() + 2, "%d %d", &bow, &arrows);
+            int bow = 0, arrows = 0, stype = 0, scount = 0;
+            std::sscanf(ln.c_str() + 2, "%d %d %d %d", &bow, &arrows, &stype, &scount);
             for (size_t i = 0; i < sc.actors.size(); ++i)
-                if (is_prince(sc.actors[i])) { sc.actors[i].has_bow = bow != 0; sc.actors[i].arrows = arrows; }
+                if (is_prince(sc.actors[i])) {
+                    sc.actors[i].has_bow = bow != 0;
+                    sc.actors[i].arrows = arrows;
+                    sc.actors[i].special_type = stype;
+                    sc.actors[i].special_count = scount;
+                    sc.actors[i].special_until = 1.0e30;    // the time left is not kept
+                }
         } else if (kind == 'a') {
             int hidden = 0, health = 0, dead = 0;
             if (std::sscanf(ln.c_str() + 2, "%255s %d %d %d %255s", name, &hidden, &health, &dead, st) < 5) continue;
@@ -8396,7 +8424,38 @@ int main(int argc, char** argv) {
                         if (en.state == enemy_ai::DEAD || ea.hidden) continue;
                         if (!body_hit::test(ar.p, ar.d, travel, ea.node->local.translate)) continue;
                         en.waiting = false;
-                        enemy_damage(combat, sc, en, arrow_tuning::DAMAGE, DIR_CENTER, game_time, false);
+                        // Arrow__OnHitCharacter (0x4A4E26), by kind; enemy.dat's
+                        // [Archery] numbers.
+                        int dmg = arrow_tuning::DAMAGE;
+                        switch (ar.type) {
+                        case 1: dmg = 30; break;                                  // kArrowBlueFireDamage
+                        case 2: dmg = 20; en.next_attack = game_time + 5.0; en.react = enemy_ai::R_NONE; break;   // charmed 5 s
+                        case 3: dmg = 24; break;                                  // kArrowSwarmDamage
+                        case 4: dmg = arrow_tuning::DAMAGE / 2; break;            // possession: not ported
+                        case 5: dmg = 0; en.busy_until = game_time + 10.0; en.hit.active = false; break;   // frozen (time ours)
+                        case 7: dmg = ea.health; break;                           // the black arrow
+                        case 8: dmg = 15;                                         // kArrowStealerDamage, and heals him
+                            for (size_t a = 0; a < sc.actors.size(); ++a)
+                                if (is_prince(sc.actors[a])) sc.actors[a].health = std::min(sc.actors[a].max_health, sc.actors[a].health + 15);
+                            break;
+                        default: break;
+                        }
+                        if (ar.type == 6) {
+                            // Magic: 30 - d^2 to every guard about the hit.
+                            for (size_t e2 = 0; e2 < combat.enemies.size(); ++e2) {
+                                enemy_ai& o = combat.enemies[e2];
+                                const actor_inst& oa = sc.actors[size_t(o.actor)];
+                                if (o.state == enemy_ai::DEAD || oa.hidden) continue;
+                                const float* q = oa.node->local.translate;
+                                const float d2 = (q[0] - ar.p[0]) * (q[0] - ar.p[0]) + (q[1] - ar.p[1]) * (q[1] - ar.p[1]) + (q[2] - ar.p[2]) * (q[2] - ar.p[2]);
+                                const int md = int(30.0f - d2);
+                                if (md > 0) enemy_damage(combat, sc, o, md, DIR_CENTER, game_time, false);
+                            }
+                            fx_spawn("ArrowDestructImpact.NIF", ar.p, 0.0f, game_time, 1.5);
+                        } else if (dmg > 0) {
+                            enemy_damage(combat, sc, en, dmg, DIR_CENTER, game_time, false);
+                        }
+                        if (ar.type == 7) fx_spawn("ArrowDeathImpact.NIF", ar.p, 0.0f, game_time, 1.5);
                         play_sound("mularrowhitop", ar.p, 14.0f, false);
                         gone = true;
                     }
@@ -8655,6 +8714,10 @@ int main(int argc, char** argv) {
                             if (cs > best) { best = cs; for (int k = 0; k < 3; ++k) to[k] = c[k]; }
                         }
                         fire_arrow(from, to, true, game_time);
+                        if (player->special_count > 0 && game_time < player->special_until) {
+                            g_arrows.back().type = player->special_type;     // the charged ones go first
+                            if (--player->special_count == 0) player->special_type = 0;
+                        }
                         --player->arrows;
                         std::printf("bow: loosed, %d arrows left\n", player->arrows);
                         bow.stage = 0;
@@ -8820,6 +8883,32 @@ int main(int argc, char** argv) {
                     ? find_actor_skill(sc, *player, std::string("CombatBlocking") + k_dir_names[combat.prince_block_dir] + "_G2")
                     : player->health <= combat_tuning::BOTTLE ? find_actor_skill(sc, *player, "CombatWoozy_G2") : 0;
                 if (!player->stance) player->stance = find_actor_skill(sc, *player, "CombatAtReady_G2");
+            }
+            // An ArrowCharger (ArrowCharger__CanUse 0x465241): within 2.7,
+            // facing it, it on, a normal arrow in hand - the action input
+            // plays UseArrowCharger_M, trading the arrow for a charged one
+            // (one; two on the easiest difficulty; Swarm never more than one).
+            if (act_pressed && !dead && !scripted_now && player->arrows > 0) {
+                const float fx = std::sin(player_yaw), fz = std::cos(player_yaw);
+                for (size_t t = 0; t < sc.traps.size(); ++t) {
+                    scene_trap* ch = dynamic_cast<scene_trap*>(sc.traps[t]);
+                    if (!ch || ch->type != "ArrowCharger" || !ch->charge_on || !ch->enabled()) continue;
+                    const float cx = (ch->box[0] + ch->box[3]) * 0.5f, cz = (ch->box[2] + ch->box[5]) * 0.5f;
+                    const float dx = cx - lt.translate[0], dz = cz - lt.translate[2];
+                    if (dx * dx + dz * dz >= 2.7f * 2.7f) continue;
+                    const float bx = cx - (lt.translate[0] + fx * 0.5f), bz = cz - (lt.translate[2] + fz * 0.5f);
+                    const float bl = std::sqrt(bx * bx + bz * bz);
+                    if (bl > 1e-4f && (bx * fx + bz * fz) / bl <= 0.8f) continue;
+                    play_once(sc, *player, "UseArrowCharger_M", game_time, player_yaw, false);
+                    --player->arrows;
+                    const int gain = frontend.prefs().difficulty == 0 ? 2 : 1;
+                    if (player->special_type != ch->charge_type) player->special_count = 0;
+                    player->special_type = ch->charge_type;
+                    player->special_count = ch->charge_type == 3 ? 1 : player->special_count + gain;
+                    player->special_until = ch->charge_secs > 0.0 ? game_time + ch->charge_secs : 1.0e30;
+                    std::printf("charger: %d arrows of kind %d for %.0f s\n", player->special_count, ch->charge_type, ch->charge_secs);
+                    break;
+                }
             }
             // E near a pickup collects it.
             if (act && !dead && !taking.active()) {
