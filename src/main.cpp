@@ -6786,6 +6786,19 @@ void actor_part_matrices(const scene& sc, actor_inst& a, bool skin) {
     }
 }
 
+// Pole numbers from the binary (docs/reference/poles-ropes-bars.md).
+namespace pole_tuning {
+const float HOLD        = 2.25f;    // hands above the feet (0x74AF68)
+const float FEET_CLEAR  = 0.25f;    // feet stay this far above the bottom
+const float CLIMB_STEP  = 0.393f;   // a climb clip's rise (0x74AAD0)
+const float SLIDE_STEP  = 0.4723f;  // start / end slide (0x74AAD4)
+const float SLIDE_SPEED = 3.0f;     // the slide loop, units a second (0x74AB64)
+const float TURN_RATE   = 1.0471976f;   // pi/3 a second round the pole
+// Ours: the original notices a pole by touching it (Prince__CollidePoleFilter).
+const float REACH       = 1.0f;
+const float AIR_REACH   = 0.7f;
+}
+
 // --- saves: the level's state ------------------------------------------------------
 //
 // Ours: the original's .pop is not read or written. Each line is one thing:
@@ -7726,6 +7739,19 @@ int main(int argc, char** argv) {
     // Riding a Mover (lifts, swinging platforms, the gears' teeth): where he
     // stands, held in the platform's own frame, so its motion carries him.
     // Ours; the original's rider handling is not traced.
+    // Poles: vertical ropes and chains he climbs (docs/reference/poles-ropes-bars.md).
+    // The hands hold the pole's axis at `hand_y`; the body hangs behind,
+    // turned by `yaw`; the clips play about that hold, as the original's
+    // K2AttachActivity plays them about its attach transform.
+    struct pole_ctl {
+        enum state_t { NONE, MOUNT, HANG, CLIMB, SLIDE_START, SLIDE, SLIDE_END, PUSHOFF } state = NONE;
+        scene_trap* pole = 0;
+        float yaw = 0.0f, hand_y = 0.0f;
+        int   hand = 1;                 // which hand is up: +1 right (fight+0xF0's sign)
+        float grip[3] = { 0.0f, 2.25f, 0.0f };
+        bool  have_grip = false;
+        bool  let_go = false;           // a release pressed during a clip, kept for the hang
+    } pole;
     struct ride_ctl { int32_t node = -1; float local[3] = { 0.0f, 0.0f, 0.0f }; float at[3] = { 0.0f, 0.0f, 0.0f }; } ride;
     bool      jump_was_down = false;
     bool      act_was_down = false;
@@ -8681,7 +8707,7 @@ int main(int argc, char** argv) {
                 jump_begin(jumps, *player, FALL_VERT, game_time, lt.translate);
                 regrab_after = game_time + 0.6;
             }
-            if (!on_ledge && jump_pressed && !scripted_now && crates.state == crate_ctl::NONE &&
+            if (!on_ledge && jump_pressed && !scripted_now && crates.state == crate_ctl::NONE && pole.state == pole_ctl::NONE &&
                 crouch.state == crouch_ctl::NONE &&
                 jumps.state == jump_ctl::NONE && player_vy == 0.0f && swim.state == swim_ctl::NONE) {
                 // Jump never climbs (the original climbs from StStartStepBack,
@@ -8791,6 +8817,141 @@ int main(int argc, char** argv) {
                     in_jump = false;
                 }
             }
+            // --- poles ---------------------------------------------------------
+            {
+                namespace pt = pole_tuning;
+                // The root that puts the hands on the axis at hand_y, facing yaw.
+                struct pole_place { static void at(const pole_ctl& pc, float* out) {
+                    const float c = std::cos(pc.yaw), sn = std::sin(pc.yaw);
+                    const float gx = c * pc.grip[0] + sn * pc.grip[2], gz = -sn * pc.grip[0] + c * pc.grip[2];
+                    const float* b = pc.pole->box;
+                    out[0] = (b[0] + b[3]) * 0.5f - gx;
+                    out[1] = pc.hand_y - pc.grip[1];
+                    out[2] = (b[2] + b[5]) * 0.5f - gz;
+                } };
+                // Prince__CanMoveOnPole (0x4D141C), without the body probe.
+                struct pole_can { static bool move(const pole_ctl& pc, float dy) {
+                    const float y = pc.hand_y + dy;
+                    return dy >= 0.0f ? y <= pc.pole->box[4] : y - pt::HOLD + pt::FEET_CLEAR >= pc.pole->box[1];
+                } };
+                const char* side = pole.hand >= 0 ? "RH_M" : "LH_M";
+                const char* other = pole.hand >= 0 ? "LH_M" : "RH_M";     // the slides pick the other way
+                if (pole.state == pole_ctl::NONE && !dead && !in_swim && ledges.state == hang_ctl::NONE &&
+                    crates.state == crate_ctl::NONE && (act_pressed || (in_jump && jumps.state == jump_ctl::AIR)) &&
+                    (!scripted_now || in_jump)) {
+                    // Prince__CanGrabPole (0x4D11E4): a pole ahead, in a cos 0.7 cone
+                    // from half a unit behind him; the hands 2.25 up must be on it.
+                    const float fx = std::sin(player_yaw), fz = std::cos(player_yaw);
+                    for (size_t t = 0; t < sc.traps.size(); ++t) {
+                        scene_trap* pl = dynamic_cast<scene_trap*>(sc.traps[t]);
+                        if (!pl || pl->type != "Pole" || !pl->enabled()) continue;
+                        const float ax = (pl->box[0] + pl->box[3]) * 0.5f, az = (pl->box[2] + pl->box[5]) * 0.5f;
+                        const float dx = ax - lt.translate[0], dz = az - lt.translate[2];
+                        const float d = std::sqrt(dx * dx + dz * dz);
+                        if (d > (in_jump ? pt::AIR_REACH : pt::REACH)) continue;
+                        const float hy = lt.translate[1] + pt::HOLD;
+                        if (hy > pl->box[4] + 0.3f || hy - pt::HOLD + pt::FEET_CLEAR < pl->box[1]) continue;
+                        const float bx = ax - (lt.translate[0] - fx * 0.5f), bz = az - (lt.translate[2] - fz * 0.5f);
+                        const float bl = std::sqrt(bx * bx + bz * bz);
+                        if (bl < 1e-4f || (bx * fx + bz * fz) / bl <= 0.7f) continue;
+                        pole.pole = pl;
+                        pole.yaw = std::atan2(bx, bz);
+                        pole.hand_y = std::min(hy, pl->box[4]);
+                        pole.hand = 1;
+                        if (!pole.have_grip) {
+                            const assets::skl_file* base = find_actor_skill(sc, *player, "VerticalRopeBaseRH_M");
+                            pole.have_grip = base && clip_grip(*player, *base, 0, pole.grip);
+                        }
+                        pl->set_collideable(false);           // StStartPoleMount
+                        const bool from_jump = in_jump;
+                        jumps.state = jump_ctl::NONE;
+                        in_jump = false;
+                        player_yaw = pole.yaw;
+                        pole_place::at(pole, lt.translate);
+                        play_once(sc, *player, from_jump ? "VerticalRopeFromJump_M" : "VerticalRopeAntic_M",
+                                  game_time, player_yaw, false);
+                        pole.state = pole_ctl::MOUNT;
+                        pole.let_go = false;
+                        std::printf("pole: %s grabbed\n", pl->name().c_str());
+                        break;
+                    }
+                }
+                if (pole.state != pole_ctl::NONE && pole.state != pole_ctl::PUSHOFF && (jump_pressed || act_pressed))
+                    pole.let_go = true;
+                if (pole.state != pole_ctl::NONE && !player->scripted) {
+                    float at[3];
+                    switch (pole.state) {
+                    case pole_ctl::CLIMB:
+                        pole.hand_y += pt::CLIMB_STEP;
+                        pole.hand = -pole.hand;           // climbing swaps hands
+                        pole.state = pole_ctl::HANG;
+                        break;
+                    case pole_ctl::SLIDE_START:
+                        if (in_y < -0.5f && pole_can::move(pole, -pt::SLIDE_STEP)) {
+                            pole.hand_y -= pt::SLIDE_STEP;
+                            pole.state = pole_ctl::SLIDE;
+                        } else {
+                            pole.state = pole_ctl::SLIDE_END;
+                            pole_place::at(pole, lt.translate);
+                            play_once(sc, *player, std::string("VerticalRopeEndSlideDown") + other, game_time, pole.yaw, false);
+                        }
+                        break;
+                    case pole_ctl::SLIDE_END:
+                    case pole_ctl::MOUNT:
+                        pole.state = pole_ctl::HANG;
+                        break;
+                    case pole_ctl::PUSHOFF:
+                        // StIdlePolePushOff: then a fall from rest.
+                        pole.pole->set_collideable(true);
+                        pole.state = pole_ctl::NONE;
+                        player->stance = 0;
+                        jumps.state = jump_ctl::AIR;
+                        jumps.dir = 0;
+                        jumps.vel[0] = jumps.vel[1] = jumps.vel[2] = 0.0f;
+                        jumps.peak_y = lt.translate[1];
+                        jump_begin(jumps, *player, FALL_VERT, game_time, lt.translate);
+                        regrab_after = game_time + 0.6;
+                        break;
+                    default:
+                        break;
+                    }
+                    if (pole.state == pole_ctl::SLIDE) {
+                        // StIdlePoleMove: down 3 units a second while back is held.
+                        player->stance = find_actor_skill(sc, *player, std::string("VerticalRopeSlideDown") + other);
+                        pole_place::at(pole, lt.translate);
+                        if (in_y < -0.5f && pole_can::move(pole, -pt::SLIDE_SPEED * dt)) {
+                            pole.hand_y -= pt::SLIDE_SPEED * dt;
+                        } else {
+                            pole.state = pole_ctl::SLIDE_END;
+                            player->stance = 0;
+                            play_once(sc, *player, std::string("VerticalRopeEndSlideDown") + other, game_time, pole.yaw, false);
+                        }
+                    } else if (pole.state == pole_ctl::HANG) {
+                        // StIdlePoleHang.
+                        player->stance = find_actor_skill(sc, *player, std::string("VerticalRopeBase") + (pole.hand >= 0 ? "RH_M" : "LH_M"));
+                        if (std::fabs(in_x) > 0.3f) pole.yaw += (in_x > 0.0f ? -1.0f : 1.0f) * pt::TURN_RATE * dt;
+                        player_yaw = pole.yaw;
+                        pole_place::at(pole, at);
+                        for (int k = 0; k < 3; ++k) lt.translate[k] = at[k];
+                        const char* hs = pole.hand >= 0 ? "RH_M" : "LH_M";
+                        if (pole.let_go) {
+                            pole.let_go = false;
+                            pole.state = pole_ctl::PUSHOFF;
+                            player->stance = 0;
+                            play_once(sc, *player, std::string("VerticalRopePushOff") + hs, game_time, pole.yaw, false);
+                        } else if (in_y > 0.5f && pole_can::move(pole, pt::CLIMB_STEP)) {
+                            pole.state = pole_ctl::CLIMB;
+                            player->stance = 0;
+                            play_once(sc, *player, std::string("VerticalRopeClimbUp") + hs, game_time, pole.yaw, false);
+                        } else if (in_y < -0.5f && pole_can::move(pole, -pt::SLIDE_STEP)) {
+                            pole.state = pole_ctl::SLIDE_START;
+                            player->stance = 0;
+                            play_once(sc, *player, std::string("VerticalRopeStartSlideDown") + other, game_time, pole.yaw, false);
+                        }
+                    }
+                }
+                (void)side;
+            }
             // Action traps (levers, cranes, the cart, the crusher, Assan's
             // mouth): the action input inside one plays its stages - reach,
             // use, finish - each a Prince skill and a script, in turn.
@@ -8843,7 +9004,7 @@ int main(int argc, char** argv) {
                 crouch_update(crouch, sc, *player, sc.coll, lt.translate, player_yaw, crouch_key,
                               mv, ml, classic, in_x, in_y, game_time, dt);
             const bool busy = on_ledge || ledges.state != hang_ctl::NONE || in_swim || crouched ||
-                              working.trap != 0 || bow.ready;
+                              working.trap != 0 || bow.ready || pole.state != pole_ctl::NONE;
             const bool in_crate = !scripted_now && !in_jump && !busy &&
                                   update_crate(crates, sc, *player, lt.translate, player_yaw,
                                                game_time, act, push, pull);
