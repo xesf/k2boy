@@ -2456,7 +2456,9 @@ bool update_scripted(actor_inst& a, double now) {
     const float dx = pt[0] - p0[0], dy = pt[1] - p0[1], dz = pt[2] - p0[2];
     const float c = std::cos(a.scripted_yaw + a.motion_turn), sn = std::sin(a.scripted_yaw + a.motion_turn);
     k2::engine::transform& lt = a.node->local;
-    lt.set_yaw(a.scripted_yaw);
+    // The node faces where the clip carries him; a sideways or backward
+    // clip turns the body back round inside itself.
+    lt.set_yaw(a.scripted_yaw + a.motion_turn);
     lt.translate[0] = a.scripted_origin[0] + c * dx + sn * dz;
     lt.translate[1] = a.scripted_origin[1] + dy;
     lt.translate[2] = a.scripted_origin[2] - sn * dx + c * dz;
@@ -2626,17 +2628,29 @@ void audio_callback(float* out, int32_t frames, void*) {
 // variant, up to eight per name. One that exists is picked at random each
 // time; how the original chooses is not traced.
 std::string resolve_sound_file(const std::string& name) {
-    char real[4096];
-    if (plat::fs_resolve_basename((name + ".sfx").c_str(), real, sizeof(real))) return name;
-    std::vector<std::string> found;
-    for (int v = 1; v <= 20; ++v) {
-        char buf[16];
-        std::snprintf(buf, sizeof(buf), "%03d", v);
-        if (plat::fs_resolve_basename((name + buf + ".sfx").c_str(), real, sizeof(real)))
-            found.push_back(name + buf);
+    // Resolved once per name, misses included: sounds are asked for every
+    // footstep, and a by-name search without the install indexed only sees
+    // the folders used lately - Audio/sfx is looked in directly.
+    static std::map<std::string, std::vector<std::string> > cache;
+    std::map<std::string, std::vector<std::string> >::iterator it = cache.find(name);
+    if (it == cache.end()) {
+        std::vector<std::string> found;
+        char real[4096];
+        struct probe { static bool at(const std::string& n, char* out, size_t sz) {
+            return plat::fs_probe(("audio/sfx/" + n + ".sfx").c_str(), out, sz);
+        } };
+        if (probe::at(name, real, sizeof(real))) found.push_back(name);
+        else
+            for (int v = 1; v <= 20; ++v) {
+                char buf[16];
+                std::snprintf(buf, sizeof(buf), "%03d", v);
+                if (probe::at(name + buf, real, sizeof(real))) found.push_back(name + buf);
+                else if (v > 1) break;          // variants are numbered without gaps
+            }
+        it = cache.insert(std::make_pair(name, found)).first;
     }
-    if (found.empty()) return std::string();
-    return found[size_t(std::rand()) % found.size()];
+    if (it->second.empty()) return std::string();
+    return it->second[size_t(std::rand()) % it->second.size()];
 }
 
 bool ensure_sound(const std::string& raw) {
@@ -2648,7 +2662,7 @@ bool ensure_sound(const std::string& raw) {
     const std::string file = resolve_sound_file(name);
     if (file.empty()) return false;
     size_t size = 0;
-    uint8_t* d = plat::fs_read_basename((file + ".sfx").c_str(), size);
+    uint8_t* d = plat::fs_read(("audio/sfx/" + file + ".sfx").c_str(), size);
     if (!d) return false;
     assets::sfx_file sf;
     const bool ok = assets::sfx_parse(d, size, sf);
@@ -8672,6 +8686,7 @@ int main(int argc, char** argv) {
             const bool run = autorun || (!step_key && (keys_move || pad_run ||
                              (pad.connected && (pad.button[plat::PAD_RSHOULDER] ||
                                                 pad.axis[plat::PAD_AXIS_RTRIGGER] > 0.5f))));
+            float step_turn = 0.0f;     // the node's turn from his facing while a step clip plays
             // The input in the Prince's own frame: x his left, z ahead.
             const float pf[3] = { std::sin(player_yaw), 0.0f, std::cos(player_yaw) };
             const float ps[3] = { std::cos(player_yaw), 0.0f, -std::sin(player_yaw) };
@@ -9712,6 +9727,9 @@ int main(int argc, char** argv) {
                 // sidestep (SidestepLeft/Right_L).
                 const float side = local[0], ahead = local[2];
                 const bool sideways = std::fabs(side) > std::fabs(ahead);
+                // Every step clip travels along its own +z, the body turned
+                // inside it: the node faces the way he goes.
+                step_turn = sideways ? (side > 0.0f ? 1.5707963f : -1.5707963f) : (ahead > 0.0f ? 0.0f : 3.14159265f);
                 const char* clip_name = 0;
                 float dir[3] = { 0.0f, 0.0f, 0.0f };
                 float speed = walk_speed;
@@ -9831,7 +9849,7 @@ int main(int argc, char** argv) {
                 dyw -= 3.14159265f;
                 cam.yaw += dyw * std::min(1.0f, dt * 3.0f);
             }
-            lt.set_yaw(player_yaw);
+            if (!player->scripted) lt.set_yaw(player_yaw + step_turn);
             sc.root->update_world();
             {   // What he stands on now, for next frame's ride.
                 ride.node = -1;
