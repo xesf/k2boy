@@ -649,6 +649,10 @@ struct draw_item {
 // one node per part, switched off until its actor says otherwise.
 bool g_part_collision = false;
 
+// K2_SCRIPTAUDIT: every trap's script arguments, run once at the start so the
+// exit summary lists what nothing handles. A diagnostic only.
+std::vector<std::string> g_audit_scripts;
+
 // A material's texture: one frame, or an IFL sequence with per-frame holds.
 struct mat_tex {
     std::vector<gfx::texture_id> frames;
@@ -708,6 +712,7 @@ struct actor_inst {
     bool                              has_bow;        // "weapon:+bow"
     int                               arrows;         // "weapon:+arrow,type,count"
     int                               pending_hurt;   // "hurt:N", applied by combat
+    std::string                       pending_kill;   // "kill:<clip>": dies playing it
     bool                              archer;         // a bowman: shoots, never closes in
     // The other hand (master.dat's second grip), where the Prince's bow is
     // held while `bow_shown`.
@@ -2067,6 +2072,11 @@ public:
                 return true;
             }
             if (msg.size() > 7 && equals_nocase(msg.substr(0, 7), "weapon:")) return weapon(a, msg.substr(7));
+            if (msg.size() >= 5 && equals_nocase(msg.substr(0, 5), "kill:")) {
+                a.pending_kill = msg.substr(5);
+                if (a.pending_kill.empty()) a.pending_kill = "DeathGeneric_G";
+                return true;
+            }
             return false;
         }
         if (a.is_enemy) {
@@ -2930,6 +2940,9 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
             sc.coll.add_mesh(&vb[0].x, sizeof(assets::k2a_vertex) / sizeof(float),
                              vb.size(), &ib[0], ib.size(), node);
 
+        if (collide && n.has_trap && std::getenv("K2_SCRIPTAUDIT"))
+            for (size_t a = 1; a < n.trap.argv.size(); ++a)
+                if (n.trap.argv[a].find(',') != std::string::npos) g_audit_scripts.push_back(n.trap.argv[a]);
         // Every trap node becomes a script target under its node name.
         if (collide && n.has_trap) {
             k2::engine::trap_object* t;
@@ -7493,6 +7506,19 @@ int main(int argc, char** argv) {
     sc.script.trace = trapmsg;
     // --send "target,msg" delivers a message at start, as if a trap sent it.
     for (size_t i = 0; i < send_args.size(); ++i) sc.script.send_item(send_args[i], 0);
+    for (size_t i = 0; i < g_audit_scripts.size(); ++i) {
+        // "{state:items}" blocks run regardless of state here.
+        std::string sct = g_audit_scripts[i];
+        for (size_t k = 0; k < sct.size(); ++k) {
+            if (sct[k] == '}') sct[k] = ';';
+            else if (sct[k] == '{') {
+                const size_t c = sct.find(':', k);
+                if (c != std::string::npos) sct.erase(k, c - k + 1); else sct[k] = ' ';
+                --k;
+            }
+        }
+        sc.script.execute(sct, 0);
+    }
     double game_time = 0.0;
     crate_ctl crates;
     jump_ctl  jumps;
@@ -8426,6 +8452,10 @@ int main(int argc, char** argv) {
                     taking.pickup = -1;
             }
             if (!dead) specials_update(sc, combat, *player, game_time);
+            if (!player->pending_kill.empty()) {  // "Prince,kill:Lvl1HandGetsEaten_G"
+                if (!dead) prince_damage(combat, sc, *player, player->health, 0, game_time, player->pending_kill.c_str());
+                player->pending_kill.clear();
+            }
             if (player->pending_hurt > 0) {       // "prince,hurt:N" from a trap
                 if (!dead) prince_damage(combat, sc, *player, player->pending_hurt, 0, game_time);
                 player->pending_hurt = 0;
