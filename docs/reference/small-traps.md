@@ -5,9 +5,9 @@ disassembly of `data/pop3dreal.exe` (MD5 `7a89eaef1997f089fa04f7a3f4a26779`). Gu
 **(guess)**. Message syntax and the messages every trap understands are in
 [trap-scripts.md](trap-scripts.md). Builder keys are in [trap-factory.md](trap-factory.md).
 
-> **IDA names.** The IDA session could not be reached for this pass, so the disassembly was read
-> offline with `llvm-objdump`. No IDA renames were applied. The names in the tables are the
-> intended IDA names. Apply them when the database is open.
+> **IDA names.** The disassembly was read offline with `llvm-objdump`; the names in the tables
+> were applied in the IDA database afterwards, except where a function already had a name
+> (`0x4C73D6` stays `Prince__Poison`, `0x4C763C` stays `Prince__Heal`).
 
 ## Shared pieces
 

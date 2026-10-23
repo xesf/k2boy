@@ -370,10 +370,9 @@ his position, `StIdleFall` (which can catch another bar, rope or pole).
 
 ## Functions and globals
 
-Names used above. **None of these were applied in IDA:** the MCP server at `127.0.0.1:13337` is
-answered by another IDA instance (a 64-bit database), not the one with `pop3dreal.exe` open.
+Names used above, applied in the IDA database (functions that were still `sub_*`, and the globals).
 
-| address | proposed name |
+| address | name |
 |---|---|
 | `0x4832BF` / `0x466F19` / `0x487FF3` | `Pole__ctor` / `Bar__ctor` / `Rope__ctor` |
 | `0x4833E8` | `Pole__AddToRoom` |
