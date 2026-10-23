@@ -6787,6 +6787,17 @@ void actor_part_matrices(const scene& sc, actor_inst& a, bool skin) {
 }
 
 // Pole numbers from the binary (docs/reference/poles-ropes-bars.md).
+namespace bar_tuning {
+const float STEP         = 0.5717f;  // a shimmy step (0x74AB04)
+const float LAUNCH_FROM  = 0.43f, LAUNCH_TO = 0.75f;   // swing phase window (0x74AF70, 0x743D64)
+const float LAUNCH_AHEAD = 1.61f;    // placed this far ahead of the bar (0x74AFA4)
+const float LAUNCH_Y     = 4.5f;     // fHorizLaunchY
+const float LAUNCH_Z     = 5.2f;     // fHorizLaunchZ
+// Ours: how near the hands must come to catch one.
+const float REACH        = 0.5f;
+const float STAND_REACH  = 1.0f;     // above his hands, standing, for the action input
+}
+
 namespace pole_tuning {
 const float HOLD        = 2.25f;    // hands above the feet (0x74AF68)
 const float FEET_CLEAR  = 0.25f;    // feet stay this far above the bottom
@@ -7752,6 +7763,19 @@ int main(int argc, char** argv) {
         bool  have_grip = false;
         bool  let_go = false;           // a release pressed during a clip, kept for the hang
     } pole;
+    // Bars: horizontal bars and ropes he hangs from, shimmies along and
+    // swings on (StStartHorizHang .. StStartHorizLaunch). `hold` is where the
+    // hands are on the bar's axis.
+    struct bar_ctl {
+        enum state_t { NONE, CATCH, HANG, SH_START, SH_MOVE, SH_END, SW_START, SWING, SW_STOP } state = NONE;
+        scene_trap* bar = 0;
+        float hold[3] = { 0.0f, 0.0f, 0.0f };
+        float yaw = 0.0f;
+        int   dir = 0;                  // shimmy: +1 his left, -1 his right
+        float grip[3] = { 0.0f, 2.25f, 0.0f };
+        bool  have_grip = false;
+        double swing_t0 = 0.0, swing_len = 1.749;
+    } bar;
     struct ride_ctl { int32_t node = -1; float local[3] = { 0.0f, 0.0f, 0.0f }; float at[3] = { 0.0f, 0.0f, 0.0f }; } ride;
     bool      jump_was_down = false;
     bool      act_was_down = false;
@@ -8707,7 +8731,7 @@ int main(int argc, char** argv) {
                 jump_begin(jumps, *player, FALL_VERT, game_time, lt.translate);
                 regrab_after = game_time + 0.6;
             }
-            if (!on_ledge && jump_pressed && !scripted_now && crates.state == crate_ctl::NONE && pole.state == pole_ctl::NONE &&
+            if (!on_ledge && jump_pressed && !scripted_now && crates.state == crate_ctl::NONE && pole.state == pole_ctl::NONE && bar.state == bar_ctl::NONE &&
                 crouch.state == crouch_ctl::NONE &&
                 jumps.state == jump_ctl::NONE && player_vy == 0.0f && swim.state == swim_ctl::NONE) {
                 // Jump never climbs (the original climbs from StStartStepBack,
@@ -8808,8 +8832,162 @@ int main(int argc, char** argv) {
                     std::printf("combat: the Prince falls into the abyss\n");
                     break;
                 }
+            // --- bars ----------------------------------------------------------
+            {
+                namespace bt = bar_tuning;
+                // A bar's axis: its box's long horizontal side, through its middle.
+                struct bar_axis { static bool along_x(const scene_trap* b) { return b->box[3] - b->box[0] >= b->box[5] - b->box[2]; } };
+                struct bar_place { static void at(const bar_ctl& bc, float* out) {
+                    const float c = std::cos(bc.yaw), sn = std::sin(bc.yaw);
+                    out[0] = bc.hold[0] - (c * bc.grip[0] + sn * bc.grip[2]);
+                    out[1] = bc.hold[1] - bc.grip[1];
+                    out[2] = bc.hold[2] - (-sn * bc.grip[0] + c * bc.grip[2]);
+                } };
+                struct bar_drop { static void go(bar_ctl& bc, jump_ctl& jc, actor_inst& p, const float* pos, double now,
+                                                  const float* vel, int clip) {
+                    bc.state = bar_ctl::NONE;
+                    p.stance = 0;
+                    jc.state = jump_ctl::AIR;
+                    jc.dir = vel ? 5 : 0;
+                    for (int k = 0; k < 3; ++k) jc.vel[k] = vel ? vel[k] : 0.0f;
+                    jc.peak_y = pos[1];
+                    jump_begin(jc, p, clip, now, pos);
+                } };
+                if (!bar.have_grip) {
+                    const assets::skl_file* hb = find_actor_skill(sc, *player, "HorizHangBase_M");
+                    bar.have_grip = hb && clip_grip(*player, *hb, 0, bar.grip);
+                }
+                // Catching one: from a jump or fall, the hands near the axis
+                // (ours; the original reaches bars through its ledge finder,
+                // 0x4CF65C, untraced); or the action input beneath one.
+                const bool air = in_jump && jumps.state == jump_ctl::AIR && game_time >= regrab_after;
+                if (bar.state == bar_ctl::NONE && pole.state == pole_ctl::NONE && !dead && !in_swim &&
+                    ledges.state == hang_ctl::NONE && (air || (act_pressed && !scripted_now))) {
+                    const float hands[3] = { lt.translate[0], lt.translate[1] + bar.grip[1], lt.translate[2] };
+                    for (size_t t = 0; t < sc.traps.size(); ++t) {
+                        scene_trap* b = dynamic_cast<scene_trap*>(sc.traps[t]);
+                        if (!b || b->type != "Bar" || !b->enabled()) continue;
+                        const bool ax = bar_axis::along_x(b);
+                        const float by = (b->box[1] + b->box[4]) * 0.5f;
+                        const float lo = ax ? b->box[0] : b->box[2], hi = ax ? b->box[3] : b->box[5];
+                        const float along = ax ? hands[0] : hands[2];
+                        const float across = ax ? hands[2] - (b->box[2] + b->box[5]) * 0.5f
+                                                : hands[0] - (b->box[0] + b->box[3]) * 0.5f;
+                        const float up = by - hands[1];
+                        if (along < lo + 0.2f || along > hi - 0.2f) continue;
+                        if (std::fabs(across) > bt::REACH) continue;
+                        if (air ? (up < -0.4f || up > 0.5f) : (up < 0.0f || up > bt::STAND_REACH)) continue;
+                        bar.bar = b;
+                        bar.hold[0] = ax ? along : (b->box[0] + b->box[3]) * 0.5f;
+                        bar.hold[1] = by;
+                        bar.hold[2] = ax ? (b->box[2] + b->box[5]) * 0.5f : along;
+                        // Face across the bar, the way he was facing.
+                        const float fx = std::sin(player_yaw), fz = std::cos(player_yaw);
+                        bar.yaw = ax ? (fz >= 0.0f ? 0.0f : 3.14159265f) : (fx >= 0.0f ? 1.5707963f : -1.5707963f);
+                        player_yaw = bar.yaw;
+                        const bool running = air && jumps.dir == 5;
+                        jumps.state = jump_ctl::NONE;
+                        in_jump = false;
+                        bar_place::at(bar, lt.translate);
+                        play_once(sc, *player, running ? "LedgeGrabHoriz_M" : "LedgeGrabNoMomentum_M", game_time, bar.yaw, false);
+                        bar.state = bar_ctl::CATCH;
+                        std::printf("bar: %s caught\n", b->name().c_str());
+                        break;
+                    }
+                }
+                if (bar.state != bar_ctl::NONE) {
+                    float at[3];
+                    bar_place::at(bar, at);
+                    const float ps[3] = { std::cos(bar.yaw), 0.0f, -std::sin(bar.yaw) };    // his left
+                    const float lx = in_x * (right[0] * ps[0] + right[2] * ps[2]);
+                    const bool ax = bar_axis::along_x(bar.bar);
+                    const float lo = ax ? bar.bar->box[0] : bar.bar->box[2], hi = ax ? bar.bar->box[3] : bar.bar->box[5];
+                    struct bar_can { static bool step(const bar_ctl& bc, bool along_x, float lo, float hi, int dir, const float* side) {
+                        const float d = float(dir) * bar_tuning::STEP;
+                        const float v = (along_x ? bc.hold[0] + side[0] * d : bc.hold[2] + side[2] * d);
+                        return v > lo + 0.2f && v < hi - 0.2f;     // Prince__CanHangOnBarAt, by the bar's extent
+                    } };
+                    if (bar.state == bar_ctl::SWING && jump_pressed) {
+                        // Prince__CanHorizLaunch (0x4D095D): only in the swing's
+                        // middle (0.43 .. 0.75 of the clip) does he fly.
+                        const double ph = std::fmod(game_time - bar.swing_t0, bar.swing_len) / bar.swing_len;
+                        const float f[3] = { std::sin(bar.yaw), 0.0f, std::cos(bar.yaw) };
+                        player->scripted = 0;
+                        if (ph > bt::LAUNCH_FROM && ph < bt::LAUNCH_TO) {
+                            float pos[3] = { bar.hold[0] + f[0] * bt::LAUNCH_AHEAD, lt.translate[1], bar.hold[2] + f[2] * bt::LAUNCH_AHEAD };
+                            for (int k = 0; k < 3; ++k) lt.translate[k] = pos[k];
+                            const float v[3] = { f[0] * bt::LAUNCH_Z, bt::LAUNCH_Y, f[2] * bt::LAUNCH_Z };
+                            bar_drop::go(bar, jumps, *player, lt.translate, game_time, v, RUN_JUMPING);
+                            std::printf("bar: launch\n");
+                        } else {
+                            bar_drop::go(bar, jumps, *player, lt.translate, game_time, 0, FALL_VERT);
+                        }
+                        regrab_after = game_time + 0.6;
+                    } else if (!player->scripted) {
+                        switch (bar.state) {
+                        case bar_ctl::CATCH: case bar_ctl::SH_END: case bar_ctl::SW_STOP:
+                            bar.state = bar_ctl::HANG;
+                            break;
+                        case bar_ctl::SH_START: case bar_ctl::SH_MOVE:
+                            if (bar.state == bar_ctl::SH_MOVE) {
+                                for (int k = 0; k < 3; k += 2) bar.hold[k] += ps[k] * float(bar.dir) * bt::STEP;
+                                bar_place::at(bar, at);
+                            }
+                            if ((lx > 0.5f ? 1 : lx < -0.5f ? -1 : 0) == bar.dir && bar_can::step(bar, ax, lo, hi, bar.dir, ps)) {
+                                bar.state = bar_ctl::SH_MOVE;
+                                for (int k = 0; k < 3; ++k) lt.translate[k] = at[k];
+                                play_once(sc, *player, bar.dir > 0 ? "HorizMovingLeft_M" : "HorizMovingRight_M", game_time, bar.yaw, false);
+                            } else {
+                                bar.state = bar_ctl::SH_END;
+                                for (int k = 0; k < 3; ++k) lt.translate[k] = at[k];
+                                play_once(sc, *player, bar.dir > 0 ? "HorizEndMovingLeft_M" : "HorizEndMovingRight_M", game_time, bar.yaw, false);
+                            }
+                            break;
+                        case bar_ctl::SW_START: case bar_ctl::SWING:
+                            if (in_y > 0.5f) {
+                                // StIdleHorizSwing: the loop runs while forward is held.
+                                bar.state = bar_ctl::SWING;
+                                for (int k = 0; k < 3; ++k) lt.translate[k] = at[k];
+                                if (play_once(sc, *player, "HorizSwingBase_M", game_time, bar.yaw, false)) {
+                                    bar.swing_t0 = game_time;
+                                    bar.swing_len = std::max(0.1, skill_seconds(sc, *player, "HorizSwingBase_M"));
+                                }
+                            } else {
+                                bar.state = bar_ctl::SW_STOP;
+                                for (int k = 0; k < 3; ++k) lt.translate[k] = at[k];
+                                play_once(sc, *player, "HorizSwingStop_M", game_time, bar.yaw, false);
+                            }
+                            break;
+                        default:
+                            break;
+                        }
+                        if (bar.state == bar_ctl::HANG) {
+                            // StIdleHorizHang.
+                            player->stance = find_actor_skill(sc, *player, "HorizHangBase_M");
+                            player_yaw = bar.yaw;
+                            for (int k = 0; k < 3; ++k) lt.translate[k] = at[k];
+                            if (in_y < -0.5f || jump_pressed) {
+                                bar_drop::go(bar, jumps, *player, lt.translate, game_time, 0, FALL_VERT);
+                                regrab_after = game_time + 0.6;
+                            } else if (in_y > 0.5f) {
+                                bar.state = bar_ctl::SW_START;
+                                player->stance = 0;
+                                play_once(sc, *player, "HorizSwingStart_M", game_time, bar.yaw, false);
+                            } else if (std::fabs(lx) > 0.5f) {
+                                const int d = lx > 0.0f ? 1 : -1;
+                                if (bar_can::step(bar, ax, lo, hi, d, ps)) {
+                                    bar.dir = d;
+                                    bar.state = bar_ctl::SH_START;
+                                    player->stance = 0;
+                                    play_once(sc, *player, d > 0 ? "HorizStartMovingLeft_M" : "HorizStartMovingRight_M", game_time, bar.yaw, false);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             // In the air, the hands catch any ledge in reach.
-            if (in_jump && jumps.state == jump_ctl::AIR && game_time >= regrab_after) {
+            if (in_jump && jumps.state == jump_ctl::AIR && game_time >= regrab_after && bar.state == bar_ctl::NONE) {
                 const float hs = std::sqrt(jumps.vel[0] * jumps.vel[0] + jumps.vel[2] * jumps.vel[2]);
                 if (hang_try_grab(ledges, *player, sc.coll, lt.translate, player_yaw,
                                   jumps.vel[1], hs, game_time)) {
@@ -9004,7 +9182,8 @@ int main(int argc, char** argv) {
                 crouch_update(crouch, sc, *player, sc.coll, lt.translate, player_yaw, crouch_key,
                               mv, ml, classic, in_x, in_y, game_time, dt);
             const bool busy = on_ledge || ledges.state != hang_ctl::NONE || in_swim || crouched ||
-                              working.trap != 0 || bow.ready || pole.state != pole_ctl::NONE;
+                              working.trap != 0 || bow.ready || pole.state != pole_ctl::NONE ||
+                              bar.state != bar_ctl::NONE;
             const bool in_crate = !scripted_now && !in_jump && !busy &&
                                   update_crate(crates, sc, *player, lt.translate, player_yaw,
                                                game_time, act, push, pull);
