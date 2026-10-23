@@ -437,7 +437,7 @@ result frontend::options() {
             m_canvas.text("Scheme", 255, 125, 17, INK);
             m_canvas.text(edit.classic ? "Classic" : "Modern", 470, 125, 17, HOT, 1);
             static const char* lines[6] = {
-                "Move: WASD / arrows / left stick", "Run: Shift    Jump: Space",
+                "Move (runs): WASD / arrows / left stick", "Step: Shift + direction    Jump: Space",
                 "Act, climb, talk: E", "Sword: R draw, F attack, G block",
                 "Camera: mouse drag / right stick", "Tab switches scheme in play" };
             for (int i = 0; i < 6; ++i) m_canvas.text(lines[i], 255, 160 + i * 18.0f, 13, INK);

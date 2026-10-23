@@ -19,8 +19,9 @@
 #              right stick turns the camera. A full stick push runs.
 #     Classic  the original's tank controls: W/S walk forward/back along his
 #              facing, A/D turn him; the camera stays behind him.
-#     Both     Shift / RB / RT run, Space / A jump, E / X act (grab a crate and
-#              hold: then forward pushes, back pulls).
+#     Both     moving runs; Shift / pad LT held steps (careful walk, step
+#              back, sidestep, keeping his facing), Space / A jump, E / X act
+#              (grab a crate and hold: then forward pushes, back pulls).
 #     Crouch   hold C (pad B / Vita Circle with the sword away); move to
 #              crawl through low gaps.
 #     Ledges   E facing a ledge he can reach climbs onto it; jump under a high
