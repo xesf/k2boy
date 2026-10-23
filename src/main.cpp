@@ -830,6 +830,16 @@ struct scene {
     std::vector<assets::k2a_trap> spawn_points;
     std::vector<assets::k2a_trap> fixture_points;   // Fixture traps, spawned as actors
     std::vector<assets::k2a_trap> special_points;   // Specials traps (SPEC_ spikes, blades)
+    std::vector<assets::k2a_trap> rope_points;      // Rope traps: a TRAP_ROPE actor hangs at each
+    // A swinging rope (Rope__ctor 0x487FF3): its actor, the Attach joint the
+    // Prince hangs on, and where the rope's update is (idle, swing, end).
+    struct rope {
+        int actor = -1, attach = -1;
+        float pivot[3] = { 0.0f, 0.0f, 0.0f };
+        bool grabbed = false;
+        enum stage_t { IDLE, SWING, END } stage = IDLE;
+    };
+    std::vector<rope> ropes;
     // A Specials trap: its SPEC_ actor and the actor's own Trigger and Kill
     // volumes (actor space). See specials_update.
     struct special {
@@ -1662,6 +1672,8 @@ void scene_reset(scene& sc) {
     sc.spawn_points.clear();
     sc.fixture_points.clear();
     sc.special_points.clear();
+    sc.rope_points.clear();
+    sc.ropes.clear();
     sc.specials.clear();
     sc.points.clear();
     sc.pickups.clear();
@@ -2815,6 +2827,10 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
             sc.fixture_points.push_back(n.trap);
             sc.fixture_points.back().node = n.name;
         }
+        if (n.trap.name == "Rope" && collide) {
+            sc.rope_points.push_back(n.trap);
+            sc.rope_points.back().node = n.name;
+        }
         if (n.trap.name == "Specials" && collide && n.trap.argv.size() > 1 && !n.trap.argv[1].empty()) {
             sc.special_points.push_back(n.trap);
             sc.special_points.back().node = n.name;
@@ -3446,6 +3462,25 @@ void spawn_fixtures(scene& sc) {
                     placed.item_count, placed.ambient.size(), placed.hidden ? ", hidden" : "");
     }
     sc.coll.build();        // the props' parts joined the collision world
+    // Ropes: TRAP_ROPE hung at the trap's node, which is the rope's bottom
+    // end (argv "Type actor" is the default in every shipped level).
+    for (size_t i = 0; i < sc.rope_points.size(); ++i) {
+        const assets::k2a_trap& t = sc.rope_points[i];
+        const int idx = spawn_prop(sc, t, "TRAP_ROPE", t.node + "_rope");
+        if (idx < 0) continue;
+        actor_inst& a = sc.actors[size_t(idx)];
+        for (int k = 0; k < 3; ++k) a.node->local.translate[k] = t.pivot[k];
+        a.home_yaw = t.pivot_angle;
+        scene::rope r;
+        r.actor = idx;
+        for (int k = 0; k < 3; ++k) r.pivot[k] = t.pivot[k];
+        for (size_t j = 0; j < a.joint_names.size(); ++j)
+            if (a.joint_names[j] == "Attach") r.attach = int(j);
+        play_once(sc, a, "RopeBase", 0.0, a.home_yaw, true);
+        sc.ropes.push_back(r);
+        std::printf("  rope %s at (%.1f, %.1f, %.1f)%s\n", t.node.c_str(), t.pivot[0], t.pivot[1], t.pivot[2],
+                    r.attach < 0 ? ", no Attach joint" : "");
+    }
     // Specials: the SPEC_ actor named by argv1 (Specials ctor, 0x4896B1:
     // "actors\\<name>\\<name>.k2a"), and the volumes in it the binary looks
     // up by name, "trigger" and "kill".
@@ -7275,6 +7310,13 @@ int main(int argc, char** argv) {
                         sk.joints[j].keys[0].xf[0].pos[0], sk.joints[j].keys[0].xf[0].pos[1], sk.joints[j].keys[0].xf[0].pos[2],
                         sk.joints[j].keys.back().xf[0].pos[0], sk.joints[j].keys.back().xf[0].pos[1], sk.joints[j].keys.back().xf[0].pos[2],
                         sk.joints[j].keys[0].xf[0].quat[0], sk.joints[j].keys[0].xf[0].quat[1], sk.joints[j].keys[0].xf[0].quat[2], sk.joints[j].keys[0].xf[0].quat[3]);
+        if (std::getenv("K2_ALLKEYS") && !sk.joints.empty() && sk.joints[0].present)
+            for (int i = 0; i <= 8; ++i) {
+                float p[3], q[4];
+                const uint32_t t = uint32_t(double(sk.duration()) * i / 8.0);
+                assets::skl_sample(sk.joints[0].path, t, sk.interpolate != 0, p, q);
+                std::printf("    root t=%u (%.3f %.3f %.3f)\n", t, p[0], p[1], p[2]);
+            }
         // Sampled (SklS) clips: the first joints' tracks at the start.
         for (size_t j = 0; j < sk.joints.size() && j < 4; ++j) {
             if (!sk.joints[j].present) { std::printf("    joint %zu absent\n", j); continue; }
@@ -7776,6 +7818,16 @@ int main(int argc, char** argv) {
         bool  have_grip = false;
         double swing_t0 = 0.0, swing_len = 1.749;
     } bar;
+    // On a swinging rope (StStartSwingRope .. StStartSwingRopeRelease): he
+    // hangs on the rope actor's Attach joint; letting go throws him with
+    // that joint's velocity.
+    struct rope_ctl {
+        int rope = -1;                  // index into sc.ropes
+        bool looping = false;           // past SwingStart_M, on SwingBase_M
+        float prev[3] = { 0.0f, 0.0f, 0.0f };
+        double prev_t = -1.0;
+        float vel[3] = { 0.0f, 0.0f, 0.0f };
+    } rope;
     struct ride_ctl { int32_t node = -1; float local[3] = { 0.0f, 0.0f, 0.0f }; float at[3] = { 0.0f, 0.0f, 0.0f }; } ride;
     bool      jump_was_down = false;
     bool      act_was_down = false;
@@ -8731,7 +8783,7 @@ int main(int argc, char** argv) {
                 jump_begin(jumps, *player, FALL_VERT, game_time, lt.translate);
                 regrab_after = game_time + 0.6;
             }
-            if (!on_ledge && jump_pressed && !scripted_now && crates.state == crate_ctl::NONE && pole.state == pole_ctl::NONE && bar.state == bar_ctl::NONE &&
+            if (!on_ledge && jump_pressed && !scripted_now && crates.state == crate_ctl::NONE && pole.state == pole_ctl::NONE && bar.state == bar_ctl::NONE && rope.rope < 0 &&
                 crouch.state == crouch_ctl::NONE &&
                 jumps.state == jump_ctl::NONE && player_vy == 0.0f && swim.state == swim_ctl::NONE) {
                 // Jump never climbs (the original climbs from StStartStepBack,
@@ -8986,8 +9038,97 @@ int main(int argc, char** argv) {
                     }
                 }
             }
+            // --- swinging ropes ------------------------------------------------
+            {
+                // The ropes run their own clips: a held rope swings on, a
+                // let-go one ends its swing and rests (Rope__UpdateSwing,
+                // Rope__UpdateEndSwing).
+                for (size_t r = 0; r < sc.ropes.size(); ++r) {
+                    scene::rope& rp = sc.ropes[r];
+                    actor_inst& ra = sc.actors[size_t(rp.actor)];
+                    if (ra.scripted) continue;
+                    if (rp.grabbed) { play_once(sc, ra, "SwingFullRange", game_time, actor_yaw(ra), true); rp.stage = scene::rope::SWING; }
+                    else if (rp.stage == scene::rope::SWING) { play_once(sc, ra, "EndSwing", game_time, actor_yaw(ra), true); rp.stage = scene::rope::END; }
+                    else if (rp.stage == scene::rope::END) rp.stage = scene::rope::IDLE;
+                }
+                struct rope_attach { static bool at(scene& sc, const scene::rope& rp, float* out) {
+                    if (rp.attach < 0) return false;
+                    const actor_inst& ra = sc.actors[size_t(rp.actor)];
+                    k2::engine::transform w;
+                    k2::engine::transform_compose(ra.node->world(), ra.cur[size_t(rp.attach)], w);
+                    for (int k = 0; k < 3; ++k) out[k] = w.translate[k];
+                    return true;
+                } };
+                // Catching one (Prince__CanGrabRope 0x4D1541): only in the air,
+                // his root within 2 below to 0.5 above the rope's resting
+                // bottom and 0.61 of it across, the rope not behind him.
+                if (rope.rope < 0 && in_jump && jumps.state == jump_ctl::AIR && game_time >= regrab_after && !dead &&
+                    bar.state == bar_ctl::NONE && pole.state == pole_ctl::NONE) {
+                    for (size_t r = 0; r < sc.ropes.size(); ++r) {
+                        scene::rope& rp = sc.ropes[r];
+                        const float* q = lt.translate;
+                        if (!(rp.pivot[1] - 2.0f < q[1] && q[1] < rp.pivot[1] + 0.5f)) continue;
+                        const float dx = rp.pivot[0] - q[0], dz = rp.pivot[2] - q[2];
+                        if (dx * dx + dz * dz >= 0.61f * 0.61f) continue;
+                        float at[3];
+                        if (!rope_attach::at(sc, rp, at)) continue;
+                        if (std::sin(player_yaw) * (q[0] - at[0]) + std::cos(player_yaw) * (q[2] - at[2]) > 0.0f) continue;
+                        // The rope swings in the plane he faces.
+                        actor_inst& ra = sc.actors[size_t(rp.actor)];
+                        ra.home_yaw = player_yaw;
+                        ra.node->local.set_yaw(player_yaw);
+                        play_once(sc, ra, "StartSwing", game_time, player_yaw, true);
+                        rp.grabbed = true;
+                        rp.stage = scene::rope::SWING;
+                        rope.rope = int(r);
+                        rope.looping = false;
+                        rope.prev_t = -1.0;
+                        jumps.state = jump_ctl::NONE;
+                        in_jump = false;
+                        sc.root->update_world();
+                        rope_attach::at(sc, rp, at);
+                        for (int k = 0; k < 3; ++k) lt.translate[k] = at[k];
+                        play_once(sc, *player, "SwingStart_M", game_time, player_yaw, false);
+                        std::printf("rope: caught\n");
+                        break;
+                    }
+                }
+                if (rope.rope >= 0) {
+                    scene::rope& rp = sc.ropes[size_t(rope.rope)];
+                    float at[3];
+                    if (rope_attach::at(sc, rp, at)) {
+                        // The Attach joint's velocity, sampled when it moves.
+                        if (rope.prev_t >= 0.0 && game_time > rope.prev_t &&
+                            (at[0] != rope.prev[0] || at[1] != rope.prev[1] || at[2] != rope.prev[2]))
+                            for (int k = 0; k < 3; ++k) rope.vel[k] = (at[k] - rope.prev[k]) / float(game_time - rope.prev_t);
+                        for (int k = 0; k < 3; ++k) rope.prev[k] = at[k];
+                        rope.prev_t = game_time;
+                        // The clip plays about the joint: keep his origin on it.
+                        if (player->scripted) for (int k = 0; k < 3; ++k) player->scripted_origin[k] = at[k];
+                        for (int k = 0; k < 3; ++k) lt.translate[k] = at[k];
+                    }
+                    if (jump_pressed || act_pressed) {
+                        // StStartSwingRopeRelease: thrown with the joint's velocity.
+                        rp.grabbed = false;
+                        rope.rope = -1;
+                        player->scripted = 0;
+                        player->stance = 0;
+                        jumps.state = jump_ctl::AIR;
+                        jumps.dir = 5;
+                        for (int k = 0; k < 3; ++k) jumps.vel[k] = rope.vel[k];
+                        jumps.peak_y = lt.translate[1];
+                        jump_begin(jumps, *player, RUN_JUMPING, game_time, lt.translate);
+                        regrab_after = game_time + 0.6;
+                        std::printf("rope: let go at (%.1f %.1f %.1f)\n", rope.vel[0], rope.vel[1], rope.vel[2]);
+                    } else if (!player->scripted) {
+                        rope.looping = true;            // "Done with start anim, now do looping!"
+                        play_once(sc, *player, "SwingBase_M", game_time, player_yaw, false);
+                    }
+                }
+            }
             // In the air, the hands catch any ledge in reach.
-            if (in_jump && jumps.state == jump_ctl::AIR && game_time >= regrab_after && bar.state == bar_ctl::NONE) {
+            if (in_jump && jumps.state == jump_ctl::AIR && game_time >= regrab_after && bar.state == bar_ctl::NONE &&
+                rope.rope < 0) {
                 const float hs = std::sqrt(jumps.vel[0] * jumps.vel[0] + jumps.vel[2] * jumps.vel[2]);
                 if (hang_try_grab(ledges, *player, sc.coll, lt.translate, player_yaw,
                                   jumps.vel[1], hs, game_time)) {
@@ -9183,7 +9324,7 @@ int main(int argc, char** argv) {
                               mv, ml, classic, in_x, in_y, game_time, dt);
             const bool busy = on_ledge || ledges.state != hang_ctl::NONE || in_swim || crouched ||
                               working.trap != 0 || bow.ready || pole.state != pole_ctl::NONE ||
-                              bar.state != bar_ctl::NONE;
+                              bar.state != bar_ctl::NONE || rope.rope >= 0;
             const bool in_crate = !scripted_now && !in_jump && !busy &&
                                   update_crate(crates, sc, *player, lt.translate, player_yaw,
                                                game_time, act, push, pull);
