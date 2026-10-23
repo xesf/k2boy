@@ -46,6 +46,22 @@ void collision_world::set_node_transform(int32_t node, const float rot[9], const
     n.rotated = !(rot[0] == 1.0f && rot[4] == 1.0f && rot[8] == 1.0f);
 }
 
+void collision_world::node_to_local(int32_t node, const float w[3], float l[3]) const {
+    if (node < 0 || size_t(node) >= m_nodes.size()) { for (int k = 0; k < 3; ++k) l[k] = w[k]; return; }
+    const node_state& n = m_nodes[size_t(node)];
+    const float q[3] = { w[0] - n.pivot[0] - n.offset[0], w[1] - n.pivot[1] - n.offset[1], w[2] - n.pivot[2] - n.offset[2] };
+    for (int r = 0; r < 3; ++r)
+        l[r] = n.rot[0 + r] * q[0] + n.rot[3 + r] * q[1] + n.rot[6 + r] * q[2] + n.pivot[r];
+}
+
+void collision_world::node_to_world(int32_t node, const float l[3], float w[3]) const {
+    if (node < 0 || size_t(node) >= m_nodes.size()) { for (int k = 0; k < 3; ++k) w[k] = l[k]; return; }
+    const node_state& n = m_nodes[size_t(node)];
+    const float q[3] = { l[0] - n.pivot[0], l[1] - n.pivot[1], l[2] - n.pivot[2] };
+    for (int r = 0; r < 3; ++r)
+        w[r] = n.rot[r * 3] * q[0] + n.rot[r * 3 + 1] * q[1] + n.rot[r * 3 + 2] * q[2] + n.pivot[r] + n.offset[r];
+}
+
 void collision_world::add_mesh(const float* xyz, size_t stride, size_t vcount,
                                const uint16_t* idx, size_t icount, int32_t node) {
     for (size_t i = 0; i + 2 < icount; i += 3) {

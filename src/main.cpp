@@ -1298,7 +1298,9 @@ bool skill_joint(const assets::skl_file& s, size_t j, uint32_t t, float* pos, fl
     if (j >= s.joints.size()) return false;
     const assets::skl_joint& jt = s.joints[j];
     if (!jt.keys.empty()) return assets::skl_sample_keys(jt.keys, t, pos, q);
-    if (!jt.present) return false;
+    // A keyframed clip lists joints it has no keys for: those keep their
+    // pose, as an absent joint does.
+    if (!jt.present || (jt.path.pos.empty() && jt.path.rot.empty())) return false;
     assets::skl_sample(jt.path, t, s.interpolate != 0, pos, q);
     return true;
 }
@@ -7073,6 +7075,13 @@ int main(int argc, char** argv) {
                             t, j.xf[t].pos[0], j.xf[t].pos[1], j.xf[t].pos[2],
                             j.xf[t].quat[0], j.xf[t].quat[1], j.xf[t].quat[2], j.xf[t].quat[3]);
         }
+        if (std::getenv("K2_ALLKEYS"))
+            for (size_t j = 0; j < sk.joints.size(); ++j)
+                if (!sk.joints[j].keys.empty())
+                    std::printf("    joint %zu: %zu keys, first (%.3f %.3f %.3f) last (%.3f %.3f %.3f) q0 (%.3f %.3f %.3f %.3f)\n", j, sk.joints[j].keys.size(),
+                        sk.joints[j].keys[0].xf[0].pos[0], sk.joints[j].keys[0].xf[0].pos[1], sk.joints[j].keys[0].xf[0].pos[2],
+                        sk.joints[j].keys.back().xf[0].pos[0], sk.joints[j].keys.back().xf[0].pos[1], sk.joints[j].keys.back().xf[0].pos[2],
+                        sk.joints[j].keys[0].xf[0].quat[0], sk.joints[j].keys[0].xf[0].quat[1], sk.joints[j].keys[0].xf[0].quat[2], sk.joints[j].keys[0].xf[0].quat[3]);
         // Sampled (SklS) clips: the first joints' tracks at the start.
         for (size_t j = 0; j < sk.joints.size() && j < 4; ++j) {
             if (!sk.joints[j].present) { std::printf("    joint %zu absent\n", j); continue; }
@@ -7543,6 +7552,10 @@ int main(int argc, char** argv) {
     // middle and only these ends are its clips. A turn clip ends facing
     // back, so his facing flips when it is done.
     struct loco_ctl { double run_since = -1.0; bool flip = false; } loco;
+    // Riding a Mover (lifts, swinging platforms, the gears' teeth): where he
+    // stands, held in the platform's own frame, so its motion carries him.
+    // Ours; the original's rider handling is not traced.
+    struct ride_ctl { int32_t node = -1; float local[3] = { 0.0f, 0.0f, 0.0f }; float at[3] = { 0.0f, 0.0f, 0.0f }; } ride;
     bool      jump_was_down = false;
     bool      act_was_down = false;
     double    regrab_after = 0.0;      // let go: no catching the same ledge at once
@@ -8150,6 +8163,12 @@ int main(int argc, char** argv) {
             mv[1] = 0.0f;
             const float ml = std::sqrt(mv[0]*mv[0] + mv[2]*mv[2]);
             k2::engine::transform& lt = player->node->local;
+            // The platform under him moved since last frame: so does he.
+            if (ride.node >= 0 && !noclip) {
+                float w[3];
+                sc.coll.node_to_world(ride.node, ride.local, w);
+                for (int k = 0; k < 3; ++k) lt.translate[k] += w[k] - ride.at[k];
+            }
             const bool run = autorun || down[plat::KEY_LSHIFT] || down[plat::KEY_RSHIFT] || pad_run ||
                              (pad.connected && (pad.button[plat::PAD_RSHOULDER] ||
                                                 pad.axis[plat::PAD_AXIS_RTRIGGER] > 0.5f));
@@ -8790,6 +8809,20 @@ int main(int argc, char** argv) {
             }
             lt.set_yaw(player_yaw);
             sc.root->update_world();
+            {   // What he stands on now, for next frame's ride.
+                ride.node = -1;
+                const float o[3] = { lt.translate[0], lt.translate[1] + 0.5f, lt.translate[2] };
+                const float dn[3] = { 0.0f, -1.0f, 0.0f };
+                k2::engine::pick_hit h;
+                if (jumps.state != jump_ctl::AIR && ledges.state == hang_ctl::NONE &&
+                    sc.coll.pick(o, dn, 0.7f, true, h)) {
+                    ride.node = sc.coll.triangle_node(h.triangle);
+                    if (ride.node >= 0) {
+                        for (int k = 0; k < 3; ++k) ride.at[k] = lt.translate[k];
+                        sc.coll.node_to_local(ride.node, lt.translate, ride.local);
+                    }
+                }
+            }
 
             // Holding a crate, the camera swings round behind the Prince so
             // the crate is in view ahead of him, not between him and the lens.

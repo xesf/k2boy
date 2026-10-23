@@ -69,6 +69,14 @@ public:
               bool front_only, pick_hit& out) const;
 
     size_t triangle_count() const { return m_tris.size() / 9; }
+    // The node a picked triangle belongs to (-1: static), and a point
+    // carried between world space and that node's rest frame - what a
+    // platform's rider holds onto while it moves.
+    int32_t triangle_node(int32_t tri) const {
+        return tri >= 0 && size_t(tri) < m_tri_node.size() ? m_tri_node[size_t(tri)] : -1;
+    }
+    void node_to_local(int32_t node, const float world[3], float local[3]) const;
+    void node_to_world(int32_t node, const float local[3], float world[3]) const;
 
 private:
     bool ray_triangle(size_t tri, const float o[3], const float d[3], float max_t,
