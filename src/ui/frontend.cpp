@@ -72,13 +72,14 @@ void settings::save() const {
 
 bool save_game::read(int slot) {
     valid = false;
+    world.clear();
     FILE* f = std::fopen(slot_path(slot).c_str(), "r");
     if (!f) return false;
-    char line[256];
+    char line[1024];
     while (std::fgets(line, sizeof(line), f)) {
-        char key[32], rest[200];
+        char key[32], rest[1000];
         rest[0] = 0;
-        if (std::sscanf(line, "%31s %199[^\n]", key, rest) < 1) continue;
+        if (std::sscanf(line, "%31s %999[^\n]", key, rest) < 1) continue;
         const std::string k = key;
         if (k == "name") name = rest;
         else if (k == "level") level = rest;
@@ -87,6 +88,7 @@ bool save_game::read(int slot) {
         else if (k == "pos") std::sscanf(rest, "%f %f %f %f", &pos[0], &pos[1], &pos[2], &yaw);
         else if (k == "health") std::sscanf(rest, "%d %d", &health, &max_health);
         else if (k == "armed") armed = std::atoi(rest) != 0;
+        else if (k == "w") world.push_back(rest);
     }
     std::fclose(f);
     valid = !level.empty();
@@ -103,6 +105,7 @@ bool save_game::write(int slot) const {
                     "health %d %d\narmed %d\n",
                  name.c_str(), level.c_str(), when_s, region, pos[0], pos[1], pos[2], yaw,
                  health, max_health, int(armed));
+    for (size_t i = 0; i < world.size(); ++i) std::fprintf(f, "w %s\n", world[i].c_str());
     std::fclose(f);
     return true;
 }

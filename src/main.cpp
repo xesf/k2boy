@@ -713,6 +713,7 @@ struct actor_inst {
     int                               arrows;         // "weapon:+arrow,type,count"
     int                               pending_hurt;   // "hurt:N", applied by combat
     std::string                       pending_kill;   // "kill:<clip>": dies playing it
+    std::string                       held_clip;      // a prop's last scripted clip, for saves
     bool                              archer;         // a bowman: shoots, never closes in
     // The other hand (master.dat's second grip), where the Prince's bow is
     // held while `bow_shown`.
@@ -1796,7 +1797,7 @@ public:
         // the original reports "Doors can't handle message %s" otherwise.
         if (!actor.empty()) {
             const assets::skl_file* sk = find_skill(msg);
-            if (sk) { m_skill = sk; m_skill_start = m_world.now(); return true; }
+            if (sk) { m_skill = sk; m_skill_start = m_world.now(); m_skill_name = msg; return true; }
         }
         return trap_object::handle(msg, sender);
     }
@@ -1928,6 +1929,52 @@ private:
         start_step(0, m_world.now());
         return true;
     }
+public:
+    // Saves: where it has got to - offset, turn, the skill it last played
+    // (a door's "openslow"), a collapse that has happened.
+    void save_line(std::string& out) {
+        if (m_moving && m_loop) return;                 // a looping Mover restarts by itself
+        // Where a motion under way has got to, without stopping it.
+        float base[3] = { m_base[0], m_base[1], m_base[2] }, rot[9];
+        for (int k = 0; k < 9; ++k) rot[k] = m_rot[k];
+        if (m_moving) {
+            const double f = m_motion.fraction(m_world.now());
+            if (m_rotating) rotation_now(float(m_motion.distance * f), rot);
+            else for (int k = 0; k < 3; ++k) base[k] += float(m_motion.dir[k] * f);
+        }
+        if (base[0] == 0.0f && base[1] == 0.0f && base[2] == 0.0f && !m_turned && !m_moving &&
+            m_collapse == COLLAPSE_NONE && m_skill_name.empty()) return;     // as it started
+        char b[512];
+        std::snprintf(b, sizeof(b), "%.4f %.4f %.4f %d %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f %d %s",
+                      base[0], base[1], base[2], int(m_turned), rot[0], rot[1], rot[2], rot[3],
+                      rot[4], rot[5], rot[6], rot[7], rot[8], int(m_collapse),
+                      m_skill_name.empty() ? "-" : m_skill_name.c_str());
+        out = b;
+    }
+    void restore_line(const std::string& in) {
+        float b[3], r[9];
+        int turned = 0, collapse = 0;
+        char skill[200] = "-";
+        if (std::sscanf(in.c_str(), "%f %f %f %d %f %f %f %f %f %f %f %f %f %d %199s", &b[0], &b[1], &b[2], &turned,
+                        &r[0], &r[1], &r[2], &r[3], &r[4], &r[5], &r[6], &r[7], &r[8], &collapse, skill) < 14) return;
+        m_moving = false;
+        m_chain.clear();
+        for (int k = 0; k < 3; ++k) m_base[k] = b[k];
+        for (int k = 0; k < 9; ++k) m_rot[k] = r[k];
+        m_turned = turned != 0;
+        if (m_turned) pose(m_rot, m_base); else apply(m_base);
+        if (collapse == int(COLLAPSE_DOWN)) m_collapse = COLLAPSE_DOWN;
+        if (std::strcmp(skill, "-") != 0) {
+            if (const assets::skl_file* sk = find_skill(skill)) {
+                m_skill = sk;
+                m_skill_name = skill;
+                m_skill_start = m_world.now() - clip_length_ms(*sk) / 1000.0 - 1.0;   // at its end
+            }
+        }
+    }
+private:
+    std::string              m_skill_name;
+
     // Whatever motion is under way stops at its current point.
     void settle() {
         if (!m_moving) return;
@@ -2097,7 +2144,10 @@ public:
         if (l.compare(0, 7, "enable:") == 0 || l.compare(0, 6, "state:") == 0) return true;
         // Anything else names one of its skills. One that interrupts the
         // idles goes back to them; a prop (no idles) keeps its last frame.
-        if (play_once(m_sc, a, msg, m_world.now(), a.home_yaw, a.ambient.empty())) return true;
+        if (play_once(m_sc, a, msg, m_world.now(), a.home_yaw, a.ambient.empty())) {
+            if (a.ambient.empty()) a.held_clip = msg;
+            return true;
+        }
         std::printf("fixture %s: no skill %s\n", name().c_str(), msg.c_str());
         return false;
     }
@@ -5903,7 +5953,7 @@ int nearest_enemy(const combat_state& cs, const scene& sc, const float* pp, floa
 // run, then `extra`. The data root (the last argument) is kept.
 void relaunch(int argc, char** argv, const std::vector<std::string>& extra) {
     static const char* drop1[] = { "--menu", "--menu-game", "--armed", "--boot", 0 };
-    static const char* drop2[] = { "--place", "--region", "--health", "--send", "--movie", "--level", 0 };
+    static const char* drop2[] = { "--place", "--region", "--health", "--send", "--movie", "--level", "--world", 0 };
     std::vector<std::string> args;
     std::string root;
     for (int i = 1; i < argc; ++i) {
@@ -6736,6 +6786,108 @@ void actor_part_matrices(const scene& sc, actor_inst& a, bool skin) {
     }
 }
 
+// --- saves: the level's state ------------------------------------------------------
+//
+// Ours: the original's .pop is not read or written. Each line is one thing:
+//   t <trap> <state> <enabled> <visible> <collideable>
+//   m <trap> <where a moved trap, door or collapse has got to>
+//   p <pickup index taken>
+//   a <actor> <hidden> <health> <dead> <a prop's held clip>
+//   b <has bow> <arrows>
+std::vector<std::string> world_capture(scene& sc, const combat_state& cs, const std::vector<bool>& taken) {
+    std::vector<std::string> out;
+    char b[1024];
+    for (size_t i = 0; i < sc.traps.size(); ++i) {
+        k2::engine::trap_object* t = sc.traps[i];
+        if (!t || t->name().empty() || t->name().find(' ') != std::string::npos) continue;
+        std::snprintf(b, sizeof(b), "t %s %s %d %d %d", t->name().c_str(), t->state().empty() ? "-" : t->state().c_str(),
+                      int(t->enabled()), int(t->visible()), int(t->collideable()));
+        out.push_back(b);
+        if (scene_trap* st = dynamic_cast<scene_trap*>(t)) {
+            std::string m;
+            st->save_line(m);
+            if (!m.empty()) out.push_back("m " + t->name() + " " + m);
+        }
+    }
+    for (size_t i = 0; i < taken.size(); ++i)
+        if (taken[i]) { std::snprintf(b, sizeof(b), "p %zu", i); out.push_back(b); }
+    for (size_t i = 0; i < sc.actors.size(); ++i) {
+        const actor_inst& a = sc.actors[i];
+        if (is_prince(a)) {
+            std::snprintf(b, sizeof(b), "b %d %d", int(a.has_bow), a.arrows);
+            out.push_back(b);
+            continue;
+        }
+        if (a.script_name.empty() || a.script_name.find(' ') != std::string::npos) continue;
+        bool dead = false;
+        for (size_t e = 0; e < cs.enemies.size(); ++e)
+            if (cs.enemies[e].actor == int(i)) dead = cs.enemies[e].state == enemy_ai::DEAD;
+        std::snprintf(b, sizeof(b), "a %s %d %d %d %s", a.script_name.c_str(), int(a.hidden), a.health, int(dead),
+                      a.held_clip.empty() ? "-" : a.held_clip.c_str());
+        out.push_back(b);
+    }
+    return out;
+}
+
+void world_apply(scene& sc, combat_state& cs, std::vector<bool>& taken, const std::vector<std::string>& lines) {
+    for (size_t l = 0; l < lines.size(); ++l) {
+        const std::string& ln = lines[l];
+        char kind = ln.empty() ? 0 : ln[0];
+        char name[256], st[256];
+        if (kind == 't') {
+            int en = 1, vis = 1, col = 1;
+            if (std::sscanf(ln.c_str() + 2, "%255s %255s %d %d %d", name, st, &en, &vis, &col) < 5) continue;
+            for (size_t i = 0; i < sc.traps.size(); ++i) {
+                k2::engine::trap_object* t = sc.traps[i];
+                if (!t || t->name() != name) continue;
+                t->set_state(std::strcmp(st, "-") == 0 ? std::string() : std::string(st));
+                if (t->enabled() != (en != 0)) t->set_enabled(en != 0);
+                if (t->visible() != (vis != 0)) t->set_visible(vis != 0);
+                if (t->collideable() != (col != 0)) t->set_collideable(col != 0);
+            }
+        } else if (kind == 'm') {
+            const size_t sp = ln.find(' ', 2);
+            if (sp == std::string::npos) continue;
+            const std::string nm = ln.substr(2, sp - 2);
+            for (size_t i = 0; i < sc.traps.size(); ++i)
+                if (scene_trap* t = dynamic_cast<scene_trap*>(sc.traps[i]))
+                    if (t->name() == nm) t->restore_line(ln.substr(sp + 1));
+        } else if (kind == 'p') {
+            const size_t i = size_t(std::atoi(ln.c_str() + 2));
+            if (i < taken.size()) {
+                taken[i] = true;
+                if (sc.pickups[i].actor >= 0) sc.actors[size_t(sc.pickups[i].actor)].hidden = true;
+            }
+        } else if (kind == 'b') {
+            int bow = 0, arrows = 0;
+            std::sscanf(ln.c_str() + 2, "%d %d", &bow, &arrows);
+            for (size_t i = 0; i < sc.actors.size(); ++i)
+                if (is_prince(sc.actors[i])) { sc.actors[i].has_bow = bow != 0; sc.actors[i].arrows = arrows; }
+        } else if (kind == 'a') {
+            int hidden = 0, health = 0, dead = 0;
+            if (std::sscanf(ln.c_str() + 2, "%255s %d %d %d %255s", name, &hidden, &health, &dead, st) < 5) continue;
+            for (size_t i = 0; i < sc.actors.size(); ++i) {
+                actor_inst& a = sc.actors[i];
+                if (a.script_name != name || is_prince(a)) continue;
+                a.hidden = hidden != 0;
+                if (health > 0) a.health = health;
+                if (std::strcmp(st, "-") != 0 && play_once(sc, a, st, -1.0e6, a.home_yaw, true))
+                    a.held_clip = st;                   // played out long ago: at its end now
+                for (size_t e = 0; e < cs.enemies.size(); ++e) {
+                    enemy_ai& en = cs.enemies[e];
+                    if (en.actor != int(i) || !dead) continue;
+                    en.state = enemy_ai::DEAD;
+                    a.health = 0;
+                    a.stance = 0;
+                    if (!play_once(sc, a, "CombatDeathGeneric" + en.set, -1.0e6, actor_yaw(a), true))
+                        play_once(sc, a, "CombatDying" + en.set, -1.0e6, actor_yaw(a), true);
+                }
+            }
+        }
+    }
+    std::printf("save: %zu world lines applied\n", lines.size());
+}
+
 int main(int argc, char** argv) {
     if (std::getenv("K2_LINEBUF")) std::setvbuf(stdout, 0, _IOLBF, 0);     // for timing the log
     // Started without arguments on a console: the platform's defaults.
@@ -6795,6 +6947,7 @@ int main(int argc, char** argv) {
     struct key_hold { std::string keys; double from, to; };
     std::vector<key_hold> holds;                           // --hold KEYS@T0[-T1]
     std::vector<std::string> send_args;
+    std::vector<std::string> world_lines;   // a save's level state, applied once the level is up
     const char* place_arg = 0;
     bool trapmsg  = false;
     float fixed_dt = 0.0f;
@@ -6850,6 +7003,18 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--findledges") == 0) find_ledges = true;
         else if (std::strcmp(argv[i], "--mute") == 0) mute = true;
         else if (std::strcmp(argv[i], "--armed") == 0) start_armed = true;
+        else if (std::strcmp(argv[i], "--world") == 0 && i + 1 < argc) {
+            // The level state of a save being loaded (written by the game menu).
+            if (FILE* wf = std::fopen(argv[++i], "r")) {
+                char line[1024];
+                while (std::fgets(line, sizeof(line), wf)) {
+                    std::string l = line;
+                    while (!l.empty() && (l[l.size() - 1] == '\n' || l[l.size() - 1] == '\r')) l.erase(l.size() - 1);
+                    if (!l.empty()) world_lines.push_back(l);
+                }
+                std::fclose(wf);
+            }
+        }
         else if (std::strcmp(argv[i], "--menu") == 0) use_menu = true;
         else if (std::strcmp(argv[i], "--menu-game") == 0) { use_menu = true; menu_in_game_only = true; }
         else if (std::strcmp(argv[i], "--health") == 0 && i + 1 < argc)
@@ -7177,6 +7342,7 @@ int main(int argc, char** argv) {
             start_health = sv.health;
             start_max_health = sv.max_health;
             start_armed = sv.armed;
+            world_lines = sv.world;
             send_args.push_back("IntroAnim,enable:F");   // the opening scene has been seen
         }
         if (fe_audio) plat::audio_close();
@@ -7519,6 +7685,7 @@ int main(int argc, char** argv) {
     sc.script.trace = trapmsg;
     // --send "target,msg" delivers a message at start, as if a trap sent it.
     for (size_t i = 0; i < send_args.size(); ++i) sc.script.send_item(send_args[i], 0);
+    if (!world_lines.empty()) world_apply(sc, combat, pickup_taken, world_lines);
     for (size_t i = 0; i < g_audit_scripts.size(); ++i) {
         // "{state:items}" blocks run regardless of state here.
         std::string sct = g_audit_scripts[i];
@@ -7754,6 +7921,7 @@ int main(int argc, char** argv) {
                             cur.max_health = sc.actors[i].max_health;
                             cur.armed = sc.actors[i].armed;
                         }
+                    cur.world = world_capture(sc, combat, pickup_taken);
                     cur.yaw = player_yaw;
                     {
                         // The level's name in GameText, for the save list.
@@ -7795,6 +7963,14 @@ int main(int argc, char** argv) {
                         extra.push_back("--health"); extra.push_back(b);
                         if (ld.armed) extra.push_back("--armed");
                         extra.push_back("--send"); extra.push_back("IntroAnim,enable:F");
+                        if (!ld.world.empty()) {
+                            const std::string wp = plat::user_dir() + "/world-load.txt";
+                            if (FILE* wf = std::fopen(wp.c_str(), "w")) {
+                                for (size_t k = 0; k < ld.world.size(); ++k) std::fprintf(wf, "%s\n", ld.world[k].c_str());
+                                std::fclose(wf);
+                                extra.push_back("--world"); extra.push_back(wp);
+                            }
+                        }
                     }
                     if (r == ui::R_RESTART) {
                         if (level_path && boot_level.empty()) { extra.push_back("--level"); extra.push_back(level_path); }
@@ -9412,6 +9588,13 @@ int main(int argc, char** argv) {
         }
     }
 
+    // K2_WORLDDUMP=file: the level state a save would hold, for testing --world.
+    if (const char* wd = std::getenv("K2_WORLDDUMP"))
+        if (FILE* wf = std::fopen(wd, "w")) {
+            const std::vector<std::string> w = world_capture(sc, combat, pickup_taken);
+            for (size_t i = 0; i < w.size(); ++i) std::fprintf(wf, "%s\n", w[i].c_str());
+            std::fclose(wf);
+        }
     if (!sc.script.unhandled().empty()) {
         std::printf("scripts: messages not acted on (target,verb -> count)\n");
         for (std::map<std::string, int>::const_iterator it = sc.script.unhandled().begin();

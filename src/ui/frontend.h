@@ -15,6 +15,7 @@
 
 #include <functional>
 #include <string>
+#include <vector>
 
 #include "ui/ui.h"
 
@@ -40,6 +41,9 @@ struct save_game {
     int         health, max_health;
     bool        armed;
     std::string when;                   // date and time, for the list
+    // The level's state, as main writes it: one line each for traps,
+    // pickups taken, guards and props. Opaque here.
+    std::vector<std::string> world;
     save_game() : valid(false), region(0), yaw(0), health(36), max_health(36), armed(false) {
         pos[0] = pos[1] = pos[2] = 0.0f;
     }
