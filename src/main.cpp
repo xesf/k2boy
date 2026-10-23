@@ -840,6 +840,10 @@ struct scene {
         enum stage_t { IDLE, SWING, END } stage = IDLE;
     };
     std::vector<rope> ropes;
+    // Spikes traps (0x48A65B): the TRAP_Spikes actor (or argv1's) at the node.
+    std::vector<assets::k2a_trap> spike_points;
+    struct spike { int actor = -1; float at[3] = { 0.0f, 0.0f, 0.0f }; bool struck = false; };
+    std::vector<spike> spikes;
     // A Specials trap: its SPEC_ actor and the actor's own Trigger and Kill
     // volumes (actor space). See specials_update.
     struct special {
@@ -1674,6 +1678,8 @@ void scene_reset(scene& sc) {
     sc.special_points.clear();
     sc.rope_points.clear();
     sc.ropes.clear();
+    sc.spike_points.clear();
+    sc.spikes.clear();
     sc.specials.clear();
     sc.points.clear();
     sc.pickups.clear();
@@ -1701,7 +1707,7 @@ void scene_reset(scene& sc) {
 // until it hits the Prince (a bottle, Arrow::kArrowNormalDamage 12) or a
 // wall; its speed and the facing convention (-Z turned by the trap's pivot)
 // are ours - the Launcher class is not traced.
-struct dart { float p[3], d[3]; double born; };
+struct dart { float p[3], d[3]; double born; bool fireball = false; };
 std::vector<dart> g_darts;
 
 // Arrows in flight (enemy.dat [Archery]: kArrowSpeed 60, kArrowNormalDamage
@@ -1796,14 +1802,23 @@ public:
         }
         if (type == "Launcher" && msg.size() >= 4 && (msg.compare(0, 4, "fire") == 0 || msg.compare(0, 4, "Fire") == 0)) {
             dart dt;
+            dt.fireball = fireball;
             for (int k = 0; k < 3; ++k) dt.p[k] = (box[k] + box[k + 3]) * 0.5f + m_base[k];
             // -Z turned about +y by the pivot (signed by its axis).
             const float a = pivot_angle;
             dt.d[0] = -std::sin(a); dt.d[1] = 0.0f; dt.d[2] = -std::cos(a);
             dt.born = m_world.now();
             g_darts.push_back(dt);
-            play_sound("MULdartshoot", dt.p, 14.0f, false);
+            if (!fireball) play_sound("MULdartshoot", dt.p, 14.0f, false);   // fireballs fly silent (0x475D97)
             return true;
+        }
+        // FlameThrower (0x471206): "on", "off" (back to the pattern's
+        // start), "reset" (argv again); anything else is a new pattern.
+        if (type == "FlameThrower") {
+            if (equals_nocase(msg, "on")) { flame_on = true; return true; }
+            if (equals_nocase(msg, "off")) { flame_on = false; flame_step = 0; flame_until = -1.0; return true; }
+            if (equals_nocase(msg, "reset")) { flame_on = flame_on0; set_flame_pattern(flame_pattern0); return true; }
+            if (msg.find_first_not_of("0123456789., ") == std::string::npos) { set_flame_pattern(msg); return true; }
         }
         // A Door plays the skill its message names ("openslow", "pivot90");
         // the original reports "Doors can't handle message %s" otherwise.
@@ -1821,6 +1836,38 @@ public:
     // (or 30 units on), where the crash skill sounds. The trigger and the
     // drop are ours; the class is not traced.
     std::string wobble_skill, fall_skill, crash_skill;
+    bool fireball = false;              // a Launcher of type 2
+    // A FlameThrower (FlameThrower__Update 0x4710EA): argv1 starts it on;
+    // argv2's seconds alternate burn, pause, burn ..., from a burn, and wrap.
+    // No list burns for good.
+    bool flame_on = false, flame_on0 = false;
+    std::string flame_pattern0;
+    std::vector<double> flame_times;
+    size_t flame_step = 0;
+    double flame_until = -1.0, flame_fx_at = -1.0;
+    void set_flame_pattern(const std::string& p) {
+        flame_times.clear();
+        size_t st = 0;
+        while (st <= p.size()) {
+            const size_t c = p.find(',', st);
+            const std::string w = p.substr(st, c == std::string::npos ? std::string::npos : c - st);
+            if (!w.empty()) flame_times.push_back(std::atof(w.c_str()));
+            if (c == std::string::npos) break;
+            st = c + 1;
+        }
+        flame_step = 0;
+        flame_until = -1.0;
+    }
+    bool flame_burning(double now) {
+        if (!flame_on || !m_enabled) return false;
+        if (flame_times.empty()) return true;
+        if (flame_until < 0.0) flame_until = now + flame_times[0];
+        while (now >= flame_until) {
+            flame_step = (flame_step + 1) % flame_times.size();
+            flame_until += std::max(0.05, flame_times[flame_step]);
+        }
+        return flame_step % 2 == 0;
+    }
     void collapse_update(double now, float dt, const float* prince) {
         if (type != "CollapsingFloor" || m_collapse == COLLAPSE_DOWN || !m_enabled) return;
         if (m_collapse == COLLAPSE_NONE) {
@@ -2827,6 +2874,10 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
             sc.fixture_points.push_back(n.trap);
             sc.fixture_points.back().node = n.name;
         }
+        if (n.trap.name == "Spikes" && collide) {
+            sc.spike_points.push_back(n.trap);
+            sc.spike_points.back().node = n.name;
+        }
         if (n.trap.name == "Rope" && collide) {
             sc.rope_points.push_back(n.trap);
             sc.rope_points.back().node = n.name;
@@ -2996,6 +3047,7 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
         else if (n.trap.name == "Generic") solid = hdr.collideable;
         else if (n.trap.name == "Water")   solid = false;   // swum in, not stood on
         else if (n.trap.name == "Abyss")   solid = false;   // fallen through
+        else if (n.trap.name == "Spikes")  solid = false;   // never solid (Spikes__Update)
         else                             solid = hdr.collideable && !is_volume;
         // Trap geometry gets its own collision node, so scripts can switch it
         // on and off and move it; it is added even when it starts non-solid.
@@ -3052,6 +3104,12 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
                 st->pivot_angle = n.trap.pivot_angle * (n.trap.pivot_axis[1] < 0.0f ? -1.0f : 1.0f);
                 if (n.trap.name == "CrateTarget" && n.trap.argv.size() > 1) st->message = n.trap.argv[1];
                 if (n.trap.name == "ArrowTarget" && n.trap.argv.size() > 2) st->message = n.trap.argv[2];
+                if (n.trap.name == "Launcher" && n.trap.argv.size() > 1) st->fireball = std::atoi(n.trap.argv[1].c_str()) == 2;
+                if (n.trap.name == "FlameThrower") {
+                    st->flame_on = st->flame_on0 = n.trap.argv.size() > 1 && (n.trap.argv[1] == "true" || n.trap.argv[1] == "T" || n.trap.argv[1] == "1");
+                    st->flame_pattern0 = n.trap.argv.size() > 2 ? n.trap.argv[2] : std::string();
+                    st->set_flame_pattern(st->flame_pattern0);
+                }
                 // Movers (Traps.txt: argv2 "Starting Motions"): lifts and
                 // turning platforms already under way when the level opens.
                 if (n.trap.name == "Mover" && n.trap.argv.size() > 2 && !n.trap.argv[2].empty())
@@ -3462,6 +3520,19 @@ void spawn_fixtures(scene& sc) {
                     placed.item_count, placed.ambient.size(), placed.hidden ? ", hidden" : "");
     }
     sc.coll.build();        // the props' parts joined the collision world
+    for (size_t i = 0; i < sc.spike_points.size(); ++i) {
+        const assets::k2a_trap& t = sc.spike_points[i];
+        const std::string who = t.argv.size() > 1 && !t.argv[1].empty() ? t.argv[1] : std::string("TRAP_Spikes");
+        const int idx = spawn_prop(sc, t, who, t.node + "_spikes");
+        if (idx < 0) continue;
+        actor_inst& a = sc.actors[size_t(idx)];
+        for (int k = 0; k < 3; ++k) a.node->local.translate[k] = t.pivot[k];
+        scene::spike sp;
+        sp.actor = idx;
+        for (int k = 0; k < 3; ++k) sp.at[k] = t.pivot[k];
+        play_once(sc, a, "StartPosition", 0.0, a.home_yaw, true);
+        sc.spikes.push_back(sp);
+    }
     // Ropes: TRAP_ROPE hung at the trap's node, which is the rope's bottom
     // end (argv "Type actor" is the default in every shipped level).
     for (size_t i = 0; i < sc.rope_points.size(); ++i) {
@@ -8228,7 +8299,7 @@ int main(int argc, char** argv) {
             // Darts in flight: straight on until the Prince or a wall.
             for (size_t i = 0; i < g_darts.size(); ) {
                 dart& d = g_darts[i];
-                const float step = 18.0f * dt;
+                const float step = 15.0f * dt;         // both kinds, 0x747D3C
                 bool gone = game_time - d.born > 3.0;
                 k2::engine::pick_hit h;
                 float travel = step;
@@ -8244,22 +8315,53 @@ int main(int argc, char** argv) {
                     if (cx * cx + cz * cz < 0.4f * 0.4f && d.p[1] > pp[1] && d.p[1] < pp[1] + 1.8f) {
                         for (size_t a = 0; a < sc.actors.size(); ++a)
                             if (is_prince(sc.actors[a])) {
-                                prince_damage(combat, sc, sc.actors[a], combat_tuning::BOTTLE, DIR_CENTER, game_time);
+                                // A dart does 20; a fireball kills outright (ApplyDamage 0x7FFFFFFF).
+                                prince_damage(combat, sc, sc.actors[a], d.fireball ? sc.actors[a].health : 20, DIR_CENTER, game_time);
                                 break;
                             }
-                        play_sound("MULdarthitz", d.p, 12.0f, false);
+                        if (!d.fireball) play_sound("MULdarthitz", d.p, 12.0f, false);
                         gone = true;
                     }
                 }
                 for (int k = 0; k < 3; ++k) d.p[k] += d.d[k] * travel;
                 if (gone) {
-                    fx_spawn("DartImpact.NIF", d.p, 0.0f, game_time, 0.5);
+                    if (!d.fireball) fx_spawn("DartImpact.NIF", d.p, 0.0f, game_time, 0.5);
                     g_darts.erase(g_darts.begin() + long(i));
                     continue;
                 }
-                if (int(game_time * 30.0) % 2 == 0)
+                if (d.fireball) fx_spawn("fireball.NIF", d.p, std::atan2(d.d[0], d.d[2]), game_time, 0.08);
+                else if (int(game_time * 30.0) % 2 == 0)
                     fx_spawn("DartTrail.NIF", d.p, std::atan2(d.d[0], d.d[2]), game_time, 0.2);
                 ++i;
+            }
+            // Flamethrowers: while a burn lasts, the flame and its 2-unit
+            // reach from the nozzle; the Prince in it loses max(1, 25 dt) a
+            // frame (0x4710EA). The flame points along +z turned by the pivot,
+            // the way R(0, -2, 0) in Max space comes out here.
+            for (size_t t = 0; t < sc.traps.size(); ++t) {
+                scene_trap* ft = dynamic_cast<scene_trap*>(sc.traps[t]);
+                if (!ft || ft->type != "FlameThrower") continue;
+                if (!ft->flame_burning(game_time)) continue;
+                const float noz[3] = { ft->pivot[0] + ft->offset()[0], ft->pivot[1] + ft->offset()[1], ft->pivot[2] + ft->offset()[2] };
+                const float fd[3] = { std::sin(ft->pivot_angle), 0.0f, std::cos(ft->pivot_angle) };
+                if (game_time >= ft->flame_fx_at) {
+                    fx_spawn("FlameThrower.NIF", noz, ft->pivot_angle, game_time, 0.6);
+                    ft->flame_fx_at = game_time + 0.5;
+                }
+                if (!pp || combat.dead_since >= 0.0) continue;
+                const float wx = pp[0] - noz[0], wz = pp[2] - noz[2];
+                const float u = std::max(0.0f, std::min(2.0f, wx * fd[0] + wz * fd[2]));
+                const float cx = noz[0] + fd[0] * u - pp[0], cz = noz[2] + fd[2] * u - pp[2];
+                if (cx * cx + cz * cz > 0.4f * 0.4f || noz[1] < pp[1] - 0.2f || noz[1] > pp[1] + 1.9f) continue;
+                for (size_t a = 0; a < sc.actors.size(); ++a)
+                    if (is_prince(sc.actors[a])) {
+                        actor_inst& pa = sc.actors[a];
+                        pa.health -= std::max(1, int(25.0f * dt));
+                        if (int(game_time * 4.0) != int((game_time - dt) * 4.0))
+                            play_sound("GBLpfiteinjur", pp, 14.0f, false);
+                        if (pa.health <= 0) { pa.health = 1; prince_damage(combat, sc, pa, 1, DIR_CENTER, game_time); }
+                        break;
+                    }
             }
             // Arrows: the Prince's hit guards and ArrowTargets, the archers'
             // hit him; walls stop both.
@@ -8753,6 +8855,25 @@ int main(int argc, char** argv) {
                     taking.pickup = -1;
             }
             if (!dead) specials_update(sc, combat, *player, game_time);
+            // Spikes (Spikes__Update 0x48A98E): cylinders about the trap's node.
+            // Inside 1.25 (feet -0.05 .. 2 above it) they strike, and reset
+            // once he has gone; inside 0.75 (-0.05 .. 0.3) he dies, whatever
+            // they are doing.
+            for (size_t i = 0; i < sc.spikes.size() && !dead; ++i) {
+                scene::spike& sp = sc.spikes[i];
+                actor_inst& sa = sc.actors[size_t(sp.actor)];
+                const float* q = lt.translate;
+                const float dx = q[0] - sp.at[0], dz = q[2] - sp.at[2], dy = q[1] - sp.at[1];
+                const float r2 = dx * dx + dz * dz;
+                const bool in_trig = r2 < 1.25f * 1.25f && dy > -0.05f && dy < 2.0f;
+                if (!sp.struck && in_trig) { sp.struck = true; play_once(sc, sa, "Strike", game_time, sa.home_yaw, true); }
+                else if (sp.struck && !in_trig && !sa.scripted) { sp.struck = false; play_once(sc, sa, "Reset", game_time, sa.home_yaw, true); }
+                if (r2 < 0.75f * 0.75f && dy > -0.05f && dy < 0.3f && combat.dead_since < 0.0) {
+                    play_once(sc, sa, "!Hit", game_time, sa.home_yaw, true);
+                    prince_damage(combat, sc, *player, player->health, DIR_CENTER, game_time, "DeathSpikes_G");
+                    std::printf("spikes: the Prince is impaled\n");
+                }
+            }
             if (!player->pending_kill.empty()) {  // "Prince,kill:Lvl1HandGetsEaten_G"
                 if (!dead) prince_damage(combat, sc, *player, player->health, 0, game_time, player->pending_kill.c_str());
                 player->pending_kill.clear();
