@@ -714,6 +714,9 @@ struct actor_inst {
     int                               pending_hurt;   // "hurt:N", applied by combat
     std::string                       pending_kill;   // "kill:<clip>": dies playing it
     std::string                       held_clip;      // a prop's last scripted clip, for saves
+    // A cutscene clip ("SkillAt:"): its root motion goes where it was
+    // authored to, through walls if need be. Other clips slide along them.
+    bool                              scripted_free = false;
     bool                              archer;         // a bowman: shoots, never closes in
     // The other hand (master.dat's second grip), where the Prince's bow is
     // held while `bow_shown`.
@@ -801,7 +804,7 @@ enum loco_clip { LOCO_BASE = 0, LOCO_RUN, LOCO_WALK,
                  RUN_JUMP_ANTIC, RUN_JUMPING, RUN_JUMP_LAND, FALL_VERT,
                  HOP_SMALL, HOP_1M, HOP_1_5M, HOP_2M,
                  LEDGE_GRAB_VERT, LEDGE_GRAB_HORIZ, LEDGE_HANG, LEDGE_PULL_UP, LEDGE_PULL_FAIL,
-                 LEDGE_MOVE_LEFT, LEDGE_MOVE_RIGHT, WALK_BACK,
+                 LEDGE_MOVE_LEFT, LEDGE_MOVE_RIGHT, WALK_BACK, FALL_VERT_SAFE,
                  LOCO_COUNT };
 const char* const k_loco_names[LOCO_COUNT] = { "BasePose_L", "Running_L", "Walk_L",
     "PushOrPullFinish_M", "PushOrPullBase_M", "Push_M", "PushFail_M",
@@ -815,7 +818,7 @@ const char* const k_loco_names[LOCO_COUNT] = { "BasePose_L", "Running_L", "Walk_
     "HopUpOntoSmall_M", "HopUpOnto1m_M", "HopUpOnto1point5m_M", "HopUpOnto2m_M",
     "LedgeGrabVert_M", "LedgeGrabHoriz_M", "LedgeHangBase_M", "LedgePullUpOnto_M1",
     "LedgeHangPullUpFail_M", "LedgeHangMovingLeft_M", "LedgeHangMovingRight_M",
-    "WalkBackwards_L1" };
+    "WalkBackwards_L1", "FallVertControlled_G" };
 
 
 struct scene {
@@ -2410,6 +2413,7 @@ private:
         a.scripted_start = m_world.now();
         a.clip_ms = 0.0;               // the play head, for its sound keys
         a.hidden = false;
+        a.scripted_free = true;
         return true;
     }
 
@@ -2498,6 +2502,7 @@ bool play_once(scene& sc, actor_inst& a, const std::string& name, double now, fl
     a.hold_last = hold;
     a.posed_hold = false;
     a.remove_after = false;
+    a.scripted_free = false;
     return true;
 }
 
@@ -3095,6 +3100,7 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
                 k2::engine::action_trap* a = new k2::engine::action_trap(
                     sc.script, n.name, hdr, n.trap.argv, vol);
                 a->set_center(n.trap.center);
+                a->set_stand(n.trap.pivot, n.trap.pivot_angle);
                 sc.actions.push_back(a);
                 t = a;
             } else if (n.trap.name == "Messenger") {
@@ -4581,6 +4587,16 @@ struct jump_ctl {
     }
 };
 
+// The fall to play from `pos`: the quiet FallVertControlled_G when the floor
+// is within MinFallHeight below, the screaming FallVertUncontrolled_G over a
+// drop that will hurt. The choice by depth is ours.
+int fall_clip(const k2::engine::collision_world& w, const float* pos) {
+    const float o[3] = { pos[0], pos[1] + 0.1f, pos[2] };
+    const float d[3] = { 0.0f, -1.0f, 0.0f };
+    k2::engine::pick_hit h;
+    return w.pick(o, d, 0.1f + jump_tuning::MIN_FALL_HEIGHT, true, h) ? FALL_VERT_SAFE : FALL_VERT;
+}
+
 // Plays clip `c` once from now, from `pos`.
 void jump_begin(jump_ctl& jc, actor_inst& a, int c, double now, const float* pos) {
     set_clip(a, c);
@@ -5656,7 +5672,14 @@ void steer(scene& sc, actor_inst& a, const float* to, bool run, float dt) {
         if (cs > 0.0f) speed = cs;
     }
     const float step = std::min(d, speed * dt);
+    // On the floor, and never off it: a step with no floor under it is not
+    // taken, so guards stop at edges instead of walking on air (ours; the
+    // original's planner is not traced).
+    const float was[3] = { p[0], p[1], p[2] };
     move_horizontal(sc.coll, p, dx / d * step, dz / d * step);
+    float gy;
+    if (ground_under(sc.coll, p, gy)) p[1] = gy;
+    else for (int k = 0; k < 3; ++k) p[k] = was[k];
     a.node->local.set_yaw(std::atan2(dx, dz));
 }
 
@@ -8211,9 +8234,25 @@ int main(int argc, char** argv) {
             for (size_t i = 0; i < sc.plates.size(); ++i)
                 sc.plates[i]->update(game_time, pp && sc.plates[i]->contains(pp));
             // Scripted skills ("SkillAt:") drive their actors outright.
-            for (size_t i = 0; i < sc.actors.size(); ++i)
-                if (update_scripted(sc.actors[i], game_time) && is_prince(sc.actors[i]))
-                    player_yaw = sc.actors[i].scripted_yaw;
+            for (size_t i = 0; i < sc.actors.size(); ++i) {
+                actor_inst& sa = sc.actors[i];
+                const bool clamp = is_prince(sa) && sa.scripted && !sa.scripted_free && !noclip;
+                float was[3] = { 0.0f, 0.0f, 0.0f };
+                if (clamp) for (int k = 0; k < 3; ++k) was[k] = sa.node->local.translate[k];
+                if (update_scripted(sa, game_time) && is_prince(sa)) {
+                    player_yaw = sa.scripted_yaw;
+                    if (clamp) {
+                        // His own clips (injuries, attacks, levers) carry him by
+                        // their root motion; walls stop it, as walking is stopped.
+                        float* q = sa.node->local.translate;
+                        const float want[3] = { q[0], q[1], q[2] };
+                        q[0] = was[0]; q[2] = was[2];
+                        move_horizontal(sc.coll, q, want[0] - was[0], want[2] - was[2]);
+                        sa.scripted_origin[0] += q[0] - want[0];
+                        sa.scripted_origin[2] += q[2] - want[2];
+                    }
+                }
+            }
             // Fixtures between scripted skills: the next idle, picked at
             // random from the trap's list, from where they stand.
             for (size_t i = 0; i < sc.actors.size(); ++i) {
@@ -8990,7 +9029,7 @@ int main(int argc, char** argv) {
                 jumps.dir = 0;
                 jumps.vel[0] = jumps.vel[1] = jumps.vel[2] = 0.0f;
                 jumps.peak_y = lt.translate[1];
-                jump_begin(jumps, *player, FALL_VERT, game_time, lt.translate);
+                jump_begin(jumps, *player, fall_clip(sc.coll, lt.translate), game_time, lt.translate);
                 regrab_after = game_time + 0.6;
             }
             if (!on_ledge && jump_pressed && !scripted_now && crates.state == crate_ctl::NONE && pole.state == pole_ctl::NONE && bar.state == bar_ctl::NONE && rope.rope < 0 &&
@@ -9182,7 +9221,7 @@ int main(int argc, char** argv) {
                             bar_drop::go(bar, jumps, *player, lt.translate, game_time, v, RUN_JUMPING);
                             std::printf("bar: launch\n");
                         } else {
-                            bar_drop::go(bar, jumps, *player, lt.translate, game_time, 0, FALL_VERT);
+                            bar_drop::go(bar, jumps, *player, lt.translate, game_time, 0, fall_clip(sc.coll, lt.translate));
                         }
                         regrab_after = game_time + 0.6;
                     } else if (!player->scripted) {
@@ -9229,7 +9268,7 @@ int main(int argc, char** argv) {
                             player_yaw = bar.yaw;
                             for (int k = 0; k < 3; ++k) lt.translate[k] = at[k];
                             if (in_y < -0.5f || jump_pressed) {
-                                bar_drop::go(bar, jumps, *player, lt.translate, game_time, 0, FALL_VERT);
+                                bar_drop::go(bar, jumps, *player, lt.translate, game_time, 0, fall_clip(sc.coll, lt.translate));
                                 regrab_after = game_time + 0.6;
                             } else if (in_y > 0.5f) {
                                 bar.state = bar_ctl::SW_START;
@@ -9438,7 +9477,7 @@ int main(int argc, char** argv) {
                         jumps.dir = 0;
                         jumps.vel[0] = jumps.vel[1] = jumps.vel[2] = 0.0f;
                         jumps.peak_y = lt.translate[1];
-                        jump_begin(jumps, *player, FALL_VERT, game_time, lt.translate);
+                        jump_begin(jumps, *player, fall_clip(sc.coll, lt.translate), game_time, lt.translate);
                         regrab_after = game_time + 0.6;
                         break;
                     default:
@@ -9495,6 +9534,20 @@ int main(int argc, char** argv) {
                     working.stage = 0;
                     const float* c = a->center();
                     player_yaw = std::atan2(c[0] - lt.translate[0], c[2] - lt.translate[2]);
+                    // The clips are authored from the trap's stand spot: put him
+                    // there (the original walks him to it first), so their root
+                    // motion cannot carry him through the wall behind the lever.
+                    float sp[3], syaw, gy;
+                    if (a->stand(sp, syaw) && ground_under(sc.coll, sp, gy)) {
+                        const float ddx = sp[0] - lt.translate[0], ddz = sp[2] - lt.translate[2];
+                        if (ddx * ddx + ddz * ddz < 3.0f * 3.0f) {
+                            lt.translate[0] = sp[0];
+                            lt.translate[1] = gy;
+                            lt.translate[2] = sp[2];
+                            const float fx2 = c[0] - sp[0], fz2 = c[2] - sp[2];
+                            player_yaw = fx2 * fx2 + fz2 * fz2 > 0.0025f ? std::atan2(fx2, fz2) : syaw;
+                        }
+                    }
                     action_started = true;
                     std::printf("action: %s (state %s)\n", a->name().c_str(), a->state().c_str());
                     break;
@@ -9655,7 +9708,7 @@ int main(int argc, char** argv) {
                     jumps.dir = 0;
                     jumps.vel[0] = jumps.vel[1] = jumps.vel[2] = 0.0f;
                     jumps.peak_y = lt.translate[1];
-                    jump_begin(jumps, *player, FALL_VERT, game_time, lt.translate);
+                    jump_begin(jumps, *player, fall_clip(sc.coll, lt.translate), game_time, lt.translate);
                 } else {
                     player_vy -= move_tuning::GRAVITY * dt;
                     const float o[3] = { lt.translate[0], lt.translate[1], lt.translate[2] };

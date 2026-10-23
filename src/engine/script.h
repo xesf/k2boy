@@ -185,11 +185,23 @@ public:
     void run(field f) { const std::string s = pick(f); if (!s.empty()) execute(s); }
     const float* center() const { return m_center; }
     void set_center(const float* c) { for (int k = 0; k < 3; ++k) m_center[k] = c[k]; }
+    // Where the Prince stands to work it, and his facing: the trap node's
+    // pivot and pivot angle (as EnemyStart's pivot is a guard's spot).
+    void set_stand(const float* p, float yaw) { for (int k = 0; k < 3; ++k) m_stand[k] = p[k]; m_stand_yaw = yaw; m_has_stand = true; }
+    bool stand(float* p, float& yaw) const {
+        if (!m_has_stand) return false;
+        for (int k = 0; k < 3; ++k) p[k] = m_stand[k];
+        yaw = m_stand_yaw;
+        return true;
+    }
 
 private:
     std::vector<std::string> m_argv;
     trap_volume m_volume;
     float m_center[3];
+    float m_stand[3] = { 0.0f, 0.0f, 0.0f };
+    float m_stand_yaw = 0.0f;
+    bool  m_has_stand = false;
 };
 
 // A PressurePlate (0x483925 argv, states 0x483DD2 .. 0x483F04):
