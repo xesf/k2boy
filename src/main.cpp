@@ -717,6 +717,10 @@ struct actor_inst {
     // A cutscene clip ("SkillAt:"): its root motion goes where it was
     // authored to, through walls if need be. Other clips slide along them.
     bool                              scripted_free = false;
+    // Which way a clip's root track carries him, from his facing: the
+    // dodges and quick moves are authored moving ahead (+z) and played along
+    // the move's own heading.
+    float                             motion_turn = 0.0f;
     bool                              archer;         // a bowman: shoots, never closes in
     // The other hand (master.dat's second grip), where the Prince's bow is
     // held while `bow_shown`.
@@ -2450,7 +2454,7 @@ bool update_scripted(actor_inst& a, double now) {
     if (!skill_joint(s, 0, 0, p0, q) || !skill_joint(s, 0, t, pt, q))
         p0[0] = p0[1] = p0[2] = pt[0] = pt[1] = pt[2] = 0.0f;
     const float dx = pt[0] - p0[0], dy = pt[1] - p0[1], dz = pt[2] - p0[2];
-    const float c = std::cos(a.scripted_yaw), sn = std::sin(a.scripted_yaw);
+    const float c = std::cos(a.scripted_yaw + a.motion_turn), sn = std::sin(a.scripted_yaw + a.motion_turn);
     k2::engine::transform& lt = a.node->local;
     lt.set_yaw(a.scripted_yaw);
     lt.translate[0] = a.scripted_origin[0] + c * dx + sn * dz;
@@ -2503,6 +2507,7 @@ bool play_once(scene& sc, actor_inst& a, const std::string& name, double now, fl
     a.posed_hold = false;
     a.remove_after = false;
     a.scripted_free = false;
+    a.motion_turn = 0.0f;
     return true;
 }
 
@@ -8619,14 +8624,23 @@ int main(int argc, char** argv) {
 
         float mv[3] = {0.0f, 0.0f, 0.0f};
         bool  walk_back = false;                        // Classic: S walks backwards
+        // The original's Walk key (Shift; pad: left trigger): held, the
+        // direction keys step - a careful walk, a step back, a sidestep - and
+        // he keeps his facing. With it up he runs, as the original does.
+        const bool step_key = down[plat::KEY_LSHIFT] || down[plat::KEY_RSHIFT] ||
+                              (pad.connected && pad.axis[plat::PAD_AXIS_LTRIGGER] > 0.5f);
         if (player && classic) {
             // Tank controls: left/right turn, up/down along his facing.
-            if (std::fabs(in_x) > 0.2f && player->scripted == 0 && crates.state == crate_ctl::NONE &&
+            if (std::fabs(in_x) > 0.2f && !step_key && player->scripted == 0 && crates.state == crate_ctl::NONE &&
                 ledges.state == hang_ctl::NONE && jumps.state == jump_ctl::NONE)
                 player_yaw -= in_x * 2.6f * dt;
             const float pf[3] = { std::sin(player_yaw), 0.0f, std::cos(player_yaw) };
             if (in_y > 0.2f)       for (int a = 0; a < 3; ++a) mv[a] = pf[a] * in_y;
             else if (in_y < -0.2f) { for (int a = 0; a < 3; ++a) mv[a] = pf[a] * in_y; walk_back = true; }
+            if (step_key && std::fabs(in_x) > 0.2f) {
+                const float ps[3] = { std::cos(player_yaw), 0.0f, -std::sin(player_yaw) };   // his left
+                for (int a = 0; a < 3; ++a) mv[a] += ps[a] * -in_x;
+            }
         } else {
             // Camera-relative, on the ground plane.
             float fl[3] = { fwd[0], 0.0f, fwd[2] };
@@ -8651,9 +8665,13 @@ int main(int argc, char** argv) {
                 sc.coll.node_to_world(ride.node, ride.local, w);
                 for (int k = 0; k < 3; ++k) lt.translate[k] += w[k] - ride.at[k];
             }
-            const bool run = autorun || down[plat::KEY_LSHIFT] || down[plat::KEY_RSHIFT] || pad_run ||
+            // Running is the default (NumPad 8 runs, Shift + 8 walks); a part
+            // push of the stick walks.
+            const bool keys_move = down[plat::KEY_W] || down[plat::KEY_A] || down[plat::KEY_S] || down[plat::KEY_D] ||
+                                   down[plat::KEY_UP] || down[plat::KEY_DOWN] || down[plat::KEY_LEFT] || down[plat::KEY_RIGHT];
+            const bool run = autorun || (!step_key && (keys_move || pad_run ||
                              (pad.connected && (pad.button[plat::PAD_RSHOULDER] ||
-                                                pad.axis[plat::PAD_AXIS_RTRIGGER] > 0.5f));
+                                                pad.axis[plat::PAD_AXIS_RTRIGGER] > 0.5f))));
             // The input in the Prince's own frame: x his left, z ahead.
             const float pf[3] = { std::sin(player_yaw), 0.0f, std::cos(player_yaw) };
             const float ps[3] = { std::cos(player_yaw), 0.0f, -std::sin(player_yaw) };
@@ -8831,6 +8849,37 @@ int main(int argc, char** argv) {
                         combat.prince_busy_until = game_time + skill_seconds(sc, *player, fc);
                         enemy_react(combat, sc, lt.translate, player_yaw, game_time);
                     }
+                }
+            }
+            // With the sword drawn, a direction tapped twice within 0.4 s dodges
+            // (Input__DetectDoubleTap 0x412EA1): CombatDodgeLeft/Right_L2 to the
+            // sides, CombatQuickMoveForward/Backwards_L2 ahead and back.
+            {
+                static bool was[4] = { false, false, false, false };
+                static double tap[4] = { -1.0, -1.0, -1.0, -1.0 };
+                const bool now_down[4] = {
+                    down[plat::KEY_W] || down[plat::KEY_UP] || (pad.connected && pad.button[plat::PAD_DPAD_UP]),
+                    down[plat::KEY_S] || down[plat::KEY_DOWN] || (pad.connected && pad.button[plat::PAD_DPAD_DOWN]),
+                    down[plat::KEY_A] || down[plat::KEY_LEFT] || (pad.connected && pad.button[plat::PAD_DPAD_LEFT]),
+                    down[plat::KEY_D] || down[plat::KEY_RIGHT] || (pad.connected && pad.button[plat::PAD_DPAD_RIGHT]) };
+                for (int k = 0; k < 4; ++k) {
+                    if (now_down[k] && !was[k]) {
+                        if (combat.prince_drawn && free_body && !dead && game_time - tap[k] < 0.4) {
+                            const float side = local[0], ahead = local[2];
+                            const char* dc = std::fabs(side) > std::fabs(ahead)
+                                ? (side > 0.0f ? "CombatDodgeLeft_L2" : "CombatDodgeRight_L2")
+                                : (ahead > 0.0f ? "CombatQuickMoveForward_L2" : "CombatQuickMoveBackwards_L2");
+                            if (play_once(sc, *player, dc, game_time, player_yaw, false)) {
+                                combat.prince_busy_until = game_time + skill_seconds(sc, *player, dc);
+                                player->motion_turn = std::fabs(side) > std::fabs(ahead)
+                                    ? (side > 0.0f ? 1.5707963f : -1.5707963f) : (ahead > 0.0f ? 0.0f : 3.14159265f);
+                            }
+                            tap[k] = -1.0;
+                        } else {
+                            tap[k] = game_time;
+                        }
+                    }
+                    was[k] = now_down[k];
                 }
             }
             if (combat.prince_drawn && free_body) {
@@ -9603,7 +9652,8 @@ int main(int argc, char** argv) {
                 return ground_under(w, q, gy) ? gy - p[1] : -10.0f;
             } };
             bool loco_started = false;
-            if (!scripted_now && !in_jump && !busy && !in_crate && !classic && !noclip && !dead) {
+            if (!scripted_now && !in_jump && !busy && !in_crate && !classic && !noclip && !dead && !step_key &&
+                !combat.prince_drawn) {
                 const bool running_now = player->clip == LOCO_RUN && loco.run_since >= 0.0;
                 if (ml > 1e-6f) {
                     float diff = std::atan2(mv[0], mv[2]) - player_yaw;
@@ -9653,6 +9703,56 @@ int main(int argc, char** argv) {
                 // A scripted skill, a jump or a ledge owns the body.
             } else if (in_crate) {
                 crate_input(crates, sc, *player, lt.translate, player_yaw, game_time, act, push, pull);
+            } else if (ml > 1e-6f && (step_key || combat.prince_drawn) && !noclip) {
+                // Steps, keeping his facing. Their direction in his own frame
+                // picks the clip: with the sword drawn the fighting steps
+                // (Prince__StFightingSetMove / SetSideStep: CombatMove*_L2),
+                // else a careful walk (Walk_L that stops at a drop, as
+                // StepWalk does past 0.55), a step back (WalkBackwards_L1) or a
+                // sidestep (SidestepLeft/Right_L).
+                const float side = local[0], ahead = local[2];
+                const bool sideways = std::fabs(side) > std::fabs(ahead);
+                const char* clip_name = 0;
+                float dir[3] = { 0.0f, 0.0f, 0.0f };
+                float speed = walk_speed;
+                if (sideways) {
+                    clip_name = combat.prince_drawn ? (side > 0.0f ? "CombatMoveLeft_L2" : "CombatMoveRight_L2")
+                                                    : (side > 0.0f ? "SidestepLeft_L" : "SidestepRight_L");
+                    for (int k = 0; k < 3; ++k) dir[k] = ps[k] * (side > 0.0f ? 1.0f : -1.0f);
+                } else {
+                    if (combat.prince_drawn) clip_name = ahead > 0.0f ? "CombatMoveForward_L2" : "CombatMoveBackward_L2";
+                    for (int k = 0; k < 3; ++k) dir[k] = pf[k] * (ahead > 0.0f ? 1.0f : -1.0f);
+                    if (ahead < 0.0f) speed = walk_speed * 0.6f;
+                }
+                if (clip_name) {
+                    player->stance = find_actor_skill(sc, *player, clip_name);
+                    if (player->stance) {
+                        float rm[3];
+                        if (clip_root_motion(*player->stance, rm)) {
+                            const float len = float(std::max(1u, clip_length_ms(*player->stance))) / 1000.0f;
+                            const float d = std::sqrt(rm[0] * rm[0] + rm[2] * rm[2]) / len;
+                            if (d > 0.1f) speed = d;
+                        }
+                    }
+                } else {
+                    player->stance = 0;
+                    const int wc = ahead > 0.0f ? LOCO_WALK : WALK_BACK;
+                    set_clip(*player, wc);
+                    if (player->loco_ok.size() > size_t(wc) && player->loco_ok[size_t(wc)]) {
+                        const float cs = clip_speed(player->loco[size_t(wc)]);
+                        if (cs > 0.1f) speed = cs;
+                    }
+                }
+                // Careful: no step where the floor drops away more than 0.55.
+                const float probe[3] = { lt.translate[0] + dir[0] * 0.5f, lt.translate[1], lt.translate[2] + dir[2] * 0.5f };
+                float gy;
+                const bool floor_there = ground_under(sc.coll, probe, gy) && gy > lt.translate[1] - 0.55f;
+                if (floor_there) {
+                    const float step = speed * dt * std::max(0.35f, std::min(1.0f, ml));
+                    move_horizontal(sc.coll, lt.translate, dir[0] * step, dir[2] * step);
+                } else if (!clip_name) {
+                    set_clip(*player, LOCO_BASE);
+                }
             } else if (ml > 1e-6f) {
                 player->stance = 0;
                 // Walk_L or Running_L, moved at the speed its own root motion

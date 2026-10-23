@@ -87,9 +87,9 @@ Two schemes, switched with **Tab** in game or in Options:
 
 | Action | Keyboard | Gamepad (Xbox / PlayStation / MFi) |
 |---|---|---|
-| Move | WASD / arrows | left stick, d-pad |
+| Move (runs, as the original's NumPad 8 does) | WASD / arrows | left stick, d-pad (a part push walks) |
+| Step: careful walk, step back, sidestep, keeping his facing (the original's Walk key) | Shift + direction | LT + direction |
 | Camera | mouse drag | right stick |
-| Run | Shift | RB / RT |
 | Jump | Space | A |
 | Action: grab a crate, climb, talk, pull levers, pick up | E | X |
 | Climb onto a crate | E while pushing toward it | X + forward |
@@ -98,6 +98,7 @@ Two schemes, switched with **Tab** in game or in Options:
 | Attack (left / right / centre by the stick) | F | B |
 | Feint (a swing that stops short) | Shift + F | RB + B |
 | Block (it turns to meet the swing coming) | G | LB |
+| With the sword drawn: fighting steps / dodge | direction / tap it twice | the same |
 | Bow: ready / put away; hold attack to draw, let go to loose | B, then F | L3, then B |
 | Game menu | Esc | Start |
 | Motion camera (pads with a gyroscope) | — | Select |
