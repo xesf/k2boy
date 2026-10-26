@@ -649,6 +649,13 @@ struct draw_item {
 // one node per part, switched off until its actor says otherwise.
 bool g_part_collision = false;
 
+#ifdef __vita__
+// vita-elf-create wants 2.5 KB of room after the code segment for its own
+// tables, and a build that ends right at the data segment's start fails
+// ("segment 1 overlaps"). This keeps a margin; it is never read.
+extern "C" { __attribute__((used)) const char k2_vita_segment_pad[8192] = { 1 }; }
+#endif
+
 // K2_SCRIPTAUDIT: every trap's script arguments, run once at the start so the
 // exit summary lists what nothing handles. A diagnostic only.
 std::vector<std::string> g_audit_scripts;
@@ -5499,6 +5506,22 @@ uint32_t skill_marker_ms(scene& sc, const actor_inst& a, const std::string& name
     return marker;
 }
 
+// Each guard's clips carry his weapon's number: _G1 / _L1 for the palace
+// guards, _G3 / _L3 for staff men, _G4, _G6 for the beasts. Taken from the
+// clips he has: the attack and ready ones, else the death clip's.
+void guard_clip_sets(scene& sc, const actor_inst& a, enemy_ai& e) {
+    static const char* const gs[9] = { "_G1", "_G2", "_G3", "_G4", "_G5", "_G6", "_G7", "_G8", "_G9" };
+    static const char* const ls[9] = { "_L1", "_L2", "_L3", "_L4", "_L5", "_L6", "_L7", "_L8", "_L9" };
+    for (int n = 0; n < 9; ++n)
+        if (find_actor_skill(sc, a, std::string("CombatAttackCenter") + gs[n]) ||
+            find_actor_skill(sc, a, std::string("CombatAtReady") + gs[n])) { e.set = gs[n]; break; }
+    for (int n = 0; n < 9; ++n)
+        if (find_actor_skill(sc, a, std::string("CombatBeingInjuredCenter") + ls[n])) { e.hurt_set = ls[n]; break; }
+    if (!find_actor_skill(sc, a, "CombatAtReady" + e.set))
+        for (int n = 0; n < 9; ++n)
+            if (find_actor_skill(sc, a, std::string("CombatDeathGeneric") + gs[n])) { e.set = gs[n]; break; }
+}
+
 void combat_init(combat_state& cs, scene& sc, const k2::engine::fight_params& fp) {
     cs.params = &fp;
     cs.prince_drawn = cs.prince_blocking = false;
@@ -5525,29 +5548,7 @@ void combat_init(combat_state& cs, scene& sc, const k2::engine::fight_params& fp
         e.hit.active = false;
         e.set = "_G1";
         e.hurt_set = "_L1";
-        // Each guard's clips carry his weapon's number: _G1 / _L1 for the
-        // palace guards, _G3 / _L3 for staff men, _G4, _G6 for the beasts.
-        // Taken from the clips he has, the death and hurt ones first.
-        for (int n = 1; n <= 9; ++n) {
-            char g[8], l[8];
-            std::snprintf(g, sizeof(g), "_G%d", n);
-            std::snprintf(l, sizeof(l), "_L%d", n);
-            if (find_actor_skill(sc, a, std::string("CombatAttackCenter") + g) ||
-                find_actor_skill(sc, a, std::string("CombatAtReady") + g)) { e.set = g; break; }
-        }
-        for (int n = 1; n <= 9; ++n) {
-            char l[8];
-            std::snprintf(l, sizeof(l), "_L%d", n);
-            if (find_actor_skill(sc, a, std::string("CombatBeingInjuredCenter") + l)) { e.hurt_set = l; break; }
-        }
-        // Without an attack set of its own, the death clip's number.
-        if (!find_actor_skill(sc, a, "CombatAtReady" + e.set))
-            for (int n = 1; n <= 9; ++n) {
-                char g[8];
-                std::snprintf(g, sizeof(g), "_G%d", n);
-                if (find_actor_skill(sc, a, std::string("CombatDeathGeneric") + g)) { e.set = g; break; }
-            }
-        if (std::getenv("K2_SETDBG")) std::printf("guard %s clip set %s / %s\n", a.script_name.c_str(), e.set.c_str(), e.hurt_set.c_str());
+        guard_clip_sets(sc, a, e);
         e.start_loops = false;
         e.waiting = false;
         e.skill = 1;
