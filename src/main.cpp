@@ -787,6 +787,9 @@ bool equals_nocase(const std::string& a, const char* b) {
     return i == a.size() && !b[i];
 }
 
+// A prop's parts can be hidden one by one (its Kill and Trigger boxes).
+inline bool is_fixture_part(const actor_inst& a) { return a.is_fixture; }
+
 // The player: neither a guard nor a Fixture's actor.
 inline bool is_prince(const actor_inst& a) { return !a.is_enemy && !a.is_fixture; }
 
@@ -1767,6 +1770,24 @@ public:
     std::string       actor;    // whose skills a message can name (Door: argv1)
     float             pivot[3]; // K2_TRAP_PIVOT: a skill's rotation is about this
     float             pivot_angle = 0.0f;   // K2_TRAP_PIVOT_ANGLE about its axis (Launcher)
+    // The placement turn (K2_TRAP_PIVOT_AXIS and ANGLE, Rodrigues): the
+    // actor's skills are authored in its own frame, so what they turn or move
+    // is carried to the world by it - a door placed turned 90 degrees about x
+    // hinges about a different world axis than one placed upright.
+    float             place_rot[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+    void set_place(const float* axis, float angle) {
+        const float l = std::sqrt(axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]);
+        if (l < 1e-5f || std::fabs(angle) < 1e-6f) return;
+        const float x = axis[0] / l, y = axis[1] / l, z = axis[2] / l, c = std::cos(angle), sn = std::sin(angle), t = 1.0f - c;
+        const float r[9] = { t*x*x + c, t*x*y - sn*z, t*x*z + sn*y,
+                             t*x*y + sn*z, t*y*y + c, t*y*z - sn*x,
+                             t*x*z - sn*y, t*y*z + sn*x, t*z*z + c };
+        for (int i = 0; i < 9; ++i) place_rot[i] = r[i];
+    }
+    // P v (a local vector into the world) and P R P^T (a local turn).
+    void to_world(const float* v, float* out) const {
+        for (int i = 0; i < 3; ++i) out[i] = place_rot[i * 3] * v[0] + place_rot[i * 3 + 1] * v[1] + place_rot[i * 3 + 2] * v[2];
+    }
     // A Volume ForceTrap's current ("current,green,4": along the trap's
     // green axis turned by its pivot, 4 units a second), pushing whoever
     // swims inside its box. Ours: ForceTrap's Volume type is not traced.
@@ -2128,9 +2149,17 @@ private:
             if (!ok) continue;
             k2::engine::transform r;
             transform_from_pos_quat(pos, q, r);
+            float rw[9], tmp[9], wpos[3];
+            for (int i = 0; i < 3; ++i)                 // P R
+                for (int j = 0; j < 3; ++j)
+                    tmp[i * 3 + j] = place_rot[i * 3] * r.rotate[j] + place_rot[i * 3 + 1] * r.rotate[3 + j] + place_rot[i * 3 + 2] * r.rotate[6 + j];
+            for (int i = 0; i < 3; ++i)                 // (P R) P^T
+                for (int j = 0; j < 3; ++j)
+                    rw[i * 3 + j] = tmp[i * 3] * place_rot[j * 3] + tmp[i * 3 + 1] * place_rot[j * 3 + 1] + tmp[i * 3 + 2] * place_rot[j * 3 + 2];
+            to_world(pos, wpos);
             float off[3];
-            for (int k = 0; k < 3; ++k) off[k] = m_base[k] + pos[k];
-            pose(r.rotate, off);
+            for (int k = 0; k < 3; ++k) off[k] = m_base[k] + wpos[k];
+            pose(rw, off);
             return;
         }
     }
@@ -2983,7 +3012,15 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
         k2::engine::trap_header hdr;
         if (n.has_trap && !n.trap.argv.empty())
             hdr = k2::engine::parse_trap_header(n.trap.argv[0]);
-        const bool hidden = n.has_trap && !hdr.visible;
+        // A prop's own "Kill" and "Trigger" boxes (the Specials actors') are
+        // volumes the trap tests, never drawn.
+        bool prop_volume = false;
+        if (!collide) {
+            std::string tn = n.name;
+            for (size_t q = 0; q < tn.size(); ++q) tn[q] = char(std::tolower(static_cast<unsigned char>(tn[q])));
+            prop_volume = tn == "kill" || tn == "trigger";
+        }
+        const bool hidden = (n.has_trap && !hdr.visible) || prop_volume;
         if (!is_volume && !hidden) {
             for (size_t v = 0; v < vb.size(); ++v) {
                 const float p[3] = {vb[v].x, vb[v].y, vb[v].z};
@@ -3144,6 +3181,7 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
                                    int(sc.items.size()) - 1, node, n.trap.name, n.trap.bbox);
                 for (int k = 0; k < 3; ++k) st->pivot[k] = n.trap.pivot[k];
                 st->pivot_angle = n.trap.pivot_angle * (n.trap.pivot_axis[1] < 0.0f ? -1.0f : 1.0f);
+                st->set_place(n.trap.pivot_axis, n.trap.pivot_angle);
                 if (n.trap.name == "CrateTarget" && n.trap.argv.size() > 1) st->message = n.trap.argv[1];
                 if (n.trap.name == "ArrowTarget" && n.trap.argv.size() > 2) st->message = n.trap.argv[2];
                 if (n.trap.name == "Launcher" && n.trap.argv.size() > 1) st->fireball = std::atoi(n.trap.argv[1].c_str()) == 2;
@@ -10146,7 +10184,7 @@ int main(int argc, char** argv) {
                 // actor_world * cur[j] * bind_inv[j], from the pose job.
                 for (size_t k = 0; k < ai.item_count; ++k) {
                     const draw_item& di = sc.items[ai.first_item + k];
-                    if (di.is_trap) continue;
+                    if (di.is_trap || (di.hidden && is_fixture_part(ai))) continue;
                     if (ai.part_mats.size() < (k + 1) * 16) continue;
                     gfx::set_model(&ai.part_mats[k * 16]);
                     gfx::set_texture(di.tex);
