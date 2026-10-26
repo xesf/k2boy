@@ -9950,6 +9950,21 @@ int main(int argc, char** argv) {
                     }
                 }
             }
+            // In a fight the camera swings behind him, looking along the line to
+            // the guard he faces, so both are in view (CameraLogic's fight modes
+            // are not traced; the framing is ours). He steers it by hand again
+            // once the fight is over.
+            if (!classic && !input_locked && combat.prince_drawn && !dead) {
+                const int fe = nearest_enemy(combat, sc, lt.translate, 8.0f);
+                if (fe >= 0 && combat.enemies[size_t(fe)].state != enemy_ai::PATROL) {
+                    const float want = 3.14159265f - yaw_toward(lt.translate,
+                        sc.actors[size_t(combat.enemies[size_t(fe)].actor)].node->local.translate);
+                    float dyw = std::fmod(want - cam.yaw + 3.14159265f, 6.2831853f);
+                    if (dyw < 0) dyw += 6.2831853f;
+                    dyw -= 3.14159265f;
+                    cam.yaw += dyw * std::min(1.0f, dt * 2.5f);
+                }
+            }
             // Classic: the camera keeps behind him.
             if (classic && !input_locked) {
                 const float want = 3.14159265f - player_yaw;
