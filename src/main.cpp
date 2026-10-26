@@ -5525,6 +5525,29 @@ void combat_init(combat_state& cs, scene& sc, const k2::engine::fight_params& fp
         e.hit.active = false;
         e.set = "_G1";
         e.hurt_set = "_L1";
+        // Each guard's clips carry his weapon's number: _G1 / _L1 for the
+        // palace guards, _G3 / _L3 for staff men, _G4, _G6 for the beasts.
+        // Taken from the clips he has, the death and hurt ones first.
+        for (int n = 1; n <= 9; ++n) {
+            char g[8], l[8];
+            std::snprintf(g, sizeof(g), "_G%d", n);
+            std::snprintf(l, sizeof(l), "_L%d", n);
+            if (find_actor_skill(sc, a, std::string("CombatAttackCenter") + g) ||
+                find_actor_skill(sc, a, std::string("CombatAtReady") + g)) { e.set = g; break; }
+        }
+        for (int n = 1; n <= 9; ++n) {
+            char l[8];
+            std::snprintf(l, sizeof(l), "_L%d", n);
+            if (find_actor_skill(sc, a, std::string("CombatBeingInjuredCenter") + l)) { e.hurt_set = l; break; }
+        }
+        // Without an attack set of its own, the death clip's number.
+        if (!find_actor_skill(sc, a, "CombatAtReady" + e.set))
+            for (int n = 1; n <= 9; ++n) {
+                char g[8];
+                std::snprintf(g, sizeof(g), "_G%d", n);
+                if (find_actor_skill(sc, a, std::string("CombatDeathGeneric") + g)) { e.set = g; break; }
+            }
+        if (std::getenv("K2_SETDBG")) std::printf("guard %s clip set %s / %s\n", a.script_name.c_str(), e.set.c_str(), e.hurt_set.c_str());
         e.start_loops = false;
         e.waiting = false;
         e.skill = 1;
@@ -5710,7 +5733,8 @@ void enemy_damage(combat_state& cs, scene& sc, enemy_ai& e, int dmg, int dir, do
     play_sound("gblswordswish", a.node->local.translate, 14.0f, false);
     if (sword && e.state == enemy_ai::DYING) {
         enemy_killed(sc, e);
-        if (!play_once(sc, a, "CombatDeathGeneric" + e.set, now, actor_yaw(a), true)) a.posed_hold = true;
+        if (!play_once(sc, a, "CombatDeathGeneric" + e.set, now, actor_yaw(a), true) &&
+            !play_once(sc, a, "CombatDying" + e.set, now, actor_yaw(a), true)) a.posed_hold = true;
         return;
     }
     if (sword && a.health - dmg <= 1) {
@@ -5727,7 +5751,8 @@ void enemy_damage(combat_state& cs, scene& sc, enemy_ai& e, int dmg, int dir, do
     if (a.health <= 0) {
         e.state = enemy_ai::DEAD;
         a.stance = 0;
-        play_once(sc, a, "CombatDying" + e.set, now, actor_yaw(a), true);
+        if (!play_once(sc, a, "CombatDeathGeneric" + e.set, now, actor_yaw(a), true))
+            play_once(sc, a, "CombatDying" + e.set, now, actor_yaw(a), true);
         std::printf("combat: %s is defeated\n", a.script_name.c_str());
         if (!e.on_death.empty()) sc.script.execute(e.on_death, 0);
         return;
