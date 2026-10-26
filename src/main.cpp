@@ -5355,7 +5355,7 @@ bool hang_update(hang_ctl& hc, actor_inst& a, const k2::engine::collision_world&
 // EnemyAIObject logic is not traced.
 namespace combat_tuning {
 const float REACH         = 2.2f;   // a swing connects within this
-const float FIGHT_DIST    = 1.6f;   // guards stop and fight here
+const float FIGHT_DIST    = 1.75f;  // guards stop and fight here: the shortest swing (1.9) less 0.15 (enemy.dat), 0x4ABB6D
 const int   HIT_DAMAGE    = 12;       // a bottle; Arrow::kArrowNormalDamage is 12 too
 // Health is counted in thirds of a bottle, 4 each (sub_422A5F scales
 // thirds by 4: 30 thirds, ten bottles, make 120), so a bottle is 12.
@@ -5969,8 +5969,34 @@ void enemy_update(combat_state& cs, scene& sc, enemy_ai& e, actor_inst& prince,
     // Camouflaged, he is seen only from distCamoflauge (1.5).
     const bool  camo = potion_state::on(g_potions.camo_until, now) && e.state == enemy_ai::PATROL &&
                        d > float(fp.enemy("distCamoflauge", 1.5));
-    const bool  sees = !camo && prince_available && same_floor && d < watch &&
-                       (d < charge || angle_diff(yaw_toward(p, pp), actor_yaw(a)) < periph);
+    // Guard__CanSeePrince (0x4A777C): within 2 up or down; whatever is in
+    // front within 3 is seen outright, beyond that only inside the +-30 degree
+    // cone and with a clear line between the eyes (guard + 2.0, Prince + 0.5);
+    // no range limit. Prince__CanHear (0x4C76B0): his noise radius - running 6,
+    // walking 3, crawling 1, the sword drawn 6 - and a clear line all round.
+    auto clear_line = [&](float ey) {
+        const float o[3] = { p[0], p[1] + 2.0f, p[2] };
+        float dir[3] = { pp[0] - o[0], pp[1] + ey - o[1], pp[2] - o[2] };
+        const float l = std::sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+        if (l < 0.5f) return true;
+        for (int k = 0; k < 3; ++k) dir[k] /= l;
+        k2::engine::pick_hit h;
+        return !sc.coll.pick(o, dir, l - 0.4f, false, h);
+    };
+    bool sees = false;
+    if (!camo && prince_available && std::fabs(pp[1] - p[1]) <= 2.0f && d < 25.0f) {
+        const float ang = angle_diff(yaw_toward(p, pp), actor_yaw(a));
+        if (ang < 1.5707963f && d < 3.0f) sees = true;
+        else if (ang < periph) sees = clear_line(0.5f);
+        if (!sees) {
+            float noise = 0.0f;
+            if (prince.clip == LOCO_RUN) noise = 6.0f;
+            else if (prince.clip == LOCO_WALK) noise = 3.0f;
+            if (cs.prince_drawn) noise = std::max(noise, 6.0f);
+            const float dyd = (pp[1] - p[1]) * 2.0f;
+            if (noise > 0.0f && d * d + dyd * dyd < noise * noise) sees = clear_line(0.5f);
+        }
+    }
 
     switch (e.state) {
     case enemy_ai::PATROL:
@@ -5995,7 +6021,12 @@ void enemy_update(combat_state& cs, scene& sc, enemy_ai& e, actor_inst& prince,
         }
         break;
     case enemy_ai::CHARGE:
-        if (!prince_available || d > watch * 1.5f) { e.state = enemy_ai::PATROL; break; }
+        // Lost him: out of sight and five or more away (Manhattan) - back on patrol;
+        // a charge otherwise runs him down wherever he goes.
+        if (!prince_available || (std::fabs(dx) + std::fabs(dz) >= 5.0f && !clear_line(0.5f)) || d > 25.0f) {
+            e.state = enemy_ai::PATROL;
+            break;
+        }
         if (d <= combat_tuning::FIGHT_DIST) {
             e.state = enemy_ai::FIGHT;
             e.next_attack = now + 0.6;
