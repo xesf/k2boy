@@ -721,6 +721,10 @@ struct actor_inst {
     // dodges and quick moves are authored moving ahead (+z) and played along
     // the move's own heading.
     float                             motion_turn = 0.0f;
+    // A clip that is over at its '#' marker rather than at its last frame
+    // (drawing and sheathing the sword end well before their tails do), ms; 0 for none.
+    uint32_t                          cut_ms = 0;
+    int                               scabbard_joint = -1;
     bool                              archer;         // a bowman: shoots, never closes in
     // The other hand (master.dat's second grip), where the Prince's bow is
     // held while `bow_shown`.
@@ -1669,6 +1673,8 @@ void bind_actor_weapon(const assets::master_file& m, actor_inst& inst, scene& sc
             if (inst.joint_names[j] == m.hands[1].node) { inst.alt_hand_joint = int(j); break; }
         for (int k = 0; k < 3; ++k) inst.alt_hand_off[k] = m.hands[1].offset[k];
     }
+    for (size_t j = 0; j < inst.joint_names.size(); ++j)
+        if (inst.joint_names[j] == "Scabbard") { inst.scabbard_joint = int(j); break; }
     if (inst.hand_joint < 0 || !sc.weapons.count(inst.weapon))
         std::printf("  %s: weapon %s / hand %s not found\n", inst.name.c_str(), inst.weapon.c_str(),
                     m.hands[0].node.c_str());
@@ -2461,7 +2467,8 @@ private:
 bool update_scripted(actor_inst& a, double now) {
     if (!a.scripted) return false;
     const assets::skl_file& s = *a.scripted;
-    const uint32_t len = clip_length_ms(s);
+    uint32_t len = clip_length_ms(s);
+    if (a.cut_ms > 0 && a.cut_ms < len) len = a.cut_ms;
     const double el = (now - a.scripted_start) * 1000.0;
     const bool done = el >= double(len);
     const uint32_t t = done ? len : uint32_t(el < 0 ? 0 : el);
@@ -2539,6 +2546,7 @@ bool play_once(scene& sc, actor_inst& a, const std::string& name, double now, fl
     a.remove_after = false;
     a.scripted_free = false;
     a.motion_turn = 0.0f;
+    a.cut_ms = 0;
     return true;
 }
 
@@ -5448,6 +5456,8 @@ struct combat_state {
     // Dying (a blow that would leave him 1 or less): helpless until then.
     double                prince_dying_until = -1.0;
     double                taunt_at = -1.0;   // CombatTaunt after the draw
+    bool                  weapon_visible = false;   // the sword in his hand
+    double                weapon_flip_at = -1.0;    // when the draw / sheathe puts it there / away
     // A press that could not start yet waits for him to be ready
     // (fight+0x12C, Fight__RunQueuedRequest 0x4AC7D6). The 1 s it keeps
     // is ours.
@@ -5473,6 +5483,20 @@ float angle_diff(float a, float b) {
 double skill_seconds(scene& sc, const actor_inst& a, const std::string& name) {
     const assets::skl_file* sk = find_actor_skill(sc, a, name);
     return sk ? clip_length_ms(*sk) / 1000.0 : 0.5;
+}
+
+// A clip's '#' marker (its "done" event) in ms, or 0; and its first other
+// event's time (the moment of the grab or the stowing).
+uint32_t skill_marker_ms(scene& sc, const actor_inst& a, const std::string& name, uint32_t* first_event = 0) {
+    const assets::skl_file* sk = find_actor_skill(sc, a, name);
+    uint32_t marker = 0;
+    if (first_event) *first_event = 0;
+    if (!sk) return 0;
+    for (size_t i = 0; i < sk->event_keys.size(); ++i) {
+        if (sk->event_keys[i].target == "#") { if (!marker) marker = sk->event_keys[i].time; }
+        else if (first_event && !*first_event) *first_event = sk->event_keys[i].time;
+    }
+    return marker;
 }
 
 void combat_init(combat_state& cs, scene& sc, const k2::engine::fight_params& fp) {
@@ -8852,7 +8876,12 @@ int main(int argc, char** argv) {
                 combat.prince_drawn = !combat.prince_drawn;
                 const char* clip = combat.prince_drawn ? "CombatDrawWeaponBack_G2" : "CombatStoreWeaponBack_G2";
                 play_once(sc, *player, clip, game_time, player_yaw, false);
-                combat.prince_busy_until = game_time + skill_seconds(sc, *player, clip);
+                // Over at the clip's '#' marker; the sword changes hands at its other event.
+                uint32_t grab = 0;
+                const uint32_t done = skill_marker_ms(sc, *player, clip, &grab);
+                player->cut_ms = done;
+                combat.prince_busy_until = game_time + (done ? done / 1000.0 : skill_seconds(sc, *player, clip));
+                combat.weapon_flip_at = game_time + grab / 1000.0;
                 if (!combat.prince_drawn) player->stance = 0;
                 // Prince__StDrawSwordDone (0x4AF7FF): a taunt once it is out.
                 combat.taunt_at = combat.prince_drawn ? combat.prince_busy_until : -1.0;
@@ -8884,7 +8913,12 @@ int main(int argc, char** argv) {
                 combat.prince_block_dir = bd;
             }
             combat.prince_was_blocking = combat.prince_blocking;
-            player->weapon_shown = combat.prince_drawn;
+            if (combat.weapon_flip_at >= 0.0 && game_time >= combat.weapon_flip_at) {
+                combat.weapon_visible = combat.prince_drawn;
+                combat.weapon_flip_at = -1.0;
+            }
+            if (combat.weapon_flip_at < 0.0) combat.weapon_visible = combat.prince_drawn;
+            player->weapon_shown = combat.weapon_visible;
             // The stick's side for a swing; the run key held makes it a feint
             // (the original's Walk + attack, 0x502..0x504).
             const int atk_dir = local[0] > 0.4f ? DIR_LEFT : local[0] < -0.4f ? DIR_RIGHT : DIR_CENTER;
@@ -10206,6 +10240,22 @@ int main(int argc, char** argv) {
                         gfx::set_model(cm);
                         gfx::set_texture(cd.tex);
                         gfx::draw(cd.mesh);
+                    }
+                }
+                // Sheathed: the sword rides in the scabbard on his back.
+                if (is_prince(ai) && ai.armed && !ai.weapon_shown && ai.scabbard_joint >= 0 && ai.skinned) {
+                    std::map<std::string, std::vector<size_t> >::const_iterator si = sc.weapons.find(ai.weapon);
+                    if (si != sc.weapons.end()) {
+                        k2::engine::transform t0, t1;
+                        k2::engine::transform_compose(aw, ai.cur[size_t(ai.scabbard_joint)], t1);
+                        float wm[16];
+                        t1.to_matrix(wm);
+                        gfx::set_model(wm);
+                        for (size_t k = 0; k < si->second.size(); ++k) {
+                            const draw_item& wd = sc.items[si->second[k]];
+                            gfx::set_texture(wd.tex);
+                            gfx::draw(wd.mesh);
+                        }
                     }
                 }
                 // The weapon, in the hand: actor * hand joint * grip offset.
