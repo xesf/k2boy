@@ -766,6 +766,7 @@ struct actor_inst {
     // at the hand, about their own centre, while carried.
     std::vector<size_t>               carried;
     int                               carry_joint;
+    int                               carried_actor = -1;     // the actor whose parts are in the hand
     std::vector<std::string>          ambient;
     float                             home[3];
     float                             home_yaw;
@@ -2365,8 +2366,30 @@ private:
             a.carry_joint = -1;
             for (size_t j = 0; j < a.joint_names.size(); ++j)
                 if (a.joint_names[j] == hand) { a.carry_joint = int(j); break; }
+            // An actor made of it (the strongbox: P5_StrongBox is ITEM_Strongbox,
+            // shown by script once it is put down): its parts ride in the
+            // hand and the actor itself is left to appear where it stands.
+            a.carried_actor = -1;
+            if (a.carried.empty()) {
+                std::string key = f[0];
+                for (size_t q = 0; q < key.size(); ++q) key[q] = char(std::tolower(static_cast<unsigned char>(key[q])));
+                for (size_t k = 0; k < m_sc.actors.size() && a.carried.empty(); ++k) {
+                    const actor_inst& o = m_sc.actors[k];
+                    if (&o == &a || !o.is_fixture || o.item_count == 0) continue;
+                    std::string nm = o.name;
+                    for (size_t q = 0; q < nm.size(); ++q) nm[q] = char(std::tolower(static_cast<unsigned char>(nm[q])));
+                    if (nm.find(key) == std::string::npos) continue;
+                    for (size_t q = 0; q < o.item_count; ++q) a.carried.push_back(o.first_item + q);
+                    a.carried_actor = int(k);
+                }
+            }
             if (a.carried.empty()) find_item_mesh(f[0], a.carried);
             if (a.carried.empty()) std::printf("Item: can't find item %s\n", f[0].c_str());
+            return true;
+        }
+        if (a.carried_actor >= 0) {             // an actor's own parts: it shows itself
+            a.carried.clear();
+            a.carried_actor = -1;
             return true;
         }
         // Down where the hand holds it: the mesh moved from its centre to there.
@@ -9201,11 +9224,25 @@ int main(int argc, char** argv) {
                 const scene::pickup_def& pk = sc.pickups[size_t(taking.pickup)];
                 if ((taking.step >= 1 || taking.clips.empty()) && !taking.taken) {
                     taking.taken = true;
-                    if (pk.actor >= 0) sc.actors[size_t(pk.actor)].hidden = true;
+                    if (pk.actor >= 0) {
+                        actor_inst& pa = sc.actors[size_t(pk.actor)];
+                        pa.hidden = true;
+                        // An item with a grasp clip of its own (the strongbox) is
+                        // held in the hand until the finish clip puts it away.
+                        if (pk.argv.size() > 5 && !pk.argv[5].empty() && pa.item_count > 0) {
+                            player->carried.clear();
+                            for (size_t q = 0; q < pa.item_count; ++q) player->carried.push_back(pa.first_item + q);
+                            player->carried_actor = pk.actor;
+                            player->carry_joint = -1;
+                            for (size_t j = 0; j < player->joint_names.size(); ++j)
+                                if (player->joint_names[j] == "RHand") { player->carry_joint = int(j); break; }
+                        }
+                    }
                     play_sound("PRNpickup", lt.translate, 10.0f, false);
                 }
                 if (taking.step + 1 >= taking.clips.size() && !taking.applied) {
                     taking.applied = true;
+                    if (player->carried_actor == pk.actor && pk.actor >= 0) { player->carried.clear(); player->carried_actor = -1; }
                     pickup_apply(combat, sc, *player, pk, game_time);
                     const bool code = pk.argv.size() > 2 && equals_nocase(pk.argv[2], "reload");
                     if (!code && pk.argv.size() > 3 && !pk.argv[3].empty()) sc.script.execute(pk.argv[3], 0);
@@ -9777,8 +9814,7 @@ int main(int argc, char** argv) {
                             lt.translate[0] = sp[0];
                             lt.translate[1] = gy;
                             lt.translate[2] = sp[2];
-                            const float fx2 = c[0] - sp[0], fz2 = c[2] - sp[2];
-                            player_yaw = fx2 * fx2 + fz2 * fz2 > 0.0025f ? std::atan2(fx2, fz2) : syaw;
+                            player_yaw = syaw;      // the trap's own facing, not toward its volume's centre
                         }
                     }
                     action_started = true;
@@ -10344,17 +10380,12 @@ int main(int argc, char** argv) {
                 }
                 // Sheathed: the sword rides in the scabbard on his back.
                 if (is_prince(ai) && ai.armed && !ai.weapon_shown && ai.scabbard_joint >= 0 && ai.skinned) {
-                    std::map<std::string, std::vector<size_t> >::const_iterator si = sc.weapons.find(ai.weapon);
+                    // OtherWeapons.K2A's ScabbardSword: the sword as sheathed, modelled
+                    // for the Prince's Scabbard bone (WeaponParameters 0x4CBA43).
+                    std::map<std::string, std::vector<size_t> >::const_iterator si = sc.weapons.find("ScabbardSword");
                     if (si != sc.weapons.end()) {
                         k2::engine::transform t0, t1;
-                        // The scabbard bone leans the sword's +z blade forward; hang it
-                        // hilt up, tip down and back: turn 64 degrees about the bone's x.
-                        k2::engine::transform sj, hang;
-                        const float cs = 0.4384f, sn = 0.8988f;   // cos, sin of 64 deg
-                        hang.rotate[4] = cs;  hang.rotate[5] = -sn;
-                        hang.rotate[7] = sn;  hang.rotate[8] = cs;
-                        k2::engine::transform_compose(ai.cur[size_t(ai.scabbard_joint)], hang, sj);
-                        k2::engine::transform_compose(aw, sj, t1);
+                        k2::engine::transform_compose(aw, ai.cur[size_t(ai.scabbard_joint)], t1);
                         float wm[16];
                         t1.to_matrix(wm);
                         gfx::set_model(wm);

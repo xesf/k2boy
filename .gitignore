@@ -6,3 +6,4 @@ build/
 web/data-index.txt
 build-release/
 build-vita/
+.ida-export/
