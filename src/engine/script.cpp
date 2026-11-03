@@ -225,17 +225,36 @@ std::string action_trap::pick(field f) const {
     if (size_t(f) >= m_argv.size()) return std::string();
     const std::string& a = m_argv[size_t(f)];
     if (a.find('{') == std::string::npos) return a;
-    // "{state:...}" blocks: the one for this state, its body without braces.
-    std::string la = a, key = "{" + m_state + ":";
-    for (size_t i = 0; i < la.size(); ++i) la[i] = char(std::tolower(static_cast<unsigned char>(la[i])));
-    for (size_t i = 0; i < key.size(); ++i) key[i] = char(std::tolower(static_cast<unsigned char>(key[i])));
-    const size_t at = la.find(key);
-    if (at == std::string::npos) return std::string();
-    const size_t start = at + key.size();
-    const size_t end = a.find('}', start);
-    std::string body = a.substr(start, end == std::string::npos ? std::string::npos : end - start);
-    while (!body.empty() && (body[body.size() - 1] == ';' || body[body.size() - 1] == ' ')) body.erase(body.size() - 1);
-    return body;
+    // As script_world::execute reads it (0x454DE5): items outside braces
+    // always count; of the "{state:items}" blocks, the first for this state.
+    std::string out;
+    bool matched = false;
+    size_t at = 0;
+    while (at < a.size()) {
+        if (a[at] == '{') {
+            const size_t close = a.find('}', at);
+            if (close == std::string::npos) break;
+            const std::string block = a.substr(at + 1, close - at - 1);
+            const size_t colon = block.find(':');
+            if (!matched && colon != std::string::npos && equals_ci(block.substr(0, colon), m_state)) {
+                if (!out.empty() && out[out.size() - 1] != ';') out += ';';
+                out += block.substr(colon + 1);
+                matched = true;
+            }
+            const size_t semi = a.find(';', close);
+            at = semi == std::string::npos ? a.size() : semi + 1;
+        } else {
+            const size_t semi = a.find(';', at);
+            const std::string item = a.substr(at, semi == std::string::npos ? std::string::npos : semi - at);
+            if (!item.empty()) {
+                if (!out.empty() && out[out.size() - 1] != ';') out += ';';
+                out += item;
+            }
+            at = semi == std::string::npos ? a.size() : semi + 1;
+        }
+    }
+    while (!out.empty() && (out[out.size() - 1] == ';' || out[out.size() - 1] == ' ')) out.erase(out.size() - 1);
+    return out;
 }
 
 bool action_trap::can_act() const {

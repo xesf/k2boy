@@ -1779,6 +1779,10 @@ public:
     }
 
     const std::string type;     // the K2_TRAP_NAME: "Crate", "Force", ...
+    // A node parented to this trap (a door's visible slab under its Force
+    // volume) rides along with it.
+    void add_follower(int item, int32_t node) { follower f = { item, node }; m_followers.push_back(f); }
+    int     item() const { return m_item; }
     float             box[6];   // K2_TRAP_BBOX at rest, engine space
     std::string       actor;    // whose skills a message can name (Door: argv1)
     float             pivot[3]; // K2_TRAP_PIVOT: a skill's rotation is about this
@@ -2179,9 +2183,13 @@ private:
 
     // Turned by `rot` (row-major) about the pivot, then moved by `off`.
     void pose(const float* rot, const float* off) {
-        m_sc.coll.set_node_transform(m_node, rot, pivot, off);
-        if (m_item < 0) return;
-        draw_item& di = m_sc.items[size_t(m_item)];
+        pose_part(m_node, m_item, rot, off);
+        for (size_t i = 0; i < m_followers.size(); ++i) pose_part(m_followers[i].node, m_followers[i].item, rot, off);
+    }
+    void pose_part(int32_t node, int item, const float* rot, const float* off) {
+        m_sc.coll.set_node_transform(node, rot, pivot, off);
+        if (item < 0) return;
+        draw_item& di = m_sc.items[size_t(item)];
         // world = R (p - pivot) + pivot + off, as a column-major 4x4.
         float* m = di.model;
         for (int c = 0; c < 3; ++c)
@@ -2199,7 +2207,15 @@ private:
         if (m_item >= 0)
             for (int k = 0; k < 3; ++k) m_sc.items[size_t(m_item)].offset[k] = off[k];
         m_sc.coll.set_node_offset(m_node, off);
+        for (size_t i = 0; i < m_followers.size(); ++i) {
+            if (m_followers[i].item >= 0)
+                for (int k = 0; k < 3; ++k) m_sc.items[size_t(m_followers[i].item)].offset[k] = off[k];
+            m_sc.coll.set_node_offset(m_followers[i].node, off);
+        }
     }
+
+    struct follower { int item; int32_t node; };
+    std::vector<follower>         m_followers;
 
     scene&                        m_sc;
     int                           m_item;
@@ -3009,6 +3025,8 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
     }
 
     size_t total_v = 0;
+    std::map<std::string, scene_trap*> trap_by_node;      // for children that ride a parent trap
+    std::vector<std::pair<scene_trap*, std::string> > riders;
     for (size_t i = 0; i < f.nodes.size(); ++i) {
         const assets::k2a_node& n = f.nodes[i];
         if (!n.has_mesh) continue;
@@ -3171,7 +3189,9 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
                 k2::engine::action_trap* a = new k2::engine::action_trap(
                     sc.script, n.name, hdr, n.trap.argv, vol);
                 a->set_center(n.trap.center);
-                a->set_stand(n.trap.pivot, n.trap.pivot_angle);
+                // The turn is about the placement's axis: a turn about +y by a faces
+                // yaw -a (the cranes and the strongbox stand facing their trap), one about -y by a faces +a.
+                a->set_stand(n.trap.pivot, -n.trap.pivot_angle * (n.trap.pivot_axis[1] < 0.0f ? -1.0f : 1.0f));
                 sc.actions.push_back(a);
                 t = a;
             } else if (n.trap.name == "Messenger") {
@@ -3240,6 +3260,8 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
                     st->crash_skill  = pick::arg(a, 4, "Crash");
                 }
                 t = st;
+                trap_by_node[n.name] = st;
+                if (n.trap.name == "Generic" && n.parent != "ROOT" && !n.parent.empty()) riders.push_back(std::make_pair(st, n.parent));
             }
             if (n.trap.name == "Water") {
                 scene::water_area wa;
@@ -3267,6 +3289,12 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
                 !(n.trap.name == "Fixture" && n.trap.argv.size() > 1 && !n.trap.argv[1].empty()))
                 sc.script.add(t);
         }
+    }
+    // A static piece parented to a moving trap goes where it goes.
+    for (size_t r = 0; r < riders.size(); ++r) {
+        std::map<std::string, scene_trap*>::const_iterator p = trap_by_node.find(riders[r].second);
+        if (p != trap_by_node.end() && p->second->type != "Generic")
+            p->second->add_follower(riders[r].first->item(), riders[r].first->coll_node());
     }
     if (collide) sc.coll.build();
 
@@ -10319,7 +10347,14 @@ int main(int argc, char** argv) {
                     std::map<std::string, std::vector<size_t> >::const_iterator si = sc.weapons.find(ai.weapon);
                     if (si != sc.weapons.end()) {
                         k2::engine::transform t0, t1;
-                        k2::engine::transform_compose(aw, ai.cur[size_t(ai.scabbard_joint)], t1);
+                        // The scabbard bone leans the sword's +z blade forward; hang it
+                        // hilt up, tip down and back: turn 64 degrees about the bone's x.
+                        k2::engine::transform sj, hang;
+                        const float cs = 0.4384f, sn = 0.8988f;   // cos, sin of 64 deg
+                        hang.rotate[4] = cs;  hang.rotate[5] = -sn;
+                        hang.rotate[7] = sn;  hang.rotate[8] = cs;
+                        k2::engine::transform_compose(ai.cur[size_t(ai.scabbard_joint)], hang, sj);
+                        k2::engine::transform_compose(aw, sj, t1);
                         float wm[16];
                         t1.to_matrix(wm);
                         gfx::set_model(wm);
