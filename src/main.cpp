@@ -2955,6 +2955,12 @@ void prefetch_rooms(const std::vector<std::string>& paths) {
                 k2::jobs::worker_count());
 }
 
+static bool lower_name_has(const std::string& name, const char* what) {
+    std::string l = name;
+    for (size_t i = 0; i < l.size(); ++i) l[i] = char(std::tolower(static_cast<unsigned char>(l[i])));
+    return l.find(what) != std::string::npos;
+}
+
 bool append_scene(const char* path, scene& sc, bool collide = true) {
     assets::k2a_file f;
     std::map<std::string, assets::k2a_file>::iterator pre = g_parsed_k2a.find(path);
@@ -3059,10 +3065,34 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
         assets::k2a_build_mesh(n, vb, ib);
         if (vb.empty() || ib.empty()) continue;
 
+        // A "fake" stand-in (Ivory Tower's startroom_fakestairlanding_walls03) that
+        // fills an Aperture: it shows through the portal what the next room holds
+        // while that room is not loaded. All rooms are loaded here, so it only
+        // walls the exit up.
+        if (!n.has_trap && lower_name_has(n.name, "fake")) {
+            float mn[3] = { 1e30f, 1e30f, 1e30f }, mx[3] = { -1e30f, -1e30f, -1e30f };
+            for (size_t q = 0; q < vb.size(); ++q) {
+                const float* v = &vb[q].x;
+                for (int c = 0; c < 3; ++c) { mn[c] = std::min(mn[c], v[c]); mx[c] = std::max(mx[c], v[c]); }
+            }
+            bool fills = false;
+            for (size_t q = 0; q < f.nodes.size() && !fills; ++q) {
+                if (!f.nodes[q].has_trap || f.nodes[q].trap.name != "Aperture") continue;
+                const float* b = f.nodes[q].trap.bbox;
+                fills = true;
+                for (int c = 0; c < 3; ++c)
+                    if (mn[c] < b[c] - 0.6f || mx[c] > b[c + 3] + 0.6f) fills = false;
+            }
+            if (fills) continue;
+        }
+
         // Trigger volumes are not room geometry: keep them out of the bounds so
         // a large Area trap cannot throw off camera framing. See the note below
         // on why a trap block alone is not enough to classify a node.
-        const bool is_volume = n.has_trap && n.material_ref < 0;
+        // An Aperture is a portal between rooms (a NiCollisionSwitch the
+        // original never draws or collides with); Ivory Tower models its
+        // doorways with a textured quad, which filled the first exit.
+        const bool is_volume = n.has_trap && (n.material_ref < 0 || n.trap.name == "Aperture");
         // Every trap's argv[0] carries Visible and Collideable (0x454A41).
         // An invisible trap is not drawn; it joins the trigger-volume view.
         k2::engine::trap_header hdr;
