@@ -14,8 +14,7 @@ make vita                       # → build-vita/k2boy.vpk  (VitaSDK at $VITASDK
 - Copy the retail install to `ux0:data/k2boy/data/` (the same tree `make play` reads, about 880 MB).
 - Saves, settings, `log.txt` and `err.txt` are written to `ux0:data/k2boy/`.
 
-The LiveArea art (icon, background, start image) is made from the retail data at build time by
-`tools/vita_sce_sys.py` (needs Pillow), so no game art is kept in the repository.
+The LiveArea art (icon, background, start image) and template are in `platforms/vita/sce_sys`.
 
 ## Shaders
 

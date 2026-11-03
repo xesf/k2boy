@@ -34,7 +34,6 @@ endif()
 
 set(ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../..)
 set(SRC ${ROOT}/src)
-set(DATA "${ROOT}/data" CACHE PATH "retail install, for the LiveArea art")
 
 set(K2_SOURCES
     ${SRC}/main.cpp
@@ -96,15 +95,8 @@ target_link_libraries(k2boy
     m
 )
 
-# LiveArea art, made from platforms/vita/art (tools/vita_sce_sys.py).
-set(SYS ${CMAKE_CURRENT_BINARY_DIR}/sce_sys)
-add_custom_command(
-    OUTPUT ${SYS}/icon0.png ${SYS}/livearea/contents/bg.png ${SYS}/livearea/contents/startup.png
-    COMMAND python3 ${ROOT}/tools/vita_sce_sys.py ${CMAKE_CURRENT_SOURCE_DIR}/art ${SYS}
-    DEPENDS ${ROOT}/tools/vita_sce_sys.py ${CMAKE_CURRENT_SOURCE_DIR}/art/pop3d-heroes.jpg
-            ${CMAKE_CURRENT_SOURCE_DIR}/art/pop3d-grid.jpg ${CMAKE_CURRENT_SOURCE_DIR}/art/pop3d-logo.png ${CMAKE_CURRENT_SOURCE_DIR}/art/pop3d-icon.png
-    COMMENT "LiveArea art")
-add_custom_target(k2boy_sce_sys DEPENDS ${SYS}/icon0.png)
+# LiveArea art and template: platforms/vita/sce_sys.
+set(SYS ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys)
 
 # Compiled shaders, once there are some (see gfx_gxm.cpp): packaged as
 # app0:shaders/*.gxp. Without them the game compiles its own on the device.
@@ -122,7 +114,6 @@ vita_create_vpk(k2boy.vpk K2BY00001 eboot.bin
     FILE ${SYS}/icon0.png sce_sys/icon0.png
          ${SYS}/livearea/contents/bg.png sce_sys/livearea/contents/bg.png
          ${SYS}/livearea/contents/startup.png sce_sys/livearea/contents/startup.png
-         ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/livearea/contents/template.xml sce_sys/livearea/contents/template.xml
+         ${SYS}/livearea/contents/template.xml sce_sys/livearea/contents/template.xml
          ${GXP_FILES}
 )
-add_dependencies(k2boy.vpk-vpk k2boy_sce_sys)

@@ -39,7 +39,7 @@ jobs:
       - name: Tools
         run: |
           apt-get update -qq
-          apt-get install -y -qq python3-pil cmake make
+          apt-get install -y -qq cmake make
       - name: Build
         run: |
           cmake -S platforms/vita -B build-vita -DCMAKE_BUILD_TYPE=Release

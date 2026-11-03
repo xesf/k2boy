@@ -245,8 +245,8 @@ data/             your retail install (git-ignored)
   traced yet, the code says so.
 - **No third-party dependencies.** Codecs, formats and the font rasterizer are written in-tree or
   ported in-tree from GPL-3 sources. Only the platform's own system libraries are used.
-- **No game data in the repository.** Everything comes from the user's install at run time,
-  including the Vita's LiveArea art, which is generated at build time.
+- **No game data in the repository.** Everything comes from the user's install at run time.
+  The Vita's LiveArea art (`platforms/vita/sce_sys`) is promotional artwork.
 
 ## Credits and licence
 
