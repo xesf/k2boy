@@ -140,6 +140,26 @@ def main():
                    'reimplemented - see `docs/plan/03-reimplementation.md`. Progress is better '
                    'read per subsystem below.\n')
 
+    fs = os.path.join(HERE, 'docs', 'reference', 'function-status.json')
+    if os.path.exists(fs):
+        c = json.load(open(fs))['counts']
+        tot = sum(c.values())
+        need = c.get('ported', 0) + c.get('needed', 0)
+        out.append('## What we can skip\n')
+        out.append('Every function is tagged by `python3 tools/classify.py` '
+                   '(`docs/reference/function-status.json`).\n')
+        out.append('| Status | Count | Share | Meaning |')
+        out.append('|---|---:|---:|---|')
+        for k, m in (('skip', 'library, middleware, dormant VM, tiny stubs, code only skip code calls'),
+                     ('ported', 'an address our `src/` cites'),
+                     ('needed', 'game code reached from ported or project-named code; not ported yet'),
+                     ('unknown', 'no static caller and no vtable class: triage by hand')):
+            out.append(f'| {k} | {c.get(k, 0):,} | {100.0 * c.get(k, 0) / tot:.1f}% | {m} |')
+        out.append('')
+        out.append(f'Of the {need:,} functions we need, **{100.0 * c.get("ported", 0) / need:.1f}%** '
+                   'are ported. The count counts citations in comments, so it undercounts '
+                   'code that was ported without naming an address.\n')
+
     out.append('## File formats\n')
     out.append('| Format | Status | Notes |')
     out.append('|---|---|---|')

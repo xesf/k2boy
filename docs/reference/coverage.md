@@ -13,6 +13,19 @@ Regenerate with `python3 tools/coverage.py`. Subsystem percentages are judgement
 
 The headline number is deliberately unflattering. Most of the binary is NetImmerse and Motivate middleware that does not need naming to be reimplemented - see `docs/plan/03-reimplementation.md`. Progress is better read per subsystem below.
 
+## What we can skip
+
+Every function is tagged by `python3 tools/classify.py` (`docs/reference/function-status.json`).
+
+| Status | Count | Share | Meaning |
+|---|---:|---:|---|
+| skip | 24,430 | 61.5% | library, middleware, dormant VM, tiny stubs, code only skip code calls |
+| ported | 147 | 0.4% | an address our `src/` cites |
+| needed | 4,969 | 12.5% | game code reached from ported or project-named code; not ported yet |
+| unknown | 10,149 | 25.6% | no static caller and no vtable class: triage by hand |
+
+Of the 5,116 functions we need, **2.9%** are ported. The count counts citations in comments, so it undercounts code that was ported without naming an address.
+
 ## File formats
 
 | Format | Status | Notes |
