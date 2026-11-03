@@ -96,13 +96,14 @@ target_link_libraries(k2boy
     m
 )
 
-# LiveArea art, made from the retail install (tools/vita_sce_sys.py).
+# LiveArea art, made from platforms/vita/art (tools/vita_sce_sys.py).
 set(SYS ${CMAKE_CURRENT_BINARY_DIR}/sce_sys)
 add_custom_command(
     OUTPUT ${SYS}/icon0.png ${SYS}/livearea/contents/bg.png ${SYS}/livearea/contents/startup.png
-    COMMAND python3 ${ROOT}/tools/vita_sce_sys.py ${DATA} ${SYS}
-    DEPENDS ${ROOT}/tools/vita_sce_sys.py
-    COMMENT "LiveArea art from ${DATA}")
+    COMMAND python3 ${ROOT}/tools/vita_sce_sys.py ${CMAKE_CURRENT_SOURCE_DIR}/art ${SYS}
+    DEPENDS ${ROOT}/tools/vita_sce_sys.py ${CMAKE_CURRENT_SOURCE_DIR}/art/pop3d-heroes.jpg
+            ${CMAKE_CURRENT_SOURCE_DIR}/art/pop3d-grid.jpg ${CMAKE_CURRENT_SOURCE_DIR}/art/pop3d-logo.png ${CMAKE_CURRENT_SOURCE_DIR}/art/pop3d-icon.png
+    COMMENT "LiveArea art")
 add_custom_target(k2boy_sce_sys DEPENDS ${SYS}/icon0.png)
 
 # Compiled shaders, once there are some (see gfx_gxm.cpp): packaged as
