@@ -10192,16 +10192,28 @@ int main(int argc, char** argv) {
                     for (int k = 0; k < 3; ++k) { cam.pos[k] = w.translate[k] + camera_msgs.pos[k]; at[k] = camera_msgs.look[k]; }
                 } else {
                     const float* o = w.translate;
+                    const float* rot = w.rotate;
                     if (!camera_msgs.subject.empty())
                         for (size_t i = 0; i < sc.actors.size(); ++i)
                             if (sc.actors[i].node && equals_nocase(sc.actors[i].script_name, camera_msgs.subject.c_str())) {
                                 o = sc.actors[i].node->world().translate;
+                                rot = sc.actors[i].node->world().rotate;
                                 break;
                             }
                     const bool fixed = camera_msgs.mode == camera_target::SECURITY;
+                    // "follow,pg2Yell,(0,1.5,-3)(0,1.5,0)": the offsets are in the
+                    // subject's own frame, +z the way he faces - three units behind
+                    // him, or "(0,1,5)" five in front looking back. A security
+                    // camera's aim point stays a plain offset (always straight up).
+                    struct local { static void to_world(const float* r, const float* v, float* out) {
+                        for (int i = 0; i < 3; ++i) out[i] = r[i * 3] * v[0] + r[i * 3 + 1] * v[1] + r[i * 3 + 2] * v[2];
+                    } };
+                    float po[3], lo[3];
+                    if (fixed) { for (int k = 0; k < 3; ++k) { po[k] = camera_msgs.pos[k]; lo[k] = camera_msgs.look[k]; } }
+                    else { local::to_world(rot, camera_msgs.pos, po); local::to_world(rot, camera_msgs.look, lo); }
                     for (int k = 0; k < 3; ++k) {
-                        cam.pos[k] = fixed ? camera_msgs.pos[k] : o[k] + camera_msgs.pos[k];
-                        at[k] = o[k] + camera_msgs.look[k];
+                        cam.pos[k] = fixed ? po[k] : o[k] + po[k];
+                        at[k] = o[k] + lo[k];
                     }
                 }
                 const float d[3] = { at[0] - cam.pos[0], at[1] - cam.pos[1], at[2] - cam.pos[2] };
