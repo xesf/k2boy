@@ -1,0 +1,68 @@
+name: Release
+
+# Push a tag such as v0.1.0 to build and publish a release; run by hand to
+# only build (artifacts are kept for the run, nothing is published).
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-release -j"$(sysctl -n hw.ncpu)"
+      - name: Package
+        run: |
+          mkdir dist
+          cp build-release/k2boy README.md LICENSE dist/
+          tar -C dist -czf k2boy-macos.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: k2boy-macos
+          path: k2boy-macos.tar.gz
+
+  vita:
+    runs-on: ubuntu-latest
+    container: vitasdk/vitasdk:latest
+    env:
+      VITASDK: /usr/local/vitasdk
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq python3-pil cmake make
+      - name: Build
+        run: |
+          cmake -S platforms/vita -B build-vita -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-vita -j"$(nproc)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: k2boy-vita
+          path: build-vita/k2boy.vpk
+
+  release:
+    needs: [macos, vita]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" \
+            --notes-file CHANGELOG.md --verify-tag \
+            artifacts/k2boy-macos.tar.gz artifacts/k2boy.vpk
