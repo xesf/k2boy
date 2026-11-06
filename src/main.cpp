@@ -5722,10 +5722,6 @@ void combat_init(combat_state& cs, scene& sc, const k2::engine::fight_params& fp
 void prince_damage(combat_state& cs, scene& sc, actor_inst& p, int dmg, int dir, double now,
                    const char* death = 0) {
     if (cs.dead_since >= 0.0) return;
-    if (dmg > 0 && potion_state::on(g_potions.shield_until, now)) {       // Shield potion
-        play_sound("gblswordclank", p.node->local.translate, 14.0f, false);
-        return;
-    }
     p.health -= dmg;
     play_sound("GBLpfiteinjur", p.node->local.translate, 14.0f, false);
     if (p.health <= 0) {
@@ -5795,7 +5791,7 @@ void specials_update(scene& sc, combat_state& cs, actor_inst& prince, double now
 void prince_fight_damage(combat_state& cs, scene& sc, actor_inst& p, int dmg, int dir, double now) {
     if (cs.dead_since >= 0.0) return;
     if (cs.prince_dying_until >= now) { prince_damage(cs, sc, p, p.health, dir, now); cs.prince_dying_until = -1.0; return; }
-    if (!potion_state::on(g_potions.shield_until, now) && p.health - dmg <= 1) {
+    if (p.health - dmg <= 1) {
         p.health = 1;
         p.stance = 0;
         play_once(sc, p, "CombatDying_G2", now, actor_yaw(p), true);
@@ -6036,7 +6032,7 @@ void enemy_update(combat_state& cs, scene& sc, enemy_ai& e, actor_inst& prince,
             d <= combat_tuning::REACH && in_front) {
             const int dir = e.hit.dir;
             // Blocked only by a block the same way (0x4ACE54), or the Guard potion.
-            if ((cs.prince_blocking && cs.prince_block_dir == dir) || potion_state::on(g_potions.guard_until, now)) {
+            if ((cs.prince_blocking && cs.prince_block_dir == dir)) {
                 play_sound("gblswordclank", p, 14.0f, false);
                 const std::string rec = std::string("CombatBlocked") + k_dir_names[dir] + e.set;
                 play_once(sc, a, rec, now, actor_yaw(a), false);
@@ -6081,8 +6077,10 @@ void enemy_update(combat_state& cs, scene& sc, enemy_ai& e, actor_inst& prince,
     const float charge = float(fp.enemy("distApproachEnemy", 5.0));
     const float periph = float(fp.enemy("peripheral", 30.0)) * 3.14159265f / 180.0f;
     // Camouflaged, he is seen only from distCamoflauge (1.5).
-    const bool  camo = potion_state::on(g_potions.camo_until, now) && e.state == enemy_ai::PATROL &&
-                       d > float(fp.enemy("distCamoflauge", 1.5));
+    // The Guard potion makes him a zombie to them (0x4CA44F): they never see him.
+    const bool  zombie = potion_state::on(g_potions.guard_until, now);
+    const bool  camo = zombie || (potion_state::on(g_potions.camo_until, now) && e.state == enemy_ai::PATROL &&
+                       d > float(fp.enemy("distCamoflauge", 1.5)));
     // Guard__CanSeePrince (0x4A777C): within 2 up or down; whatever is in
     // front within 3 is seen outright, beyond that only inside the +-30 degree
     // cone and with a clear line between the eyes (guard + 2.0, Prince + 0.5);
@@ -6137,7 +6135,7 @@ void enemy_update(combat_state& cs, scene& sc, enemy_ai& e, actor_inst& prince,
     case enemy_ai::CHARGE:
         // Lost him: out of sight and five or more away (Manhattan) - back on patrol;
         // a charge otherwise runs him down wherever he goes.
-        if (!prince_available || (std::fabs(dx) + std::fabs(dz) >= 5.0f && !clear_line(0.5f)) || d > 25.0f) {
+        if (!prince_available || zombie || (std::fabs(dx) + std::fabs(dz) >= 5.0f && !clear_line(0.5f)) || d > 25.0f) {
             e.state = enemy_ai::PATROL;
             break;
         }
@@ -8823,6 +8821,8 @@ int main(int argc, char** argv) {
                 } else if (pp && combat.dead_since < 0.0 && body_hit::test(ar.p, ar.d, travel, pp)) {
                     for (size_t a = 0; a < sc.actors.size(); ++a)
                         if (is_prince(sc.actors[a])) {
+                            // The Shield potion stops arrows and nothing else (0x4A4E26).
+                            if (potion_state::on(g_potions.shield_until, game_time)) break;
                             prince_damage(combat, sc, sc.actors[a], arrow_tuning::DAMAGE, DIR_CENTER, game_time);
                             break;
                         }
