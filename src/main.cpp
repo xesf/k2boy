@@ -5551,6 +5551,8 @@ struct enemy_ai {
     double      dying_until = 0.0;
     bool        last_feint = false;     // never two feints in a row (fight+0x130)
     bool        taunted = false;        // CombatTaunt on first engaging
+    int         budget = 32768;         // attack schedule (fight+0x180) and its base time (+0x178)
+    double      budget_base = 0.0;
     // Fight__PickAIResponse (0x4AC272): the Prince's repeats and quick swings are punished.
     int         last_dir = -1;          // the direction of the Prince's last swing at him
     double      same_dir_mul = 1.0;     // fight+0x15C: x0.4 per repeat, back to 1 on a new direction
@@ -6255,12 +6257,21 @@ void enemy_update(combat_state& cs, scene& sc, enemy_ai& e, actor_inst& prince,
                                + fp.fight("Unblocked Attack", 0.0667);
                 e.busy_until = now + skill_seconds(sc, a, atk);
             }
-            // Aggression is his pause between attacks, by skill; now and
-            // then he goes again at once (Double Attack Percentage).
+            // Fight__ScheduleNextAIAttack (0x4AE7FD): a budget of Aggression x 100 per attack, spent
+            // at a uniform random point past the base time - a long-run mean of one attack per
+            // Aggression seconds, and sometimes two almost back to back. (Double Attack Percentage
+            // only weights the blades' super attack.)
             const double aggr = skill_param(fp, e.skill, "Aggression", 2.0);
-            e.next_attack = now + aggr * (0.75 + 0.5 * frand());
-            if (frand() * 100.0 < skill_param(fp, e.skill, "Double Attack Percentage", 10.0))
-                e.next_attack = e.busy_until;
+            if (aggr <= 0.0) e.next_attack = 1.0e30;
+            else {
+                if (e.budget >= 32768) { e.budget = 0; e.budget_base = now; }
+                e.budget += int(aggr * 100.0);
+                e.next_attack = e.budget_base + double(std::rand() % std::max(1, e.budget)) * 0.01;
+                if (e.next_attack < now) {
+                    e.budget = std::max(0, int((e.budget_base - now) * 100.0) + e.budget);
+                    e.budget_base = now;
+                }
+            }
         }
         break;
     }
