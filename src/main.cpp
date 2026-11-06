@@ -6260,7 +6260,7 @@ void prince_hit_resolve(combat_state& cs, scene& sc, actor_inst& p, double now) 
         play_sound("gblswordclank", a.node->local.translate, 14.0f, false);
         play_once(sc, a, std::string("CombatBlock") + k_dir_names[dir] + best->set, now, actor_yaw(a), false);
         play_once(sc, p, std::string("CombatBlocked") + k_dir_names[dir] + "_G2", now, actor_yaw(p), false);
-        best->busy_until = now + fp.fight("Recover From Block", 0.0667);
+        best->busy_until = now + fp.fight("Computer Recover From Block", 0.3667);   // the AI's own key (guard-ai.md 7.2)
         cs.prince_busy_until = std::max(cs.prince_busy_until,
             now + fp.fight(std::string("Sword Blocked ") + k_dir_names[dir] + " Attack Recover", 0.367));
         // His left or right blocked: the guard may counter on that side
