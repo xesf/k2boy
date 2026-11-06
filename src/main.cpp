@@ -649,6 +649,11 @@ struct draw_item {
 // one node per part, switched off until its actor says otherwise.
 bool g_part_collision = false;
 
+// Where the camera looked last frame, so a gliding scripted camera starts from it.
+struct prev_view_t { bool valid = false; float pos[3] = { 0, 0, 0 }, fwd[3] = { 0, 0, 1 }; };
+prev_view_t g_prev_view;
+bool* g_cam_glide_on = 0;       // the scripted camera's glide state, cleared on the chase camera
+
 #ifdef __vita__
 // vita-elf-create wants 2.5 KB of room after the code segment for its own
 // tables, and a build that ends right at the data segment's start fails
@@ -2248,7 +2253,11 @@ public:
 
     bool receive(const std::string& msg, k2::engine::script_target*) {
         if (msg.compare(0, 7, "snooze:") == 0) {
-            snooze_until = m_world.now() + std::atof(msg.c_str() + 7);
+            // "snooze:t[,camera lock,mask]": a negative time is for good; an
+            // EnemyStart ignores it (camera-logic.md 5).
+            if (!is_prince(m_sc.actors[m_actor])) return true;
+            const double t = std::atof(msg.c_str() + 7);
+            snooze_until = t < 0.0 ? 1.0e30 : m_world.now() + t;
             return true;
         }
         if (msg.compare(0, 8, "SkillAt:") == 0 || msg.compare(0, 8, "skillat:") == 0)
@@ -2621,9 +2630,17 @@ public:
         for (int k = 0; k < 3; ++k) pos[k] = look[k] = 0.0f;
     }
 
+    // The flag letters after the last ')' (or after the D): X snaps for one frame,
+    // otherwise the camera glides there (camera-logic.md 3.4).
+    static bool has_x(const std::string& s, size_t from) {
+        for (size_t i = from; i < s.size(); ++i) if (s[i] == 'X' || s[i] == 'x') return true;
+        return false;
+    }
     bool receive(const std::string& msg, k2::engine::script_target*) {
         if (msg.empty()) return false;
-        if (msg[0] == 'D' || msg[0] == 'd' || equals_nocase(msg, "#d")) { mode = DEFAULT; return true; }
+        if (msg[0] == 'D' || msg[0] == 'd' || equals_nocase(msg, "#d")) { mode = DEFAULT; snap = has_x(msg, 1); ++serial; return true; }
+        snap = has_x(msg, msg.rfind(')') == std::string::npos ? 0 : msg.rfind(')'));
+        ++serial;
         const size_t comma = msg.find(',');
         if (comma == std::string::npos) return false;
         std::string verb = msg.substr(0, comma);
@@ -2660,6 +2677,8 @@ public:
     }
 
     mode_t mode;
+    bool   snap = true;         // the last message had the X flag
+    unsigned serial = 0;        // counts accepted messages
     float  pos[3];      // TRIPOD: where; FOLLOW: offset from the Prince
     float  look[3];     // TRIPOD: at what; FOLLOW: what it looks at, also from the Prince
     std::string subject;    // FOLLOW: whom, when not the Prince
@@ -10189,7 +10208,21 @@ int main(int argc, char** argv) {
                 if (camera_msgs.mode == camera_target::TRIPOD) {
                     for (int k = 0; k < 3; ++k) { cam.pos[k] = camera_msgs.pos[k]; at[k] = camera_msgs.look[k]; }
                 } else if (camera_msgs.mode == camera_target::LOOK) {
-                    for (int k = 0; k < 3; ++k) { cam.pos[k] = w.translate[k] + camera_msgs.pos[k]; at[k] = camera_msgs.look[k]; }
+                    // "look,(A)(B)": A is taken in the frame that faces B from the Prince -
+                    // right, up, forward (camera-logic.md 3.3).
+                    float f[3] = { camera_msgs.look[0] - w.translate[0], camera_msgs.look[1] - w.translate[1],
+                                   camera_msgs.look[2] - w.translate[2] };
+                    const float fl = std::sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
+                    if (fl > 1e-5f) for (int k = 0; k < 3; ++k) f[k] /= fl; else { f[0] = 0; f[1] = 0; f[2] = 1; }
+                    float r[3] = { f[2], 0.0f, -f[0] };         // up x forward, up = +y
+                    const float rl = std::sqrt(r[0] * r[0] + r[2] * r[2]);
+                    if (rl > 1e-5f) { r[0] /= rl; r[2] /= rl; } else { r[0] = 1; r[2] = 0; }
+                    const float u[3] = { f[1] * r[2] - f[2] * r[1], f[2] * r[0] - f[0] * r[2], f[0] * r[1] - f[1] * r[0] };
+                    const float* A = camera_msgs.pos;
+                    for (int k = 0; k < 3; ++k) {
+                        cam.pos[k] = w.translate[k] + r[k] * A[0] + u[k] * A[1] + f[k] * A[2];
+                        at[k] = camera_msgs.look[k];
+                    }
                 } else {
                     const float* o = w.translate;
                     const float* rot = w.rotate;
@@ -10216,6 +10249,30 @@ int main(int argc, char** argv) {
                         at[k] = o[k] + lo[k];
                     }
                 }
+                // A message without X glides there on a critically damped spring (k = 10,
+                // CameraLogic 0x40DDBB); with X the first frame cuts.
+                {
+                    static unsigned sm_serial = ~0u;
+                    static bool sm_active = false;
+                    static float sm_pos[3], sm_at[3];
+                    if (!sm_active || camera_msgs.serial != sm_serial) {
+                        sm_serial = camera_msgs.serial;
+                        if (camera_msgs.snap || !g_prev_view.valid) {
+                            for (int k = 0; k < 3; ++k) { sm_pos[k] = cam.pos[k]; sm_at[k] = at[k]; }
+                        } else {
+                            for (int k = 0; k < 3; ++k) {
+                                sm_pos[k] = g_prev_view.pos[k];
+                                sm_at[k]  = g_prev_view.pos[k] + g_prev_view.fwd[k] * 10.0f;
+                            }
+                        }
+                        sm_active = true;
+                    } else {
+                        const float a = 1.0f - std::exp(-10.0f * float(dt));
+                        for (int k = 0; k < 3; ++k) { sm_pos[k] += (cam.pos[k] - sm_pos[k]) * a; sm_at[k] += (at[k] - sm_at[k]) * a; }
+                    }
+                    for (int k = 0; k < 3; ++k) { cam.pos[k] = sm_pos[k]; at[k] = sm_at[k]; }
+                    g_cam_glide_on = &sm_active;
+                }
                 const float d[3] = { at[0] - cam.pos[0], at[1] - cam.pos[1], at[2] - cam.pos[2] };
                 const float dl = std::sqrt(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
                 if (dl > 1e-5f) {
@@ -10226,8 +10283,11 @@ int main(int argc, char** argv) {
                     if (rl > 1e-5f) { right[0] /= rl; right[2] /= rl; }
                 }
             } else {
+                if (g_cam_glide_on) *g_cam_glide_on = false;
                 camera_basis(cam, fwd, right);
             }
+            for (int k = 0; k < 3; ++k) { g_prev_view.pos[k] = cam.pos[k]; g_prev_view.fwd[k] = fwd[k]; }
+            g_prev_view.valid = true;
         } else {
             if (down[plat::KEY_E] || down[plat::KEY_SPACE]) mv[1] += 1.0f;
             if (down[plat::KEY_Q]) mv[1] -= 1.0f;
