@@ -5551,6 +5551,10 @@ struct enemy_ai {
     double      dying_until = 0.0;
     bool        last_feint = false;     // never two feints in a row (fight+0x130)
     bool        taunted = false;        // CombatTaunt on first engaging
+    // Fight__PickAIResponse (0x4AC272): the Prince's repeats and quick swings are punished.
+    int         last_dir = -1;          // the direction of the Prince's last swing at him
+    double      same_dir_mul = 1.0;     // fight+0x15C: x0.4 per repeat, back to 1 on a new direction
+    double      last_swing_at = -1e9;   // when that swing landed
 };
 
 struct combat_state {
@@ -6349,18 +6353,37 @@ void enemy_react(combat_state& cs, scene& sc, const float* pp, float yaw, double
         const float dx = q[0] - pp[0], dz = q[2] - pp[2];
         if (dx * dx + dz * dz > combat_tuning::REACH * combat_tuning::REACH * 1.5f) continue;
         if (angle_diff(std::atan2(dx, dz), yaw) > 1.2f) continue;
-        const double w[4] = { skill_param(fp, e.skill, "Blocks", 12), skill_param(fp, e.skill, "Wrong Blocks", 12),
-                              skill_param(fp, e.skill, "Did Nothings", 65), skill_param(fp, e.skill, "Late Attacks", 11) };
-        double r = frand() * (w[0] + w[1] + w[2] + w[3]);
+        // Buckets in the binary's order: Late, Wrong, Did Nothing, Block, Sneak. The first three
+        // shrink by m for a repeated direction (x0.4 each time) or a swing within Max Fast Attack
+        // Time (1.5 s) of the last (down to 0.75); Block takes whatever that frees up.
+        const int dir = cs.prince_hit.dir;
+        const double late0 = skill_param(fp, e.skill, "Late Attacks", 11), wrong0 = skill_param(fp, e.skill, "Wrong Blocks", 12),
+                     none0 = skill_param(fp, e.skill, "Did Nothings", 65), block0 = skill_param(fp, e.skill, "Blocks", 12),
+                     sneak = skill_param(fp, e.skill, "Sneak Attacks", 0);
+        const double total = late0 + wrong0 + none0 + block0 + sneak;
+        double m = 1.0;
+        const double fastmax = fp.fight("Max Fast Attack Time", 1.5), since = now - e.last_swing_at;
+        if (since < fastmax) m = 1.0 - (1.0 - since / fastmax) * 0.25;
+        if (dir == e.last_dir) e.same_dir_mul *= 0.4; else e.same_dir_mul = 1.0;
+        m *= e.same_dir_mul;
+        e.last_dir = dir;
+        e.last_swing_at = cs.prince_hit.at;
+        double rest = total - sneak;
+        const double late = std::min(std::floor(late0 * m), rest);   rest -= late;
+        const double wrong = std::min(std::floor(wrong0 * m), rest); rest -= wrong;
+        const double none = std::min(std::floor(none0 * m), rest);   rest -= none;
+        const double w[5] = { late, wrong, none, rest, sneak };
+        double r = frand() * total;
         int pick = 0;
-        while (pick < 3 && r >= w[pick]) { r -= w[pick]; ++pick; }
+        while (pick < 4 && r >= w[pick]) { r -= w[pick]; ++pick; }
+        // pick: 0 Late, 1 Wrong, 2 Did Nothing, 3 Block, 4 Sneak (answered like a late attack)
         const double lo = fp.fight("AI Min Block Delay", 0.15), hi = fp.fight("AI Max Block Delay", 0.433);
-        e.react_at = now + lo + (hi - lo) * frand();
+        e.react_at = now + (m < 1.0 ? 0.0 : lo + (hi - lo) * frand());   // a penalised block is instant
         // Too slow to raise the sword before it lands: it lands.
         const bool in_time = e.react_at <= cs.prince_hit.at && now >= e.busy_until && !a.scripted;
-        e.react = pick == 0 ? (in_time ? enemy_ai::R_BLOCK : enemy_ai::R_NONE)
+        e.react = pick == 3 ? (in_time ? enemy_ai::R_BLOCK : enemy_ai::R_NONE)
                 : pick == 1 ? enemy_ai::R_WRONG
-                : pick == 3 ? enemy_ai::R_LATE : enemy_ai::R_NONE;
+                : (pick == 0 || pick == 4) ? enemy_ai::R_LATE : enemy_ai::R_NONE;
     }
 }
 
