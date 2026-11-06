@@ -905,7 +905,8 @@ struct scene {
         std::string name; std::vector<std::string> argv; float pos[3];
         assets::k2a_trap trap;      // for placing its model
         int actor;                  // the model in actors, or -1
-        pickup_def() : actor(-1) {}
+        float node[3];              // the trap node's own position (engine space)
+        pickup_def() : actor(-1) { node[0] = node[1] = node[2] = 0.0f; }
     };
     std::vector<pickup_def> pickups;
     // Water traps' outlines: the surface mesh's triangles in xz (both
@@ -3041,8 +3042,10 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
             pd.trap = n.trap;
             pd.trap.node = n.name;
             for (int k = 0; k < 3; ++k) pd.pos[k] = (n.trap.bbox[k] + n.trap.bbox[k + 3]) * 0.5f;
+            pd.node[0] = n.pos[0]; pd.node[1] = n.pos[2]; pd.node[2] = -n.pos[1];
             if (std::getenv("K2_PICKUPS"))
-                std::printf("pickup %s at (%.2f %.2f %.2f) %s\n", n.name.c_str(), pd.pos[0], pd.pos[1], pd.pos[2],
+                std::printf("pickup %s at (%.2f %.2f %.2f) node (%.2f %.2f %.2f) %s\n", n.name.c_str(), pd.pos[0], pd.pos[1], pd.pos[2],
+                            pd.node[0], pd.node[1], pd.node[2],
                             pd.argv.size() > 1 ? pd.argv[1].c_str() : "");
             sc.pickups.push_back(pd);
         }
@@ -6985,7 +6988,7 @@ struct pickup {
 bool pickup_live(scene& sc, size_t i) {
     const std::string& nm = sc.pickups[i].name;
     for (size_t t = 0; t < sc.traps.size(); ++t)
-        if (sc.traps[t]->name() == nm) return sc.traps[t]->visible() && sc.traps[t]->enabled();
+        if (sc.traps[t]->name() == nm) return sc.traps[t]->enabled();   // CanUse (0x47F9F1) tests enabled only, not visibility
     return true;
 }
 
@@ -9298,8 +9301,19 @@ int main(int argc, char** argv) {
                 for (size_t i = 0; i < sc.pickups.size(); ++i) {
                     if (pickup_taken[i] || !pickup_live(sc, i)) continue;
                     const scene::pickup_def& pk = sc.pickups[i];
-                    const float dx = pk.pos[0] - lt.translate[0], dz = pk.pos[2] - lt.translate[2];
-                    if (dx * dx + dz * dz > 1.6f * 1.6f || std::fabs(pk.pos[1] - lt.translate[1]) > 2.0f) continue;
+                    // Pickup::CanUse (0x47F9F1): |dy| <= 0.15 (0.95 above the Prince
+                    // for a Table), within 1.5 on the ground and within a 0.8 dot of
+                    // the way he faces, measured from a point 0.5 ahead of him.
+                    bool table = false;
+                    for (size_t q = 0; q < pk.argv.size(); ++q) if (equals_nocase(pk.argv[q], "Table")) table = true;
+                    if (std::fabs(pk.node[1] - lt.translate[1] - (table ? 0.95f : 0.0f)) > 0.15f) continue;
+                    const float dx = pk.node[0] - lt.translate[0], dz = pk.node[2] - lt.translate[2];
+                    if (dx * dx + dz * dz >= 1.5f * 1.5f) continue;
+                    const float pfx = std::sin(player_yaw), pfz = std::cos(player_yaw);
+                    const float bx = pk.node[0] - (lt.translate[0] + pfx * 0.5f), bz = pk.node[2] - (lt.translate[2] + pfz * 0.5f);
+                    const float bl = std::sqrt(bx * bx + bz * bz);
+                    if (bl > 1e-4f && (bx * pfx + bz * pfz) / bl <= 0.8f) continue;
+                    std::printf("pickup: taking %s\n", pk.name.c_str());
                     pickup_taken[i] = true;
                     taking.begin(sc, *player, pk, int(i));
                     player_yaw = yaw_toward(lt.translate, pk.pos);
