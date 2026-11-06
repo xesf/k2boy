@@ -6193,7 +6193,13 @@ void enemy_update(combat_state& cs, scene& sc, enemy_ai& e, actor_inst& prince,
     case enemy_ai::FIGHT:
     case enemy_ai::RECOVER: {
         if (!prince_available) { e.state = enemy_ai::PATROL; a.stance = 0; break; }
-        if (d > combat_tuning::FIGHT_DIST * 1.6f) { e.state = enemy_ai::CHARGE; break; }
+        // StEnemyInContact (0x4AA95A): he gives up the duel only past 13 m (or 1.5 up or down),
+        // and follows a Prince who steps back until he is at S - 0.15 again, running beyond 3.5.
+        if (d > 13.0f || std::fabs(pp[1] - p[1]) > 1.5f) { e.state = enemy_ai::CHARGE; break; }
+        if (d > combat_tuning::FIGHT_DIST + 0.05f) {
+            steer(sc, a, pp, d > 3.5f, dt);
+            break;
+        }
         a.node->local.set_yaw(std::atan2(dx, dz));
         // At ready; woozy at a bottle or less (Fight__IdleAmbientOrWoozy 0x4AE60F).
         a.stance = a.health <= combat_tuning::BOTTLE ? find_actor_skill(sc, a, "CombatWoozy" + e.set) : 0;
