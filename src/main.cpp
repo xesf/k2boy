@@ -7361,6 +7361,7 @@ int main(int argc, char** argv) {
     bool use_menu = false;          // --menu: the title screens, Esc menu in play
     bool menu_in_game_only = false; // --menu-game: straight into play, Esc menu only
     int  start_health = -1, start_max_health = -1;   // --health H,MAX (from a save)
+    int  start_bow = -1, start_arrows = 0;           // --bow HAS,ARROWS (carried across a level)
     bool sounds_only = false;
     bool find_ledges = false;
     struct key_hold { std::string keys; double from, to; };
@@ -7438,6 +7439,8 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--menu-game") == 0) { use_menu = true; menu_in_game_only = true; }
         else if (std::strcmp(argv[i], "--health") == 0 && i + 1 < argc)
             std::sscanf(argv[++i], "%d,%d", &start_health, &start_max_health);
+        else if (std::strcmp(argv[i], "--bow") == 0 && i + 1 < argc)
+            std::sscanf(argv[++i], "%d,%d", &start_bow, &start_arrows);
         else if (std::strcmp(argv[i], "--sounds") == 0) sounds_only = true;
         else if (std::strcmp(argv[i], "--hold") == 0 && i + 1 < argc) {
             const std::string h = argv[++i];
@@ -8072,6 +8075,9 @@ int main(int argc, char** argv) {
                 sc.actors[i].max_health = start_max_health > 0 ? start_max_health : start_health;
                 sc.actors[i].health = start_health;
             }
+    if (start_bow >= 0)
+        for (size_t i = 0; i < sc.actors.size(); ++i)
+            if (is_prince(sc.actors[i])) { sc.actors[i].has_bow = start_bow != 0; sc.actors[i].arrows = start_arrows; }
     std::vector<bool> pickup_taken(sc.pickups.size(), false);
     pickup_seq taking;
     std::printf("combat: %zu fight.ini values, %zu enemy.dat values, %zu guards, %zu pickups\n",
@@ -8081,10 +8087,15 @@ int main(int argc, char** argv) {
     sc.script.add(&camera_msgs);
     // "game": "exit" ends the level (prison6's exit door: "delay,2,game,exit").
     struct game_target : public k2::engine::script_target {
-        bool exit_requested;
-        game_target() : script_target("game"), exit_requested(false) {}
+        bool exit_requested, win;
+        game_target() : script_target("game"), exit_requested(false), win(true) {}
         bool receive(const std::string& msg, k2::engine::script_target*) {
-            if (equals_nocase(msg, "exit")) { exit_requested = true; return true; }
+            // "exit[:Win|Lose]" (0x420ABE); only the finale says which.
+            if (msg.size() >= 4 && equals_nocase(msg.substr(0, 4), "exit")) {
+                exit_requested = true;
+                win = !(msg.size() > 5 && equals_nocase(msg.substr(5), "lose"));
+                return true;
+            }
             return false;
         }
     };
@@ -8351,12 +8362,40 @@ int main(int argc, char** argv) {
                 for (size_t q = 0; q < o.size(); ++q) o[q] = char(std::tolower(static_cast<unsigned char>(o[q])));
                 if (cur == o) next = k + 1;
             }
-            if (next < n) {
+            // The cutscene between levels (level-transitions.md 3.1): the NIS message
+            // a level posts, and the movie each one plays.
+            static const struct { const char* level; const char* movie; } nis[] = {
+                { "prisonfix", "cs02" }, { "cistern", "cs03" }, { "palace4", "cs04" }, { "cityanddocks", "cs05" },
+                { "dirig2", "cs06" }, { "dirigfinale", "cs07" }, { "ruins", "cs09" }, { "cliffs", "cs08" },
+                { "solar1", "cs10" }, { "moontemple", "cs11" } };
+            std::string movie;
+            for (size_t k = 0; k < sizeof(nis) / sizeof(nis[0]); ++k)
+                if (cur.find(std::string("\\") + nis[k].level + ".lvl") != std::string::npos) movie = nis[k].movie;
+            std::vector<std::string> extra;
+            if (cur.find("\\finale.lvl") != std::string::npos) {
+                // The finale ends the game: its movie by win or lose, then the menu.
+                extra.push_back("--movie"); extra.push_back("cs11");
+                extra.push_back("--movie"); extra.push_back(game_msgs.win ? "cs13" : "cs12");
+                extra.push_back("--menu");
+                std::printf("level: the game ends (%s)\n", game_msgs.win ? "win" : "lose");
+                relaunch(argc, argv, extra);
+            } else if (next < n) {
                 std::printf("level: exit to %s\n", order[next]);
-                std::vector<std::string> extra;
+                if (!movie.empty()) { extra.push_back("--movie"); extra.push_back(movie); }
                 extra.push_back("--level");
                 extra.push_back(order[next]);
                 if (use_menu) extra.push_back("--menu-game");
+                // What the Prince carries into the next level: health, the sword,
+                // the bow and its arrows (level-transitions.md 4.2).
+                for (size_t i = 0; i < sc.actors.size(); ++i)
+                    if (is_prince(sc.actors[i])) {
+                        char b[48];
+                        std::snprintf(b, sizeof(b), "%d,%d", sc.actors[i].health, sc.actors[i].max_health);
+                        extra.push_back("--health"); extra.push_back(b);
+                        if (sc.actors[i].armed) extra.push_back("--armed");
+                        std::snprintf(b, sizeof(b), "%d,%d", int(sc.actors[i].has_bow), sc.actors[i].arrows);
+                        extra.push_back("--bow"); extra.push_back(b);
+                    }
                 relaunch(argc, argv, extra);
             } else {
                 std::printf("level: exit with no level after %s\n", cur.c_str());
