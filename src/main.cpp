@@ -5551,6 +5551,7 @@ struct enemy_ai {
     double      dying_until = 0.0;
     bool        last_feint = false;     // never two feints in a row (fight+0x130)
     bool        taunted = false;        // CombatTaunt on first engaging
+    bool        inhibit_death = false;  // argv3: the DeathMsg script plays the death, not the generic clip
     int         budget = 32768;         // attack schedule (fight+0x180) and its base time (+0x178)
     double      budget_base = 0.0;
     // Fight__PickAIResponse (0x4AC272): the Prince's repeats and quick swings are punished.
@@ -5695,6 +5696,7 @@ void combat_init(combat_state& cs, scene& sc, const k2::engine::fight_params& fp
                     bottles = std::atoi(a1.c_str() + c2 + 1);
                 a.max_health = a.health = bottles * combat_tuning::BOTTLE;
             }
+            if (sp.argv.size() > 3) e.inhibit_death = equals_nocase(sp.argv[3], "true") || sp.argv[3] == "t" || sp.argv[3] == "T";
             if (sp.argv.size() > 4) e.on_death = sp.argv[4];
             if (sp.argv.size() > 5 && !sp.argv[5].empty()) {
                 e.start_loops = sp.argv[5][0] == '*';
@@ -5853,6 +5855,7 @@ void enemy_damage(combat_state& cs, scene& sc, enemy_ai& e, int dmg, int dir, do
     play_sound("gblswordswish", a.node->local.translate, 14.0f, false);
     if (sword && e.state == enemy_ai::DYING) {
         enemy_killed(sc, e);
+        if (e.inhibit_death) return;
         if (!play_once(sc, a, "CombatDeathGeneric" + e.set, now, actor_yaw(a), true) &&
             !play_once(sc, a, "CombatDying" + e.set, now, actor_yaw(a), true)) a.posed_hold = true;
         return;
@@ -5871,7 +5874,7 @@ void enemy_damage(combat_state& cs, scene& sc, enemy_ai& e, int dmg, int dir, do
     if (a.health <= 0) {
         e.state = enemy_ai::DEAD;
         a.stance = 0;
-        if (!play_once(sc, a, "CombatDeathGeneric" + e.set, now, actor_yaw(a), true))
+        if (!e.inhibit_death && !play_once(sc, a, "CombatDeathGeneric" + e.set, now, actor_yaw(a), true))
             play_once(sc, a, "CombatDying" + e.set, now, actor_yaw(a), true);
         std::printf("combat: %s is defeated\n", a.script_name.c_str());
         if (!e.on_death.empty()) sc.script.execute(e.on_death, 0);
