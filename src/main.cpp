@@ -5517,7 +5517,10 @@ inline const char* follow_clip(int from) {
 }
 
 struct enemy_ai {
-    enum state_t { PATROL, CHARGE, FIGHT, RECOVER, DEAD, DYING } state;
+    enum state_t { PATROL, CHARGE, FIGHT, RECOVER, DEAD, DYING, SWING } state;
+    // SWING (StSwingWhileMoving 0x4BAA34): one running swing at an unarmed Prince.
+    double swing_at = 0.0;
+    bool   swung = true;
     int    actor;
     float  home[3];
     std::vector<std::array<float, 3> > way;
@@ -6067,7 +6070,21 @@ void enemy_update(combat_state& cs, scene& sc, enemy_ai& e, actor_inst& prince,
             }
         }
     }
+    // The sheathed-Prince swing lands once, 0.3 s in, within 2 m and in front (15, enemy.dat "swing").
+    if (e.state == enemy_ai::SWING && !e.swung && now >= e.swing_at) {
+        e.swung = true;
+        const float sdx = prince.node->local.translate[0] - a.node->local.translate[0];
+        const float sdz = prince.node->local.translate[2] - a.node->local.translate[2];
+        const float sdy = prince.node->local.translate[1] - a.node->local.translate[1];
+        if (prince_available && sdx * sdx + sdz * sdz < 4.0f && std::fabs(sdy) < 1.0f &&
+            angle_diff(std::atan2(sdx, sdz), actor_yaw(a)) < 0.8f)
+        {
+            std::printf("combat: %s swings at the unarmed Prince\n", a.script_name.c_str());
+            prince_damage(cs, sc, prince, int(fp.enemy("swing", 15)), DIR_RIGHT, now);
+        }
+    }
     if (a.scripted || now < e.busy_until) return;     // a clip owns the body
+    if (e.state == enemy_ai::SWING) e.state = enemy_ai::CHARGE;   // recovered (0.1 s) - charge again
 
     // Stay on the floor.
     float gy;
@@ -6137,6 +6154,19 @@ void enemy_update(combat_state& cs, scene& sc, enemy_ai& e, actor_inst& prince,
         // a charge otherwise runs him down wherever he goes.
         if (!prince_available || zombie || (std::fabs(dx) + std::fabs(dz) >= 5.0f && !clear_line(0.5f)) || d > 25.0f) {
             e.state = enemy_ai::PATROL;
+            break;
+        }
+        if (d <= combat_tuning::FIGHT_DIST && !cs.prince_drawn) {
+            // StEnemyPatrolAttack (0x4BA831): a Prince with no sword out is not dueled -
+            // he gets one running swing.
+            a.node->local.set_yaw(std::atan2(dx, dz));
+            const std::string sw = "CombatAttackRight" + e.set;
+            if (play_once(sc, a, sw, now, std::atan2(dx, dz), false)) {
+                e.state = enemy_ai::SWING;
+                e.swing_at = now + 0.3;
+                e.swung = false;
+                e.busy_until = now + skill_seconds(sc, a, sw) + 0.1;
+            }
             break;
         }
         if (d <= combat_tuning::FIGHT_DIST) {
