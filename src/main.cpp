@@ -9352,12 +9352,18 @@ int main(int argc, char** argv) {
                                 if (player->joint_names[j] == "RHand") { player->carry_joint = int(j); break; }
                         }
                     }
-                    play_sound("PRNpickup", lt.translate, 10.0f, false);
                 }
                 if (taking.step + 1 >= taking.clips.size() && !taking.applied) {
                     taking.applied = true;
                     if (player->carried_actor == pk.actor && pk.actor >= 0) { player->carried.clear(); player->carried_actor = -1; }
                     pickup_apply(combat, sc, *player, pk, game_time);
+                    // The potion's own sound plays at the pickup (table 0x800E28); items have none.
+                    static const char* pot_sfx[11] = { 0, "POTBlue", "POTGreenl", "POTYellow", "POTRed", "POTOrange",
+                                                       "POTWhite", "POTSilver", "POTGold", "POTViolet", "POTGreend" };
+                    if (pk.argv.size() > 1 && !pk.argv[1].empty() && pk.argv[1].find_first_not_of("0123456789") == std::string::npos) {
+                        const int ty = std::atoi(pk.argv[1].c_str());
+                        if (ty >= 1 && ty <= 10) play_sound(pot_sfx[ty], lt.translate, 10.0f, false);
+                    }
                     const bool code = pk.argv.size() > 2 && equals_nocase(pk.argv[2], "reload");
                     if (!code && pk.argv.size() > 3 && !pk.argv[3].empty()) sc.script.execute(pk.argv[3], 0);
                 }
