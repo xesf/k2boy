@@ -906,7 +906,10 @@ struct scene {
         assets::k2a_trap trap;      // for placing its model
         int actor;                  // the model in actors, or -1
         float node[3];              // the trap node's own position (engine space)
-        pickup_def() : actor(-1) { node[0] = node[1] = node[2] = 0.0f; }
+        std::string parent;         // its parent node: an EnemyStart makes it that guard's prize
+        int  guard;                 // the guard's actor when it is a prize (0x4A89F9), else -1
+        bool dropped;               // a prize that has been moved to where its guard fell
+        pickup_def() : actor(-1), guard(-1), dropped(false) { node[0] = node[1] = node[2] = 0.0f; }
     };
     std::vector<pickup_def> pickups;
     // Water traps' outlines: the surface mesh's triangles in xz (both
@@ -3042,6 +3045,7 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
             pd.trap = n.trap;
             pd.trap.node = n.name;
             for (int k = 0; k < 3; ++k) pd.pos[k] = (n.trap.bbox[k] + n.trap.bbox[k + 3]) * 0.5f;
+            pd.parent = n.parent;
             pd.node[0] = n.pos[0]; pd.node[1] = n.pos[2]; pd.node[2] = -n.pos[1];
             if (std::getenv("K2_PICKUPS"))
                 std::printf("pickup %s at (%.2f %.2f %.2f) node (%.2f %.2f %.2f) %s\n", n.name.c_str(), pd.pos[0], pd.pos[1], pd.pos[2],
@@ -3811,6 +3815,13 @@ void spawn_fixtures(scene& sc) {
         if (pk.argv.size() < 2 || pk.argv[1].empty()) continue;
         const bool numbered = pk.argv[1].find_first_not_of("0123456789") == std::string::npos;
         pk.actor = spawn_prop(sc, pk.trap, numbered ? std::string("TRAP_Potion") : pk.argv[1], "");
+        // A Pickup under an EnemyStart is that guard's prize: out of play until he falls.
+        for (size_t a = 0; a < sc.actors.size() && !pk.parent.empty(); ++a)
+            if (sc.actors[a].is_enemy && sc.actors[a].script_name == pk.parent) {
+                pk.guard = int(a);
+                std::printf("  pickup %s is the prize of %s\n", pk.name.c_str(), pk.parent.c_str());
+                break;
+            }
     }
 }
 
@@ -6986,6 +6997,7 @@ struct pickup {
 
 // Whether a pickup's trap is shown and enabled (Visible:T / Enable:T).
 bool pickup_live(scene& sc, size_t i) {
+    if (sc.pickups[i].guard >= 0 && sc.actors[size_t(sc.pickups[i].guard)].health > 0) return false;
     const std::string& nm = sc.pickups[i].name;
     for (size_t t = 0; t < sc.traps.size(); ++t)
         if (sc.traps[t]->name() == nm) return sc.traps[t]->enabled();   // CanUse (0x47F9F1) tests enabled only, not visibility
@@ -9384,6 +9396,16 @@ int main(int argc, char** argv) {
             }
             // Pickups shown or hidden by script (P4BoxPotion02 appears when
             // its box breaks) follow their trap.
+            for (size_t i = 0; i < sc.pickups.size(); ++i) {
+                scene::pickup_def& pp = sc.pickups[i];
+                if (pp.guard >= 0 && !pp.dropped && sc.actors[size_t(pp.guard)].health <= 0) {
+                    // His prize drops where he fell.
+                    pp.dropped = true;
+                    const float* g = sc.actors[size_t(pp.guard)].node->local.translate;
+                    for (int k = 0; k < 3; ++k) pp.node[k] = g[k];
+                    if (pp.actor >= 0) for (int k = 0; k < 3; ++k) sc.actors[size_t(pp.actor)].node->local.translate[k] = g[k];
+                }
+            }
             for (size_t i = 0; i < sc.pickups.size(); ++i)
                 if (sc.pickups[i].actor >= 0)
                     sc.actors[size_t(sc.pickups[i].actor)].hidden = pickup_taken[i] || !pickup_live(sc, i);
