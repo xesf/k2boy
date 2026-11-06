@@ -20,11 +20,11 @@ Every function is tagged by `python3 tools/classify.py` (`docs/reference/functio
 | Status | Count | Share | Meaning |
 |---|---:|---:|---|
 | skip | 24,430 | 61.5% | library, middleware, dormant VM, tiny stubs, code only skip code calls |
-| ported | 147 | 0.4% | an address our `src/` cites |
+| ported | 148 | 0.4% | an address our `src/` cites |
 | needed | 4,969 | 12.5% | game code reached from ported or project-named code; not ported yet |
-| unknown | 10,149 | 25.6% | no static caller and no vtable class: triage by hand |
+| unknown | 10,148 | 25.6% | no static caller and no vtable class: triage by hand |
 
-Of the 5,116 functions we need, **2.9%** are ported. The count counts citations in comments, so it undercounts code that was ported without naming an address.
+Of the 5,117 functions we need, **2.9%** are ported. The count counts citations in comments, so it undercounts code that was ported without naming an address.
 
 ## File formats
 

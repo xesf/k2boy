@@ -31,6 +31,7 @@
 #define K2_ENGINE_SCRIPT_H
 
 #include <map>
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -177,6 +178,16 @@ public:
                 const std::vector<std::string>& argv, const trap_volume& volume);
 
     bool contains(const float* p) const { return m_volume.contains(p); }
+    // Action::CanUse (0x463350): enabled, within 1.7 of the trap's pivot, and facing
+    // within 60 degrees (dot > 0.5) of the way the trap faces. `yaw` is ours:
+    // forward is (sin yaw, cos yaw).
+    bool can_use(const float* pos, float yaw) const {
+        if (!m_enabled) return false;
+        if (!m_has_stand) return m_volume.contains(pos);
+        const float dx = pos[0] - m_stand[0], dy = pos[1] - m_stand[1], dz = pos[2] - m_stand[2];
+        if (dx * dx + dy * dy + dz * dz >= 1.7f * 1.7f) return false;
+        return std::cos(yaw - m_stand_yaw) > 0.5f;
+    }
     // The argument for the current state: its "{state:...}" block, or all
     // of it when it has none. Empty when nothing applies.
     std::string pick(field f) const;

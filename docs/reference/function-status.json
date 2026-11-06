@@ -1,9 +1,9 @@
 {
 "counts":{
 "needed":4969,
-"unknown":10149,
+"unknown":10148,
 "skip":24430,
-"ported":147
+"ported":148
 },
 "functions":{
 "00401000":[
@@ -38582,8 +38582,8 @@
 "sub_463328"
 ],
 "00463350":[
-"unknown",
-"",
+"ported",
+"cited in src/",
 "sub_463350"
 ],
 "00463506":[

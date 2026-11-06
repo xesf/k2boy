@@ -210,3 +210,18 @@ acted on.
 
 Not yet: camera `look`/`security` and transitions, audio, Mover/Action behaviour, Water `raise`, the plate's own animation,
 Rotate, Oscillate and the other motion types, and testing enemies against Areas.
+
+## Action::CanUse (0x463350)
+
+Recovered from the binary (virtual slot of `Action`, called `sub_463350` in the export). The action
+input works an Action only when all of these hold:
+
+1. the trap is enabled (`+0x158`, the debug flag `+0x15C` overrides the global one at `0x7E9BF4`);
+2. the Prince is within **1.7** of the trap's pivot (squared compare against `flt_7C1B3C`);
+3. his facing and the trap's facing - the same constant vector turned by each one's rotation - have a
+   dot product above **0.5**, i.e. within 60 degrees.
+
+The trap's rotation is its `K2_TRAP_PIVOT_AXIS` / `PIVOT_ANGLE` (Rodrigues). The Prince's yaw matrix is
+the same turn about +y by the *negative* of his yaw, so the yaw that matches a trap turned by `s` about
++y is `-s` (`s = angle`, negated when the axis is -y). This is why a lever turned 90 degrees about +y is
+worked facing -x, and why the volume's centre is not the facing. `action_trap::can_use` implements it.

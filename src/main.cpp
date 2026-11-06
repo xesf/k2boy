@@ -9829,7 +9829,7 @@ int main(int argc, char** argv) {
                 crouch.state == crouch_ctl::NONE && !working.trap) {
                 for (size_t i = 0; i < sc.actions.size(); ++i) {
                     k2::engine::action_trap* a = sc.actions[i];
-                    if (!a->contains(lt.translate) || !a->can_act()) continue;
+                    if (!a->can_use(lt.translate, player_yaw) || !a->can_act()) continue;
                     working.trap = a;
                     working.stage = 0;
                     const float* c = a->center();
