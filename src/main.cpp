@@ -722,6 +722,7 @@ struct actor_inst {
     int                               health, max_health;
     bool                              armed;          // the Prince has his sword
     bool                              has_bow;        // "weapon:+bow"
+    bool                              pending_potionclear = false;   // "potionclear": end every potion at once
     int                               arrows;         // "weapon:+arrow,type,count"
     int                               pending_hurt;   // "hurt:N", applied by combat
     std::string                       pending_kill;   // "kill:<clip>": dies playing it
@@ -2275,6 +2276,21 @@ public:
                 return true;
             }
             if (msg.size() > 7 && equals_nocase(msg.substr(0, 7), "weapon:")) return weapon(a, msg.substr(7));
+            // PrinceMessage table (builder 0x4845A7, script-messages.md).
+            if (equals_nocase(msg, "potionclear")) { a.pending_potionclear = true; return true; }     // 0x4858CC
+            if (msg.size() > 5 && equals_nocase(msg.substr(0, 5), "heal:")) {                       // 0x484B0A
+                a.health = std::min(a.max_health, a.health + std::atoi(msg.c_str() + 5));
+                return true;
+            }
+            if (msg.size() > 5 && equals_nocase(msg.substr(0, 5), "play:"))                         // 0x484C4F
+                return play_once(m_sc, a, msg.substr(5), m_world.now(), a.home_yaw, false);
+            if (msg.size() >= 4 && equals_nocase(msg.substr(0, 4), "die:")) {                       // 0x484BD0, like Kill
+                a.pending_kill = msg.substr(4);
+                if (a.pending_kill.empty()) a.pending_kill = "DeathGeneric_G";
+                return true;
+            }
+            if (equals_nocase(msg.substr(0, 6), "water:") || equals_nocase(msg.substr(0, 4), "add:") ||
+                equals_nocase(msg.substr(0, 4), "use:")) return true;                               // accepted, no effect
             if (msg.size() >= 5 && equals_nocase(msg.substr(0, 5), "kill:")) {
                 a.pending_kill = msg.substr(5);
                 if (a.pending_kill.empty()) a.pending_kill = "DeathGeneric_G";
@@ -9468,6 +9484,10 @@ int main(int argc, char** argv) {
             if (!player->pending_kill.empty()) {  // "Prince,kill:Lvl1HandGetsEaten_G"
                 if (!dead) prince_damage(combat, sc, *player, player->health, 0, game_time, player->pending_kill.c_str());
                 player->pending_kill.clear();
+            }
+            if (player->pending_potionclear) {    // "prince,potionclear" (0x4858CC)
+                player->pending_potionclear = false;
+                g_potions = potion_state();
             }
             if (player->pending_hurt > 0) {       // "prince,hurt:N" from a trap
                 if (!dead) prince_damage(combat, sc, *player, player->pending_hurt, 0, game_time);
