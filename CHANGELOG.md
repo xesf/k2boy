@@ -2,6 +2,9 @@
 
 One line per change, newest first within each date.
 
+## 2026-11-07 (v0.2.1)
+- Releases are sent to VitaDB after publishing; the `vitadb` workflow re-sends one by hand.
+
 ## 2026-11-07 (v0.2.0)
 - Prison: the sheathed sword rides in its scabbard; the strongbox is carried in the hand and placed once; the crusher and its camera reset; the torture door follows its collision.
 - Ivory Tower: the start room's exit is open (an Aperture is a portal, not a wall); the intro cameras face the right way.
