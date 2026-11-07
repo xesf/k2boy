@@ -3125,6 +3125,7 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
                 for (int c = 0; c < 3; ++c)
                     if (mn[c] < b[c] - 0.6f || mx[c] > b[c + 3] + 0.6f) fills = false;
             }
+            if (std::getenv("K2_FAKE")) std::printf("fake %s [%.1f %.1f %.1f]-[%.1f %.1f %.1f] %s\n", n.name.c_str(), mn[0], mn[1], mn[2], mx[0], mx[1], mx[2], fills ? "hidden" : "kept");
             if (fills) continue;
         }
 
@@ -10954,6 +10955,7 @@ int main(int argc, char** argv) {
                                 ea.node->local.translate[1], ea.node->local.translate[2], ea.health,
                                 ea.scripted ? " (in a clip)" : "");
                 }
+                if (player) std::printf("player ended at (%.2f, %.2f, %.2f) yaw %.2f health %d\n", player->node->local.translate[0], player->node->local.translate[1], player->node->local.translate[2], player_yaw, player->health);
                 if (write_bmp(shot_path, w, h, &px[0]))
                     std::printf("wrote %s (%dx%d)\n", shot_path, w, h);
                 else
