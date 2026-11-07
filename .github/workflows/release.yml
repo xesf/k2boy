@@ -66,3 +66,28 @@ jobs:
           gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" \
             --notes-file CHANGELOG.md --verify-tag \
             artifacts/k2boy-macos.tar.gz artifacts/k2boy.vpk
+      # VitaDB copies the VPK from the release just published. The secret (VITA_SECRET) comes
+      # from the app's VitaDB page; without it the step does nothing. VitaDB's server
+      # sometimes cannot reach GitHub: a failure here leaves the release published and green.
+      # Re-send by hand with the vitadb workflow.
+      - name: Publish to VitaDB
+        continue-on-error: true
+        env:
+          VITADB_SECRET: ${{ secrets.VITA_SECRET }}
+        run: |
+          if [ -z "${VITADB_SECRET}" ]; then
+            echo "VITA_SECRET is not set: skipping VitaDB"
+            exit 0
+          fi
+          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/k2boy.vpk"
+          for try in 1 2 3; do
+            if curl --fail-with-body --show-error -X POST \
+                -F "secret=${VITADB_SECRET}" \
+                -F "vpk_url=${URL}" \
+                https://www.rinnegatamante.eu/vitadb/publish_nightly.php; then
+              exit 0
+            fi
+            echo "VitaDB attempt $try failed; waiting before the next"
+            sleep 60
+          done
+          exit 1
