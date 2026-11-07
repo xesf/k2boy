@@ -3310,6 +3310,7 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
             } else {
                 scene_trap* st = new scene_trap(sc.script, n.name, hdr, sc,
                                    int(sc.items.size()) - 1, node, n.trap.name, n.trap.bbox);
+                if (std::getenv("K2_TRAPTYPES")) std::fprintf(stderr, "traptype %s %s\n", n.trap.name.c_str(), n.name.c_str());
                 for (int k = 0; k < 3; ++k) st->pivot[k] = n.trap.pivot[k];
                 st->pivot_angle = n.trap.pivot_angle * (n.trap.pivot_axis[1] < 0.0f ? -1.0f : 1.0f);
                 st->set_place(n.trap.pivot_axis, n.trap.pivot_angle);
