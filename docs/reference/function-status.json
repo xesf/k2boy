@@ -1,9 +1,9 @@
 {
 "counts":{
-"needed":4969,
-"unknown":10148,
+"needed":5042,
+"unknown":10066,
 "skip":24430,
-"ported":148
+"ported":157
 },
 "functions":{
 "00401000":[
@@ -47,13 +47,13 @@
 "sub_401187"
 ],
 "00401214":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_401214"
 ],
 "00401253":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_401253"
 ],
 "004012B0":[
@@ -2142,8 +2142,8 @@
 "nullsub_131"
 ],
 "004099F4":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_4099F4"
 ],
 "00409AE3":[
@@ -2207,13 +2207,13 @@
 "sub_409E5D"
 ],
 "00409EB7":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_409EB7"
 ],
 "00409EF3":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_409EF3"
 ],
 "00409F11":[
@@ -3752,43 +3752,43 @@
 "sub_40C376"
 ],
 "0040C380":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_40C380"
 ],
 "0040C47A":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_40C47A"
 ],
 "0040C609":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_40C609"
 ],
 "0040C637":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_40C637"
 ],
 "0040C71C":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_40C71C"
 ],
 "0040C8DF":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_40C8DF"
 ],
 "0040C8FA":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_40C8FA"
 ],
 "0040CB19":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_40CB19"
 ],
 "0040CC2C":[
@@ -3797,18 +3797,18 @@
 "sub_40CC2C"
 ],
 "0040CD0B":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_40CD0B"
 ],
 "0040CE04":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_40CE04"
 ],
 "0040CEF1":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_40CEF1"
 ],
 "0040D061":[
@@ -3837,18 +3837,18 @@
 "sub_40D334"
 ],
 "0040D341":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_40D341"
 ],
 "0040DAB1":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_40DAB1"
 ],
 "0040DB0E":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_40DB0E"
 ],
 "0040DC68":[
@@ -3857,8 +3857,8 @@
 "sub_40DC68"
 ],
 "0040DDBB":[
-"unknown",
-"",
+"ported",
+"cited in src/",
 "sub_40DDBB"
 ],
 "0040E71F":[
@@ -4507,13 +4507,13 @@
 "sub_40FAD1"
 ],
 "0040FADC":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_40FADC"
 ],
 "0040FAE3":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_40FAE3"
 ],
 "0040FAEA":[
@@ -4527,8 +4527,8 @@
 "sub_40FAF3"
 ],
 "0040FB05":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_40FB05"
 ],
 "0040FB0C":[
@@ -4927,8 +4927,8 @@
 "sub_411712"
 ],
 "00411750":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_411750"
 ],
 "00411791":[
@@ -4947,13 +4947,13 @@
 "sub_41186B"
 ],
 "0041193A":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_41193A"
 ],
 "00411A09":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_411A09"
 ],
 "00411ADC":[
@@ -10352,8 +10352,8 @@
 "sub_420AA2"
 ],
 "00420ABE":[
-"unknown",
-"",
+"ported",
+"cited in src/",
 "sub_420ABE"
 ],
 "00420B3F":[
@@ -15262,8 +15262,8 @@
 "sub_42AE09"
 ],
 "0042B0BC":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_42B0BC"
 ],
 "0042B514":[
@@ -15362,8 +15362,8 @@
 "sub_42C740"
 ],
 "0042C74A":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_42C74A"
 ],
 "0042C771":[
@@ -15872,8 +15872,8 @@
 "sub_42CA9C"
 ],
 "0042CAA7":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_42CAA7"
 ],
 "0042CB29":[
@@ -15887,8 +15887,8 @@
 "sub_42CB35"
 ],
 "0042CB38":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_42CB38"
 ],
 "0042CB50":[
@@ -15902,8 +15902,8 @@
 "sub_42CB54"
 ],
 "0042CB6E":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_42CB6E"
 ],
 "0042CBF9":[
@@ -15912,18 +15912,18 @@
 "sub_42CBF9"
 ],
 "0042CBFC":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_42CBFC"
 ],
 "0042CC68":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_42CC68"
 ],
 "0042CC82":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_42CC82"
 ],
 "0042CC92":[
@@ -15962,8 +15962,8 @@
 "sub_42CCE8"
 ],
 "0042CD13":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_42CD13"
 ],
 "0042CD1D":[
@@ -16757,8 +16757,8 @@
 "sub_42E93B"
 ],
 "0042E9F7":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_42E9F7"
 ],
 "0042EA0C":[
@@ -18372,8 +18372,8 @@
 "sub_434A73"
 ],
 "00434A9A":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_434A9A"
 ],
 "00434ADB":[
@@ -19292,8 +19292,8 @@
 "sub_4370F2"
 ],
 "004371EE":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_4371EE"
 ],
 "0043729C":[
@@ -19307,8 +19307,8 @@
 "sub_4372F7"
 ],
 "00437318":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_437318"
 ],
 "00437397":[
@@ -19332,38 +19332,38 @@
 "sub_43745E"
 ],
 "004374C2":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_4374C2"
 ],
 "00437554":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_437554"
 ],
 "00437569":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_437569"
 ],
 "00437945":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_437945"
 ],
 "004379DF":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_4379DF"
 ],
 "00437B71":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_437B71"
 ],
 "00437BF3":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_437BF3"
 ],
 "00437C70":[
@@ -21567,8 +21567,8 @@
 "nullsub_18"
 ],
 "0043B5A5":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_43B5A5"
 ],
 "0043B64A":[
@@ -21587,8 +21587,8 @@
 "sub_43B65C"
 ],
 "0043B6B7":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_43B6B7"
 ],
 "0043B6E1":[
@@ -22792,8 +22792,8 @@
 "sub_43F5B1"
 ],
 "0043F61F":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_43F61F"
 ],
 "0043F636":[
@@ -22802,13 +22802,13 @@
 "sub_43F636"
 ],
 "0043F65A":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_43F65A"
 ],
 "0043F672":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_43F672"
 ],
 "0043F68F":[
@@ -30512,8 +30512,8 @@
 "sub_451416"
 ],
 "00451432":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_451432"
 ],
 "004514AD":[
@@ -30677,13 +30677,13 @@
 "sub_452506"
 ],
 "004525FE":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_4525FE"
 ],
 "0045261A":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_45261A"
 ],
 "0045269A":[
@@ -34572,8 +34572,8 @@
 "sub_45C62D"
 ],
 "0045C64F":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_45C64F"
 ],
 "0045C719":[
@@ -57947,8 +57947,8 @@
 "sub_47F9B1"
 ],
 "0047F9F1":[
-"unknown",
-"",
+"ported",
+"cited in src/",
 "sub_47F9F1"
 ],
 "0047FB90":[
@@ -78417,8 +78417,8 @@
 "sub_4AA7DE"
 ],
 "004AA95A":[
-"needed",
-"called from game code",
+"ported",
+"cited in src/",
 "sub_4AA95A"
 ],
 "004AAC00":[
@@ -78547,8 +78547,8 @@
 "sub_4AC229"
 ],
 "004AC272":[
-"needed",
-"called from game code",
+"ported",
+"cited in src/",
 "sub_4AC272"
 ],
 "004AC517":[
@@ -78652,13 +78652,13 @@
 "sub_4ADD4A"
 ],
 "004ADEB1":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_4ADEB1"
 ],
 "004ADF0A":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_4ADF0A"
 ],
 "004ADF40":[
@@ -78732,8 +78732,8 @@
 "sub_4AE6C5"
 ],
 "004AE7FD":[
-"needed",
-"called from game code",
+"ported",
+"cited in src/",
 "sub_4AE7FD"
 ],
 "004AE8DE":[
@@ -81897,13 +81897,13 @@
 "sub_4BA6B0"
 ],
 "004BA831":[
-"needed",
-"called from game code",
+"ported",
+"cited in src/",
 "sub_4BA831"
 ],
 "004BAA34":[
-"needed",
-"called from game code",
+"ported",
+"cited in src/",
 "sub_4BAA34"
 ],
 "004BAC5C":[
@@ -86137,8 +86137,8 @@
 "sub_4C890A"
 ],
 "004C89B9":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_4C89B9"
 ],
 "004C89F9":[
@@ -86182,8 +86182,8 @@
 "sub_4C8B0D"
 ],
 "004C8B97":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_4C8B97"
 ],
 "004C8C41":[
@@ -86892,8 +86892,8 @@
 "sub_4CA2A4"
 ],
 "004CA44F":[
-"needed",
-"called from game code",
+"ported",
+"cited in src/",
 "sub_4CA44F"
 ],
 "004CA4D0":[
@@ -88552,8 +88552,8 @@
 "sub_4CD9AA"
 ],
 "004CDB86":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_4CDB86"
 ],
 "004CDD87":[
@@ -113322,8 +113322,8 @@
 "sub_500B51"
 ],
 "00500B6A":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_500B6A"
 ],
 "00500BD4":[
@@ -114752,8 +114752,8 @@
 "sub_504AF5"
 ],
 "00504B00":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_504B00"
 ],
 "00504B72":[
@@ -114762,18 +114762,18 @@
 "sub_504B72"
 ],
 "00504EDC":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_504EDC"
 ],
 "0050520A":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_50520A"
 ],
 "00505235":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_505235"
 ],
 "005052AC":[
@@ -114787,13 +114787,13 @@
 "sub_5052C8"
 ],
 "005052FC":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_5052FC"
 ],
 "0050530D":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_50530D"
 ],
 "00505649":[
@@ -114802,8 +114802,8 @@
 "sub_505649"
 ],
 "005056F9":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_5056F9"
 ],
 "005057DF":[
@@ -114822,18 +114822,18 @@
 "sub_5059A9"
 ],
 "005059EE":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_5059EE"
 ],
 "00505E34":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_505E34"
 ],
 "00505E44":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_505E44"
 ],
 "00505E7E":[
@@ -124212,13 +124212,13 @@
 "sub_51AF9F"
 ],
 "0051AFF5":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_51AFF5"
 ],
 "0051B04D":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_51B04D"
 ],
 "0051B0A5":[
@@ -124487,13 +124487,13 @@
 "sub_51BD59"
 ],
 "0051BDB6":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_51BDB6"
 ],
 "0051BDD5":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_51BDD5"
 ],
 "0051BDF4":[
@@ -126882,8 +126882,8 @@
 "sub_520294"
 ],
 "005204D8":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_5204D8"
 ],
 "005204EE":[
@@ -131222,8 +131222,8 @@
 "__purecall"
 ],
 "0052DFD0":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_52DFD0"
 ],
 "0052DFDA":[
@@ -162677,8 +162677,8 @@
 "MfProtoActor__vf_maybe_Load"
 ],
 "00600707":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_600707"
 ],
 "00600744":[
@@ -166217,8 +166217,8 @@
 "sub_6149F4"
 ],
 "00614B7A":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_614B7A"
 ],
 "00614BC1":[
@@ -166242,8 +166242,8 @@
 "sub_614EA8"
 ],
 "00614F40":[
-"unknown",
-"",
+"needed",
+"called from game code",
 "sub_614F40"
 ],
 "00614FA0":[
