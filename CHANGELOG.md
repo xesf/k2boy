@@ -2,6 +2,16 @@
 
 One line per change, newest first within each date.
 
+## 2026-11-07 (v0.2.0)
+- Prison: the sheathed sword rides in its scabbard; the strongbox is carried in the hand and placed once; the crusher and its camera reset; the torture door follows its collision.
+- Ivory Tower: the start room's exit is open (an Aperture is a portal, not a wall); the intro cameras face the right way.
+- Cameras glide to the next scripted shot unless it cuts; `look` takes one actor facing another; a negative snooze lasts for good.
+- Leaving a level plays its cutscene and carries health, sword, bow and arrows to the next; the finale ends with its win or lose movie.
+- Action traps need the Prince within 1.7 of the pivot and facing it; pickups need him within 1.5, level with the item and facing it.
+- A guard's prize stays out of play until he falls, then drops where he fell.
+- Shield potion stops arrows only; Guard potion makes guards ignore the Prince; each potion plays its own sound.
+- Guards swing once at an unarmed Prince, recover from a block in 0.37 s, follow a Prince who backs off, answer repeats and quick swings by blocking, attack on the original's irregular timing, and honour `InhibitDeath`.
+
 ## 2026-11-03
 - Vita: LiveArea icon, startup and background now come from the Prince of Persia 3D art in `platforms/vita/art`.
 
