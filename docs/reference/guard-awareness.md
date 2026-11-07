@@ -249,7 +249,8 @@ Walk and run speed follow the clips' root motion (`locomotion.md` method).
 | Camouflage | unseen beyond 1.5 m, possessed never seen | the same (patrol only; Guard potion = never seen) |
 | Sheathed Prince | one running swing for 15, no duel | the same (`SWING`) |
 | Charge give-up | Manhattan ≥ 5 and no line of sight | the same; duel gives up at d > 13 |
-| Stop distance, reach, back off | per weapon (`S − 0.15`, 1.7–3.05, `D < L − 1.1`) | `FIGHT_DIST` 1.6, `REACH` 2.2, none |
+| Stop distance | `S − 0.15` per weapon | the same, read from master.dat `[Weapons]` |
+| Reach, back off | 1.7–3.05, `D < L − 1.1` | `REACH` 2.2, no back off |
 | Prince dying | guard sheathes and idles | finishing move |
 | Other guards | independent, no alerting | independent |
 

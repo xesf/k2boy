@@ -765,6 +765,7 @@ struct actor_inst {
     // The weapon in his hand: master.dat [Weapons] names it and the hand
     // node with an offset into it. Drawn while `weapon_shown`.
     std::string                       weapon;
+    float                             fight_dist = 1.75f;   // S - 0.15: the shortest of his weapon's eight ranges (0x4ABB6D)
     int                               hand_joint;
     float                             hand_off[3];
     bool                              weapon_shown;
@@ -1683,6 +1684,12 @@ void bind_actor_weapon(const assets::master_file& m, actor_inst& inst, scene& sc
     if (m.weapons.empty() || m.hands.empty()) return;
     const size_t w = which >= 0 && size_t(which) < m.weapons.size() ? size_t(which) : 0;
     inst.weapon = m.weapons[w].name;
+    {
+        float lo = 1e9f;
+        for (int k = 0; k < 8; ++k) if (m.weapons[w].ranges[k] > 0.0f) lo = std::min(lo, m.weapons[w].ranges[k]);
+        if (lo < 1e8f) inst.fight_dist = lo - 0.15f;
+        if (std::getenv("K2_TRAPTYPES")) std::fprintf(stderr, "weapon %s %s fights at %.2f\n", inst.name.c_str(), inst.weapon.c_str(), inst.fight_dist);
+    }
     for (size_t j = 0; j < inst.joint_names.size(); ++j)
         if (inst.joint_names[j] == m.hands[0].node) { inst.hand_joint = int(j); break; }
     for (int k = 0; k < 3; ++k) inst.hand_off[k] = m.hands[0].offset[k];
@@ -6117,6 +6124,7 @@ void enemy_update(combat_state& cs, scene& sc, enemy_ai& e, actor_inst& prince,
     float gy;
     if (ground_under(sc.coll, p, gy)) p[1] = gy;
 
+    const float fight_d = a.fight_dist;
     const float watch  = float(fp.enemy("distFarFromEnemy", 10.0));
     const float charge = float(fp.enemy("distApproachEnemy", 5.0));
     const float periph = float(fp.enemy("peripheral", 30.0)) * 3.14159265f / 180.0f;
@@ -6159,7 +6167,7 @@ void enemy_update(combat_state& cs, scene& sc, enemy_ai& e, actor_inst& prince,
         if (sees) {
             e.state = enemy_ai::CHARGE;
             play_sound("PG1dlg", p, 20.0f, false);
-            std::printf("combat: %s sees the Prince (%.1f away)\n", a.script_name.c_str(), d);
+            std::printf("combat: %s sees the Prince (%.1f away, fights at %.2f with %s)\n", a.script_name.c_str(), d, fight_d, a.weapon.c_str());
             break;
         }
         if (!e.way.empty()) {
@@ -6183,7 +6191,7 @@ void enemy_update(combat_state& cs, scene& sc, enemy_ai& e, actor_inst& prince,
             e.state = enemy_ai::PATROL;
             break;
         }
-        if (d <= combat_tuning::FIGHT_DIST && !cs.prince_drawn) {
+        if (d <= fight_d && !cs.prince_drawn) {
             // StEnemyPatrolAttack (0x4BA831): a Prince with no sword out is not dueled -
             // he gets one running swing.
             a.node->local.set_yaw(std::atan2(dx, dz));
@@ -6196,7 +6204,7 @@ void enemy_update(combat_state& cs, scene& sc, enemy_ai& e, actor_inst& prince,
             }
             break;
         }
-        if (d <= combat_tuning::FIGHT_DIST) {
+        if (d <= fight_d) {
             e.state = enemy_ai::FIGHT;
             e.next_attack = now + 0.6;
             // Fighter__StSetupForFightMode (0x4C604D): a taunt going in.
@@ -6219,7 +6227,7 @@ void enemy_update(combat_state& cs, scene& sc, enemy_ai& e, actor_inst& prince,
         // StEnemyInContact (0x4AA95A): he gives up the duel only past 13 m (or 1.5 up or down),
         // and follows a Prince who steps back until he is at S - 0.15 again, running beyond 3.5.
         if (d > 13.0f || std::fabs(pp[1] - p[1]) > 1.5f) { e.state = enemy_ai::CHARGE; break; }
-        if (d > combat_tuning::FIGHT_DIST + 0.05f) {
+        if (d > fight_d + 0.05f) {
             steer(sc, a, pp, d > 3.5f, dt);
             break;
         }
