@@ -243,17 +243,14 @@ Walk and run speed follow the clips' root motion (`locomotion.md` method).
 
 | Topic | Binary | Current model |
 |---|---|---|
-| Notice range | no distance limit; ±30° cone + ray; any direction within 3 m in front, even through walls | 10 m (`distFarFromEnemy`) and 360° inside 5 m (`distApproachEnemy`) |
-| Vertical | |dy| ≤ 2 m (archers exempt) | `same_floor` |
-| Hearing | 0/1/3/4/6/8 m by Prince action, y doubled, needs 360° ray; sword draw 6 m | none |
-| Camouflage | unseen beyond 1.5 m, possessed never seen | camo only on `PATROL`, same 1.5 |
-| Charge start | Manhattan < 5 or 4 to attack; chase uses live position | switches at `FIGHT_DIST` 1.6 |
-| Sheathed Prince | guard does a running swing for 15 and repeats, no duel | always duels |
-| Stop distance | `S − 0.15` (1.75 for a 1.9/2.1 weapon), per weapon | `FIGHT_DIST` 1.6 |
-| Attack reach | the weapon's ranges (1.7 to 3.05) | `REACH` 2.2 |
-| Back off | `D < L − 1.1` (1.0), speed −1 | none |
-| Give up | patrol branch: lost line of sight at Manhattan ≥ 5, then sheathe and resume. Active: `D > 13` or the home leash 10 | `d > watch × 1.5` |
-| Prince dying | guard sheathes and idles with ambient clips | finishing move |
+| Notice | 3 m in front outright; else ±30° cone + ray; no range limit | the same (`enemy_update`), capped at 25 m |
+| Vertical | \|dy\| ≤ 2 m | the same (archers are not exempt yet) |
+| Hearing | 0/1/3/4/6/8 m by action, y doubled, 360° ray; sword draw 6 m | run 6, walk 3, drawn 6; crawl, bounce and landing radii not modelled |
+| Camouflage | unseen beyond 1.5 m, possessed never seen | the same (patrol only; Guard potion = never seen) |
+| Sheathed Prince | one running swing for 15, no duel | the same (`SWING`) |
+| Charge give-up | Manhattan ≥ 5 and no line of sight | the same; duel gives up at d > 13 |
+| Stop distance, reach, back off | per weapon (`S − 0.15`, 1.7–3.05, `D < L − 1.1`) | `FIGHT_DIST` 1.6, `REACH` 2.2, none |
+| Prince dying | guard sheathes and idles | finishing move |
 | Other guards | independent, no alerting | independent |
 
 ## Names and IDA
