@@ -3281,6 +3281,20 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
         if (collide && n.has_trap && std::getenv("K2_SCRIPTAUDIT"))
             for (size_t a = 1; a < n.trap.argv.size(); ++a)
                 if (n.trap.argv[a].find(',') != std::string::npos) g_audit_scripts.push_back(n.trap.argv[a]);
+        if (collide && n.has_trap && std::getenv("K2_EXITAUDIT") && !vb.empty()) {
+            for (size_t a = 1; a < n.trap.argv.size(); ++a) {
+                std::string lo = n.trap.argv[a];
+                for (size_t q = 0; q < lo.size(); ++q) lo[q] = char(std::tolower(static_cast<unsigned char>(lo[q])));
+                if (lo.find("game,exit") == std::string::npos) continue;
+                float lo3[3] = { 1e9f, 1e9f, 1e9f }, hi3[3] = { -1e9f, -1e9f, -1e9f };
+                for (size_t v = 0; v < vb.size(); ++v) {
+                    const float q[3] = { vb[v].x, vb[v].y, vb[v].z };
+                    for (int k = 0; k < 3; ++k) { lo3[k] = std::min(lo3[k], q[k]); hi3[k] = std::max(hi3[k], q[k]); }
+                }
+                std::fprintf(stderr, "exitaudit %s %s box %.2f,%.2f,%.2f .. %.2f,%.2f,%.2f: %s\n", n.trap.name.c_str(), n.name.c_str(),
+                             lo3[0], lo3[1], lo3[2], hi3[0], hi3[1], hi3[2], n.trap.argv[a].c_str());
+            }
+        }
         // Every trap node becomes a script target under its node name.
         if (collide && n.has_trap) {
             k2::engine::trap_object* t;
