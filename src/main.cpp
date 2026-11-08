@@ -2325,6 +2325,7 @@ public:
             return false;
         }
         if (!a.is_fixture) return false;
+        if (std::getenv("K2_TRAPTYPES")) std::fprintf(stderr, "fixture %s <- %s (hidden %d)\n", name().c_str(), msg.c_str(), int(a.hidden));
         std::string l = msg;
         for (size_t i = 0; i < l.size(); ++i) l[i] = char(std::tolower(static_cast<unsigned char>(l[i])));
         if (l == "enable:t" || l == "visible:t") { a.hidden = false; return true; }
@@ -7163,6 +7164,15 @@ bool pickup_live(scene& sc, size_t i) {
     return true;
 }
 
+// A pickup shows its model while its trap is visible (P4_Sword starts ",true,false,false":
+// invisible until the crushing-crate scene sends Visible:T).
+bool pickup_visible(scene& sc, size_t i) {
+    const std::string& nm = sc.pickups[i].name;
+    for (size_t t = 0; t < sc.traps.size(); ++t)
+        if (sc.traps[t]->name() == nm) return sc.traps[t]->visible();
+    return true;
+}
+
 // The pickup handler (0x47FC8C). argv1 is the item: a number is a potion,
 // mapped by the table built at 0x4EB9D6 to the effect it applies with argv2
 // as its argument; a name is an object (PrinceSword01 and argv2 "weapon"
@@ -9577,9 +9587,30 @@ int main(int argc, char** argv) {
                 const int have = pr ? (ty != 0 && pr->special_type == ty ? pr->special_count : pr->arrows) : 0;
                 if (pr && have < mn) { pickup_taken[i] = false; std::printf("pickup: %s is back (%d < %d)\n", rk.name.c_str(), have, mn); }
             }
+            // A weapon appearing on the floor is the dead guard's: he lets go of his (P4_Sword
+            // after the crushing crate).
+            static std::vector<char> was_shown;
+            if (was_shown.size() != sc.pickups.size()) was_shown.assign(sc.pickups.size(), 0);
+            for (size_t i = 0; i < sc.pickups.size(); ++i) {
+                const bool shown = !pickup_taken[i] && pickup_live(sc, i) && pickup_visible(sc, i);
+                if (shown && !was_shown[i] && sc.pickups[i].argv.size() > 2 && equals_nocase(sc.pickups[i].argv[2], "weapon") &&
+                    sc.pickups[i].guard < 0) {
+                    for (size_t g = 0; g < combat.enemies.size(); ++g) {
+                        actor_inst& ga = sc.actors[size_t(combat.enemies[g].actor)];
+                        const float* gt = ga.node->local.translate;
+                        const float dx = gt[0] - sc.pickups[i].node[0], dz = gt[2] - sc.pickups[i].node[2];
+                        if (ga.weapon_shown && dx * dx + dz * dz < 4.0f * 4.0f && std::fabs(gt[1] - sc.pickups[i].node[1]) < 2.0f &&
+                            (combat.enemies[g].state == enemy_ai::DEAD || ga.health <= 0)) {
+                            ga.weapon_shown = false;
+                            std::printf("pickup: %s takes the sword out of %s's hand\n", sc.pickups[i].name.c_str(), ga.script_name.c_str());
+                        }
+                    }
+                }
+                was_shown[i] = shown ? 1 : 0;
+            }
             for (size_t i = 0; i < sc.pickups.size(); ++i)
                 if (sc.pickups[i].actor >= 0)
-                    sc.actors[size_t(sc.pickups[i].actor)].hidden = pickup_taken[i] || !pickup_live(sc, i);
+                    sc.actors[size_t(sc.pickups[i].actor)].hidden = pickup_taken[i] || !pickup_live(sc, i) || !pickup_visible(sc, i);
             // While the sword is drawn, jump is not a jump.
             const bool jump_pressed = jump_pressed_raw && !combat.prince_drawn && !dead;
 
