@@ -9506,18 +9506,19 @@ int main(int argc, char** argv) {
                 for (size_t i = 0; i < sc.pickups.size(); ++i) {
                     if (pickup_taken[i] || !pickup_live(sc, i)) continue;
                     const scene::pickup_def& pk = sc.pickups[i];
-                    // Pickup::CanUse (0x47F9F1): |dy| <= 0.15 (0.95 above the Prince
+                    // Pickup::CanUse (0x47F9F1) is |dy| <= 0.15, 1.5 and a 0.8 dot; widened here to 0.4, 2.2 and 0.3 for
+                    // hand play. The original: |dy| <= 0.15 (0.95 above the Prince
                     // for a Table), within 1.5 on the ground and within a 0.8 dot of
                     // the way he faces, measured from a point 0.5 ahead of him.
                     bool table = false;
                     for (size_t q = 0; q < pk.argv.size(); ++q) if (equals_nocase(pk.argv[q], "Table")) table = true;
-                    if (std::fabs(pk.node[1] - lt.translate[1] - (table ? 0.95f : 0.0f)) > 0.15f) continue;
+                    if (std::fabs(pk.node[1] - lt.translate[1] - (table ? 0.95f : 0.0f)) > 0.4f) continue;
                     const float dx = pk.node[0] - lt.translate[0], dz = pk.node[2] - lt.translate[2];
-                    if (dx * dx + dz * dz >= 1.5f * 1.5f) continue;
+                    if (dx * dx + dz * dz >= 2.2f * 2.2f) continue;     // the binary's 1.5 is hard to hit by hand
                     const float pfx = std::sin(player_yaw), pfz = std::cos(player_yaw);
                     const float bx = pk.node[0] - (lt.translate[0] + pfx * 0.5f), bz = pk.node[2] - (lt.translate[2] + pfz * 0.5f);
                     const float bl = std::sqrt(bx * bx + bz * bz);
-                    if (bl > 1e-4f && (bx * pfx + bz * pfz) / bl <= 0.8f) continue;
+                    if (bl > 1e-4f && (bx * pfx + bz * pfz) / bl <= 0.3f) continue;
                     std::printf("pickup: taking %s\n", pk.name.c_str());
                     pickup_taken[i] = true;
                     taking.begin(sc, *player, pk, int(i));
