@@ -2370,8 +2370,12 @@ private:
         const std::string kind = w.substr(0, w.find(','));
         if (equals_nocase(kind, "all")) {
             if (!add) { a.armed = false; a.has_bow = false; a.arrows = 0; a.stance = 0; }
+            else { a.armed = true; a.has_bow = true; }
             return true;
         }
+        // staff (2) and double (4) are weapon-mask bits like the sword (0x4C8896): the first weapon
+        // added is equipped; the bare blade stands in for their models.
+        if (equals_nocase(kind, "staff") || equals_nocase(kind, "double")) { a.armed = add; if (!add) a.stance = 0; return true; }
         if (equals_nocase(kind, "sword")) { a.armed = add; if (!add) a.stance = 0; return true; }
         if (equals_nocase(kind, "bow")) { a.has_bow = add; return true; }
         if (equals_nocase(kind, "arrow")) {
@@ -6166,7 +6170,7 @@ void enemy_update(combat_state& cs, scene& sc, enemy_ai& e, actor_inst& prince,
         return !sc.coll.pick(o, dir, l - 0.4f, false, h);
     };
     bool sees = false;
-    if (!camo && prince_available && std::fabs(pp[1] - p[1]) <= 2.0f && d < 25.0f) {
+    if (!camo && prince_available && (a.archer || std::fabs(pp[1] - p[1]) <= 2.0f) && d < 25.0f) {
         const float ang = angle_diff(yaw_toward(p, pp), actor_yaw(a));
         if (ang < 1.5707963f && d < 3.0f) sees = true;
         else if (ang < periph) sees = clear_line(0.5f);
@@ -6174,6 +6178,7 @@ void enemy_update(combat_state& cs, scene& sc, enemy_ai& e, actor_inst& prince,
             float noise = 0.0f;
             if (prince.clip == LOCO_RUN) noise = 6.0f;
             else if (prince.clip == LOCO_WALK) noise = 3.0f;
+            else if (prince.stance && prince.stance == find_actor_skill(sc, prince, "CrawlForward_L")) noise = 1.0f;
             if (cs.prince_drawn) noise = std::max(noise, 6.0f);
             const float dyd = (pp[1] - p[1]) * 2.0f;
             if (noise > 0.0f && d * d + dyd * dyd < noise * noise) sees = clear_line(0.5f);

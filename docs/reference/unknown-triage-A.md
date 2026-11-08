@@ -30,7 +30,7 @@ Notes: 17 STL tree/map instantiations (455E89, 4568C2, 46A58D, ...) are library.
 | 004077DD | camera | Camera state machine entry (CameraPointing, StFixedCamera, StFollowTarget, StMonitorActive) | documented | high |
 | 00407B21 | camera | Builds visibility camera ("VisCam"/"VisHub"), prints "Cam %s at ..." (geometry utils) | NEW | low |
 | 00407DD1 | camera | Camera update step (calls 407FC7) | documented | med |
-| 00407FC7 | camera | Camera collision/obstruction probe (40BC3E x9), called from 407DD1 | NEW | med |
+| 00407FC7 | camera | Builds the camera's look-at matrix from eye and target (not an obstruction probe; ours casts its own arm at ~10392) | NEW | none |
 | 0040E71F | camera | Look mode ("Can't look with this") | documented | med |
 | 0040EDE9 | camera | Camera save serialiser | documented | low |
 | 0040EFFC | camera | Camera load (read counterpart of 40EDE9) | NEW | low |
