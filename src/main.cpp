@@ -8793,9 +8793,19 @@ int main(int argc, char** argv) {
                     set_clip(wa, LOCO_BASE);
                     if (wa.walk_remove) wa.hidden = true;
                 }
-                for (size_t i = 0; i < combat.enemies.size(); ++i)
-                    if (!sc.actors[size_t(combat.enemies[i].actor)].walking)
+                for (size_t i = 0; i < combat.enemies.size(); ++i) {
+                    actor_inst& ea = sc.actors[size_t(combat.enemies[i].actor)];
+                    // While a script holds the Prince, the guards stand: no walking, no swings.
+                    if (snoozing && combat.dead_since < 0.0 && !ea.scripted && !ea.walking &&
+                        combat.enemies[i].state != enemy_ai::DEAD && combat.enemies[i].state != enemy_ai::DYING) {
+                        combat.enemies[i].hit.active = false;
+                        ea.stance = 0;
+                        set_clip(ea, LOCO_BASE);
+                        continue;
+                    }
+                    if (!ea.walking)
                         enemy_update(combat, sc, combat.enemies[i], *prince_a, available, game_time, dt);
+                }
                 prince_hit_resolve(combat, sc, *prince_a, game_time);
                 // Bodies do not overlap: a swing's root motion stops at
                 // arm's length from a guard (ours; the original's character
