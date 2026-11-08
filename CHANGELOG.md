@@ -2,6 +2,17 @@
 
 One line per change, newest first within each date.
 
+## 2026-11-08 (v0.3.0)
+- Dying restarts the level fresh (doors, traps, guards, scripts) and carries health and weapons in; nothing hurts the Prince, and guards stand still, while a script holds him.
+- Collapsing bridges: a plank needs the Prince on it, inset from its rim, for 0.2 s before it wobbles, so running across gets over.
+- In-air ledge grabs need a real edge, not the middle of a platform.
+- Invisible pickups (the prison sword) stay hidden until a script shows them; the guard lets go of his sword when it appears.
+- The prison crushing crate lands on the floor over the guard it crushes.
+- Guards use per-weapon fight, back-off and reach distances; quivers re-arm; archers ignore the height limit; crawling is heard at 1 m.
+- Pickups can be taken from 2.2 m, off-axis and 0.4 m off level.
+- Buttons held as the game menu closes (Circle) no longer reach the game.
+- `weapon:` accepts staff, double and `+all`; `tools/exitcheck.py` checks that every level exit ends the level.
+
 ## 2026-11-07 (v0.2.1)
 - Releases are sent to VitaDB after publishing; the `vitadb` workflow re-sends one by hand.
 
