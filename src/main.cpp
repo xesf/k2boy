@@ -1956,18 +1956,25 @@ public:
         if (m_collapse == COLLAPSE_NONE) {
             if (!prince) return;
             const float x = prince[0] - m_base[0], y = prince[1] - m_base[1], z = prince[2] - m_base[2];
-            if (x < box[0] || x > box[3] || z < box[2] || z > box[5] || y < box[4] - 0.3f || y > box[4] + 0.4f)
-                return;
+            // Ours: he must be on it - a margin in from its rim - for a moment, so passing
+            // over the corner of a plank (they overlap on a bridge) does not bring it down.
+            const float in = std::min(0.3f, 0.25f * std::min(box[3] - box[0], box[5] - box[2]));
+            if (x < box[0] + in || x > box[3] - in || z < box[2] + in || z > box[5] - in ||
+                y < box[4] - 0.3f || y > box[4] + 0.4f) { m_touch_since = -1.0; return; }
+            if (m_touch_since < 0.0) m_touch_since = now;
+            if (now - m_touch_since < 0.2) return;
             const assets::skl_file* w = find_skill(wobble_skill);
             if (w) { m_skill = w; m_skill_start = now; }
             m_collapse_until = now + (w ? clip_length_ms(*w) / 1000.0 : 0.3);
             m_collapse = COLLAPSE_WOBBLE;
+            if (std::getenv("K2_TRAPTYPES")) std::fprintf(stderr, "collapse: %s wobbles at %.2f for %.2f s (skill \"%s\" %s)\n", name().c_str(), now, m_collapse_until - now, wobble_skill.c_str(), w ? "found" : "MISSING");
             if (w) fire_sound_keys(*w, 0.0, 1.0, prince);
             return;
         }
         if (m_collapse == COLLAPSE_WOBBLE) {
             if (now < m_collapse_until) return;
             m_skill = 0;
+            if (std::getenv("K2_TRAPTYPES")) std::fprintf(stderr, "collapse: %s falls at %.2f, Prince x %.2f (plank %.2f..%.2f)\n", name().c_str(), now, prince ? prince[0] : 0.0f, box[0] + m_base[0], box[3] + m_base[0]);
             set_collideable(false);
             m_fall_v = 0.0f;
             m_fall_from = m_base[1];
@@ -2249,6 +2256,7 @@ private:
     double                        m_skill_start;
     enum { COLLAPSE_NONE, COLLAPSE_WOBBLE, COLLAPSE_FALLING, COLLAPSE_DOWN } m_collapse = COLLAPSE_NONE;
     double                        m_collapse_until = 0.0;
+    double                        m_touch_since = -1.0;
     float                         m_fall_v = 0.0f, m_fall_from = 0.0f;
 };
 
