@@ -765,6 +765,7 @@ struct actor_inst {
     // The weapon in his hand: master.dat [Weapons] names it and the hand
     // node with an offset into it. Drawn while `weapon_shown`.
     std::string                       weapon;
+    float                             reach_max = 2.2f;     // L: the longest of those ranges, his swing's reach
     float                             fight_dist = 1.75f;   // S - 0.15: the shortest of his weapon's eight ranges (0x4ABB6D)
     int                               hand_joint;
     float                             hand_off[3];
@@ -1685,9 +1686,11 @@ void bind_actor_weapon(const assets::master_file& m, actor_inst& inst, scene& sc
     const size_t w = which >= 0 && size_t(which) < m.weapons.size() ? size_t(which) : 0;
     inst.weapon = m.weapons[w].name;
     {
-        float lo = 1e9f;
-        for (int k = 0; k < 8; ++k) if (m.weapons[w].ranges[k] > 0.0f) lo = std::min(lo, m.weapons[w].ranges[k]);
-        if (lo < 1e8f) inst.fight_dist = lo - 0.15f;
+        float lo = 1e9f, hi = 0.0f;
+        for (int k = 0; k < 8; ++k) if (m.weapons[w].ranges[k] > 0.0f) {
+            lo = std::min(lo, m.weapons[w].ranges[k]); hi = std::max(hi, m.weapons[w].ranges[k]);
+        }
+        if (lo < 1e8f) { inst.fight_dist = lo - 0.15f; inst.reach_max = std::max(2.2f, hi + 0.1f); }
         if (std::getenv("K2_TRAPTYPES")) std::fprintf(stderr, "weapon %s %s fights at %.2f\n", inst.name.c_str(), inst.weapon.c_str(), inst.fight_dist);
     }
     for (size_t j = 0; j < inst.joint_names.size(); ++j)
@@ -6066,7 +6069,7 @@ void enemy_update(combat_state& cs, scene& sc, enemy_ai& e, actor_inst& prince,
         e.hit.active = false;
         const bool in_front = angle_diff(yaw_toward(p, pp), actor_yaw(a)) < 1.2f;
         if (e.hit.kind != pending_hit::FEINT && prince_available && same_floor &&
-            d <= combat_tuning::REACH && in_front) {
+            d <= a.reach_max && in_front) {
             const int dir = e.hit.dir;
             // Blocked only by a block the same way (0x4ACE54), or the Guard potion.
             if ((cs.prince_blocking && cs.prince_block_dir == dir)) {

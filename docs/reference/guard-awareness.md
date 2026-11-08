@@ -250,7 +250,8 @@ Walk and run speed follow the clips' root motion (`locomotion.md` method).
 | Sheathed Prince | one running swing for 15, no duel | the same (`SWING`) |
 | Charge give-up | Manhattan ≥ 5 and no line of sight | the same; duel gives up at d > 13 |
 | Stop distance | `S − 0.15` per weapon | the same, read from master.dat `[Weapons]` |
-| Reach, back off | 1.7–3.05, `D < L − 1.1` | `REACH` 2.2, no back off |
+| Guard reach | up to L (1.9–3.05) | `L + 0.1`, at least 2.2 |
+| Back off | `D < L − 1.1` | none |
 | Prince dying | guard sheathes and idles | finishing move |
 | Other guards | independent, no alerting | independent |
 
