@@ -8439,6 +8439,7 @@ int main(int argc, char** argv) {
 
     bool running = true;
     bool open_menu = false;
+    bool pad_swallow = false;      // the menu closed: buttons held from it do not reach the game
     bool motion_camera = false;
     while (running) {
         plat::event e;
@@ -8629,6 +8630,7 @@ int main(int argc, char** argv) {
                     ui::save_game ld;
                     const ui::result r = frontend.game_menu(cur, ld);
                     for (int k = 0; k < plat::KEY_COUNT; ++k) down[k] = false;
+                    pad_swallow = true;
                     classic = frontend.prefs().classic;
                     game_mixer.set_volume(frontend.prefs().sound_volume);
                     if (r == ui::R_RESUME || r == ui::R_NONE) break;
@@ -9083,6 +9085,12 @@ int main(int argc, char** argv) {
         //     behind him.
         plat::pad_state pad;
         plat::pad_poll(pad);
+        if (pad_swallow) {              // Circle closes the menu; it must not also swing the sword
+            bool held = false;
+            for (int k = 0; k < plat::PAD_BUTTON_COUNT; ++k) held = held || pad.button[k];
+            if (held) for (int k = 0; k < plat::PAD_BUTTON_COUNT; ++k) pad.button[k] = false;
+            else pad_swallow = false;
+        }
         pad_act_down = pad.connected && pad.button[plat::PAD_X];
         float in_x = 0.0f, in_y = 0.0f;                 // stick: x right, y forward
         bool  pad_run = false;
