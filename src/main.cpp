@@ -719,6 +719,7 @@ struct actor_inst {
     const assets::skl_file*           stance;
     bool                              hold_last;
     bool                              posed_hold;     // holding that frame now
+    bool                              landed = false; // a fallen crate has come to rest
     int                               health, max_health;
     bool                              armed;          // the Prince has his sword
     bool                              has_bow;        // "weapon:+bow"
@@ -8728,6 +8729,39 @@ int main(int argc, char** argv) {
             }
             // Fixtures between scripted skills: the next idle, picked at
             // random from the trap's list, from where they stand.
+            // A crate that has finished its fall comes to rest on the floor, crushing
+            // any guard beneath it (P4_CrushingCrate, prison4).
+            for (size_t i = 0; i < sc.actors.size(); ++i) {
+                actor_inst& fa = sc.actors[i];
+                if (!fa.is_fixture || fa.landed || fa.scripted || !fa.posed_hold || fa.hidden ||
+                    fa.held_clip.find("Fall") == std::string::npos) continue;
+                fa.landed = true;
+                float* ct = fa.node->local.translate;
+                float floor_y = ct[1], best = 4.0f;
+                enemy_ai* under = 0;
+                for (size_t g = 0; g < combat.enemies.size(); ++g) {
+                    actor_inst& ga = sc.actors[size_t(combat.enemies[g].actor)];
+                    const float* gt = ga.node->local.translate;
+                    const float d2 = (gt[0] - ct[0]) * (gt[0] - ct[0]) + (gt[2] - ct[2]) * (gt[2] - ct[2]);
+                    // The guard named for it (PG3Squish) is the one it falls on, wherever he waits.
+                    const bool named = ga.script_name.find("Squish") != std::string::npos && d2 < 64.0f;
+                    if (named || (d2 < best && gt[1] <= ct[1] + 0.5f)) {
+                        best = named ? -1.0f : d2; under = &combat.enemies[g]; floor_y = gt[1];
+                        if (named) break;
+                    }
+                }
+                if (!under) continue;
+                actor_inst& ga = sc.actors[size_t(under->actor)];
+                if (under->state != enemy_ai::DEAD) {
+                    enemy_killed(sc, *under);
+                    if (!play_once(sc, ga, "DeathFromFallingCrate_G", game_time, actor_yaw(ga), true)) ga.posed_hold = true;
+                }
+                play_sound("l01cratecrush001", ct, 20.0f, false);
+                const float* gp = ga.node->local.translate;
+                ct[0] = gp[0]; ct[1] = floor_y; ct[2] = gp[2];     // on the floor, over the body
+                for (int k = 0; k < 3; ++k) fa.home[k] = ct[k];
+                std::printf("crate: %s lands on %s (floor %.2f)\n", fa.name.c_str(), ga.script_name.c_str(), floor_y);
+            }
             for (size_t i = 0; i < sc.actors.size(); ++i) {
                 actor_inst& fa = sc.actors[i];
                 if (!fa.is_fixture || fa.scripted || fa.posed_hold || fa.hidden) continue;
