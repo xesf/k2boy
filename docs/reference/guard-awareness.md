@@ -251,7 +251,7 @@ Walk and run speed follow the clips' root motion (`locomotion.md` method).
 | Charge give-up | Manhattan ≥ 5 and no line of sight | the same; duel gives up at d > 13 |
 | Stop distance | `S − 0.15` per weapon | the same, read from master.dat `[Weapons]` |
 | Guard reach | up to L (1.9–3.05) | `L + 0.1`, at least 2.2 |
-| Back off | `D < L − 1.1` | none |
+| Back off | `D < L − 1.1` | the same, walking back facing him |
 | Prince dying | guard sheathes and idles | finishing move |
 | Other guards | independent, no alerting | independent |
 

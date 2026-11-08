@@ -765,6 +765,7 @@ struct actor_inst {
     // The weapon in his hand: master.dat [Weapons] names it and the hand
     // node with an offset into it. Drawn while `weapon_shown`.
     std::string                       weapon;
+    float                             back_off = 1.0f;      // L - 1.1: closer than this he steps back (0x4AA95A)
     float                             reach_max = 2.2f;     // L: the longest of those ranges, his swing's reach
     float                             fight_dist = 1.75f;   // S - 0.15: the shortest of his weapon's eight ranges (0x4ABB6D)
     int                               hand_joint;
@@ -1690,7 +1691,7 @@ void bind_actor_weapon(const assets::master_file& m, actor_inst& inst, scene& sc
         for (int k = 0; k < 8; ++k) if (m.weapons[w].ranges[k] > 0.0f) {
             lo = std::min(lo, m.weapons[w].ranges[k]); hi = std::max(hi, m.weapons[w].ranges[k]);
         }
-        if (lo < 1e8f) { inst.fight_dist = lo - 0.15f; inst.reach_max = std::max(2.2f, hi + 0.1f); }
+        if (lo < 1e8f) { inst.fight_dist = lo - 0.15f; inst.reach_max = std::max(2.2f, hi + 0.1f); inst.back_off = hi - 1.1f; }
         if (std::getenv("K2_TRAPTYPES")) std::fprintf(stderr, "weapon %s %s fights at %.2f\n", inst.name.c_str(), inst.weapon.c_str(), inst.fight_dist);
     }
     for (size_t j = 0; j < inst.joint_names.size(); ++j)
@@ -6235,6 +6236,15 @@ void enemy_update(combat_state& cs, scene& sc, enemy_ai& e, actor_inst& prince,
             break;
         }
         a.node->local.set_yaw(std::atan2(dx, dz));
+        // Too close for his weapon (D < L - 1.1): he gives ground, still facing the Prince.
+        if (d < a.back_off && now >= e.busy_until && !a.scripted) {
+            const float nx = d > 1e-4f ? dx / d : 0.0f, nz = d > 1e-4f ? dz / d : 1.0f;
+            const float away[3] = { p[0] - nx * 2.0f, p[1], p[2] - nz * 2.0f };
+            const float yaw = std::atan2(dx, dz);
+            steer(sc, a, away, false, dt);
+            a.node->local.set_yaw(yaw);
+            break;
+        }
         // At ready; woozy at a bottle or less (Fight__IdleAmbientOrWoozy 0x4AE60F).
         a.stance = a.health <= combat_tuning::BOTTLE ? find_actor_skill(sc, a, "CombatWoozy" + e.set) : 0;
         if (!a.stance) a.stance = find_actor_skill(sc, a, "CombatAtReady" + e.set);
