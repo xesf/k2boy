@@ -274,7 +274,7 @@ and `pickup_live` (~6985). Doors: `scene_trap::handle` (~1885) plus the generic 
 7. **Sound.** The binary plays `POT<Colour>.sfx` per potion type at apply (table in 2.2) and
    nothing for items. We play `PRNpickup`, which does not exist in `Audio/sfx`, so pickups are
    silent.
-8. **Reload quivers never come back.** We treat `Reload` as a one-off. The binary re-arms when
+8. **Reload quivers (done: they re-arm below their minimum).** We treat `Reload` as a one-off. The binary re-arms when
    `arrows(type) < minimum` (2.6). Only `minimum >= 1` quivers (`TKPart3a/ArrowReload`,
    `TKHiddenPoolRoom/arrowstash02`) ever return; the `0,N,0` ones are single-use there too.
    Also we add `count` to one arrow counter regardless of `type` (`pickup_apply` ~7062).

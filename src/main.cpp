@@ -9530,6 +9530,18 @@ int main(int argc, char** argv) {
                     if (pp.actor >= 0) for (int k = 0; k < 3; ++k) sc.actors[size_t(pp.actor)].node->local.translate[k] = g[k];
                 }
             }
+            // A Reload quiver comes back once the Prince is short of that arrow type: below
+            // its minimum (the third number; 0 never re-arms), 0x47F9B1.
+            for (size_t i = 0; i < sc.pickups.size(); ++i) {
+                const scene::pickup_def& rk = sc.pickups[i];
+                if (!pickup_taken[i] || rk.argv.size() < 4 || !equals_nocase(rk.argv[2], "reload")) continue;
+                int ty = 0, cnt = 0, mn = 0;
+                if (std::sscanf(rk.argv[3].c_str(), "%d,%d,%d", &ty, &cnt, &mn) < 3 || mn < 1) continue;
+                const actor_inst* pr = 0;
+                for (size_t k = 0; k < sc.actors.size(); ++k) if (is_prince(sc.actors[k])) { pr = &sc.actors[k]; break; }
+                const int have = pr ? (ty != 0 && pr->special_type == ty ? pr->special_count : pr->arrows) : 0;
+                if (pr && have < mn) { pickup_taken[i] = false; std::printf("pickup: %s is back (%d < %d)\n", rk.name.c_str(), have, mn); }
+            }
             for (size_t i = 0; i < sc.pickups.size(); ++i)
                 if (sc.pickups[i].actor >= 0)
                     sc.actors[size_t(sc.pickups[i].actor)].hidden = pickup_taken[i] || !pickup_live(sc, i);
