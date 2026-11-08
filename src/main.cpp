@@ -3339,7 +3339,14 @@ bool append_scene(const char* path, scene& sc, bool collide = true) {
             } else {
                 scene_trap* st = new scene_trap(sc.script, n.name, hdr, sc,
                                    int(sc.items.size()) - 1, node, n.trap.name, n.trap.bbox);
-                if (std::getenv("K2_TRAPTYPES")) std::fprintf(stderr, "traptype %s %s\n", n.trap.name.c_str(), n.name.c_str());
+                if (std::getenv("K2_TRAPTYPES")) {
+                    std::fprintf(stderr, "traptype %s %s", n.trap.name.c_str(), n.name.c_str());
+                    if (n.trap.name == "CollapsingFloor") {
+                        std::fprintf(stderr, " box %.2f,%.2f,%.2f..%.2f,%.2f,%.2f argv", n.trap.bbox[0], n.trap.bbox[1], n.trap.bbox[2], n.trap.bbox[3], n.trap.bbox[4], n.trap.bbox[5]);
+                        for (size_t q = 1; q < n.trap.argv.size(); ++q) std::fprintf(stderr, " [%s]", n.trap.argv[q].c_str());
+                    }
+                    std::fprintf(stderr, "\n");
+                }
                 for (int k = 0; k < 3; ++k) st->pivot[k] = n.trap.pivot[k];
                 st->pivot_angle = n.trap.pivot_angle * (n.trap.pivot_axis[1] < 0.0f ? -1.0f : 1.0f);
                 st->set_place(n.trap.pivot_axis, n.trap.pivot_angle);
@@ -4788,6 +4795,7 @@ struct potion_state {
     static bool on(double until, double now) { return until >= 1.0e29 || now < until; }
 };
 potion_state g_potions;
+bool         g_cutscene = false;     // a script holds the Prince (snooze): nothing can hurt him
 
 namespace jump_tuning {
 const float GRAVITY = -17.0f;           // FallGravity
@@ -4992,8 +5000,10 @@ struct ledge_hit {
 
 // A ledge ahead of `pos` along `yaw`, whose top is between min_h and max_h
 // above pos[1].
+// `edge_only`: a real edge - a wall face under the top within reach, open air before it, the top
+// just behind it, and the Prince himself not over or inside the slab (a grab in the air).
 bool find_ledge(const k2::engine::collision_world& w, const float* pos, float yaw,
-                float min_h, float max_h, ledge_hit& out) {
+                float min_h, float max_h, ledge_hit& out, bool edge_only = false) {
     const float f[3] = { std::sin(yaw), 0.0f, std::cos(yaw) };
     const float ds[3] = { 0.35f, 0.6f, 0.9f };
     for (int i = 0; i < 3; ++i) {
@@ -5007,9 +5017,19 @@ bool find_ledge(const k2::engine::collision_world& w, const float* pos, float ya
         const float fo[3] = { pos[0], top - 0.1f, pos[2] };
         k2::engine::pick_hit fh;
         float edge_d = ds[i] - 0.15f, yaw_face = yaw;
+        bool have_face = false;
         if (w.pick(fo, f, ds[i] + 0.3f, false, fh) && std::fabs(fh.normal[1]) < 0.5f) {
             edge_d = fh.distance;
             yaw_face = std::atan2(-fh.normal[0], -fh.normal[2]);
+            have_face = true;
+        }
+        if (edge_only) {
+            if (!have_face || edge_d < 0.05f) continue;
+            const float down2[3] = { 0.0f, -1.0f, 0.0f };
+            k2::engine::pick_hit eh;
+            // ...and he is not over it or inside it.
+            const float uo[3] = { pos[0], top + 0.3f, pos[2] };
+            if (w.pick(uo, down2, 0.6f, true, eh) && std::fabs(eh.point[1] - top) < 0.25f) continue;
         }
         // Nothing solid between him and the face at his own height.
         const float wo[3] = { pos[0], pos[1] + 0.3f, pos[2] };
@@ -5385,7 +5405,7 @@ bool hang_try_grab(hang_ctl& hc, actor_inst& a, const k2::engine::collision_worl
     if (!hc.have_grip || vy > 1.5f) return false;
     ledge_hit l;
     // Hands reach about grip[1] above the feet; take ledges near that height.
-    if (!find_ledge(w, pos, yaw, hc.grip[1] - 0.6f, hc.grip[1] + 0.35f, l)) return false;
+    if (!find_ledge(w, pos, yaw, hc.grip[1] - 0.6f, hc.grip[1] + 0.35f, l, true)) return false;
     // Too low to hang from: his feet would go through the floor under him.
     {
         const float o[3] = { pos[0], pos[1] + 0.05f, pos[2] };
@@ -5779,7 +5799,7 @@ void combat_init(combat_state& cs, scene& sc, const k2::engine::fight_params& fp
 // DeathUnderwater_G); otherwise the generic one.
 void prince_damage(combat_state& cs, scene& sc, actor_inst& p, int dmg, int dir, double now,
                    const char* death = 0) {
-    if (cs.dead_since >= 0.0) return;
+    if (cs.dead_since >= 0.0 || g_cutscene) return;
     p.health -= dmg;
     play_sound("GBLpfiteinjur", p.node->local.translate, 14.0f, false);
     if (p.health <= 0) {
@@ -5847,7 +5867,7 @@ void specials_update(scene& sc, combat_state& cs, actor_inst& prince, double now
 // A fight blow to the Prince: as for guards, one that would leave him 1 or
 // less leaves 1 and he goes Dying; a blow while dying kills.
 void prince_fight_damage(combat_state& cs, scene& sc, actor_inst& p, int dmg, int dir, double now) {
-    if (cs.dead_since >= 0.0) return;
+    if (cs.dead_since >= 0.0 || g_cutscene) return;
     if (cs.prince_dying_until >= now) { prince_damage(cs, sc, p, p.health, dir, now); cs.prince_dying_until = -1.0; return; }
     if (p.health - dmg <= 1) {
         p.health = 1;
@@ -8749,31 +8769,18 @@ int main(int argc, char** argv) {
                 }
                 if (combat.dead_since >= 0.0 &&
                     game_time - combat.dead_since > combat_tuning::RESPAWN_TIME) {
-                    // Back to the level's start, whole; guards return home.
-                    k2::engine::transform& plt = prince_a->node->local;
-                    for (int k = 0; k < 3; ++k) plt.translate[k] = combat.spawn[k];
-                    player_yaw = combat.spawn_yaw;
-                    prince_a->health = prince_a->max_health;
-                    prince_a->scripted = 0;
-                    prince_a->posed_hold = false;
-                    prince_a->stance = 0;
-                    set_clip(*prince_a, LOCO_BASE);
-                    combat.dead_since = -1.0;
-                    combat.prince_drawn = false;
-                    combat.prince_busy_until = 0.0;
-                    jumps.state = jump_ctl::NONE;
-                    ledges.state = hang_ctl::NONE;
-                    crates.state = crate_ctl::NONE;
-                    for (size_t i = 0; i < combat.enemies.size(); ++i) {
-                        enemy_ai& e = combat.enemies[i];
-                        if (e.state == enemy_ai::DEAD) continue;
-                        e.state = enemy_ai::PATROL;
-                        e.hit.active = false;
-                        actor_inst& ea = sc.actors[size_t(e.actor)];
-                        for (int k = 0; k < 3; ++k) ea.node->local.translate[k] = e.home[k];
-                        ea.stance = 0;
-                    }
-                    std::printf("combat: the Prince returns\n");
+                    // Dead: the level starts over, every door, trap, guard and script as at the
+                    // start, carrying what he came in with (health, the sword, the bow).
+                    std::printf("combat: the Prince is dead - restarting the level\n");
+                    std::vector<std::string> extra;
+                    if (level_path && boot_level.empty()) { extra.push_back("--level"); extra.push_back(level_path); }
+                    else extra.push_back("--boot");
+                    if (use_menu) extra.push_back("--menu-game");
+                    for (int i = 1; i + 1 < argc; ++i)
+                        if (std::strcmp(argv[i], "--health") == 0) { extra.push_back("--health"); extra.push_back(argv[i + 1]); }
+                    for (int i = 1; i < argc; ++i)
+                        if (std::strcmp(argv[i], "--armed") == 0) extra.push_back("--armed");
+                    relaunch(argc, argv, extra);
                 }
             }
             for (size_t i = 0; i < sc.traps.size(); ++i) {
@@ -8850,7 +8857,7 @@ int main(int argc, char** argv) {
                     fx_spawn("FlameThrower.NIF", noz, ft->pivot_angle, game_time, 0.6);
                     ft->flame_fx_at = game_time + 0.5;
                 }
-                if (!pp || combat.dead_since >= 0.0) continue;
+                if (!pp || combat.dead_since >= 0.0 || g_cutscene) continue;
                 const float wx = pp[0] - noz[0], wz = pp[2] - noz[2];
                 const float u = std::max(0.0f, std::min(2.0f, wx * fd[0] + wz * fd[2]));
                 const float cx = noz[0] + fd[0] * u - pp[0], cz = noz[2] + fd[2] * u - pp[2];
@@ -8970,6 +8977,7 @@ int main(int argc, char** argv) {
         }
         const bool snoozed = !noscript && game_time < (prince_msgs ? prince_msgs->snooze_until : 0.0);
         input_locked = snoozed;
+        g_cutscene = snoozed;
 
         // Two control modes. Follow mode drives the Prince and puts the camera
         // behind him, which is what the game does; free-fly drives the camera
