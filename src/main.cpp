@@ -6319,14 +6319,16 @@ void prince_hit_resolve(combat_state& cs, scene& sc, actor_inst& p, double now) 
     cs.prince_hit.active = false;
     const float* pp = p.node->local.translate;
     enemy_ai* best = 0;
-    float best_d = combat_tuning::REACH;
+    float best_d = 1e9f;
     for (size_t i = 0; i < cs.enemies.size(); ++i) {
         enemy_ai& e = cs.enemies[i];
         if (e.state == enemy_ai::DEAD || sc.actors[size_t(e.actor)].hidden) continue;
         const float* q = sc.actors[size_t(e.actor)].node->local.translate;
         const float dx = q[0] - pp[0], dz = q[2] - pp[2];
         const float d = std::sqrt(dx * dx + dz * dz);
-        if (d > best_d || std::fabs(q[1] - pp[1]) > 1.5f) continue;
+        // A big guard stands off at his own range; the Prince's swing reaches him there.
+        const float lim = std::min(best_d, std::max(combat_tuning::REACH, sc.actors[size_t(e.actor)].fight_dist + 0.1f));
+        if (d > lim || std::fabs(q[1] - pp[1]) > 1.5f) continue;
         if (angle_diff(std::atan2(dx, dz), actor_yaw(p)) > 1.2f) continue;
         best = &e;
         best_d = d;
